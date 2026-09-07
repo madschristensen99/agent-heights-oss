@@ -19,6 +19,9 @@ interface AgentBrowser {
   currentUrl: string;
   /** Timestamp of last activity (for idle cleanup). */
   lastActivity: number;
+  /** Console errors and failed network requests for debugging. */
+  consoleErrors: string[];
+  failedRequests: string[];
 }
 
 const browsers = new Map<string, AgentBrowser>();
@@ -71,6 +74,25 @@ export async function getAgentBrowser(agentId: string): Promise<AgentBrowser> {
     (window as any).chrome = { runtime: {} };
   });
 
+  const consoleErrors: string[] = [];
+  const failedRequests: string[] = [];
+
+  // Capture console errors for debugging SPA data-loading issues
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      consoleErrors.push(`[console] ${msg.text().slice(0, 200)}`);
+    }
+  });
+  // Capture failed network requests (API calls that return errors)
+  page.on("requestfailed", (req) => {
+    failedRequests.push(`[req] ${req.method()} ${req.url().slice(0, 150)} — ${req.failure()?.errorText ?? "unknown"}`);
+  });
+  page.on("response", (res) => {
+    if (res.status() >= 400) {
+      failedRequests.push(`[res] ${res.status()} ${res.url().slice(0, 150)}`);
+    }
+  });
+
   const ab: AgentBrowser = {
     browser,
     context,
@@ -78,6 +100,8 @@ export async function getAgentBrowser(agentId: string): Promise<AgentBrowser> {
     lastFrame: null,
     currentUrl: "about:blank",
     lastActivity: Date.now(),
+    consoleErrors,
+    failedRequests,
   };
   browsers.set(agentId, ab);
   console.log(`[browser] created context for agent ${agentId}`);
@@ -185,8 +209,19 @@ export async function browserExtractText(agentId: string): Promise<string> {
   }
   const text = await ab.page.evaluate(() => document.body?.innerText ?? "");
   ab.lastActivity = Date.now();
+
+  // Append debug info: console errors and failed network requests.
+  // This helps diagnose why SPA pages (e.g. Next.js RSC apps) show empty states.
+  let debug = "";
+  if (ab.consoleErrors.length > 0) {
+    debug += `\n\n--- Console Errors (${ab.consoleErrors.length}) ---\n${ab.consoleErrors.slice(-10).join("\n")}`;
+  }
+  if (ab.failedRequests.length > 0) {
+    debug += `\n\n--- Failed Requests (${ab.failedRequests.length}) ---\n${ab.failedRequests.slice(-10).join("\n")}`;
+  }
+
   // Truncate to avoid blowing up the context window
-  return text.slice(0, 8000);
+  return (text + debug).slice(0, 8000);
 }
 
 /** Click an element by CSS selector or text. */
