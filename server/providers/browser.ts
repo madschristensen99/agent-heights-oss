@@ -7,7 +7,16 @@
  *
  * Screenshots are cached for the ScreenshotManager and HTTP endpoint to serve.
  */
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { chromium as chromiumExtra } from "playwright-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+import type { Browser, BrowserContext, Page } from "playwright";
+
+// Apply the stealth plugin — patches canvas, WebGL, permissions, hardware
+// concurrency, navigator.webdriver, plugins, languages, chrome runtime,
+// and many more fingerprints that Cloudflare uses to detect headless browsers.
+chromiumExtra.use(StealthPlugin());
+
+const chromium = chromiumExtra as unknown as typeof import("playwright")["chromium"];
 
 interface AgentBrowser {
   browser: Browser;
@@ -65,14 +74,9 @@ export async function getAgentBrowser(agentId: string): Promise<AgentBrowser> {
   });
   const page = await context.newPage();
 
-  // Anti-detection: remove navigator.webdriver flag and patch other fingerprints
-  // that Cloudflare and similar services use to detect headless browsers.
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
-    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
-    (window as any).chrome = { runtime: {} };
-  });
+  // Stealth plugin (applied at launch) handles all fingerprint patching:
+  // navigator.webdriver, plugins, languages, chrome.runtime, canvas, WebGL,
+  // permissions, hardware concurrency, and dozens more.
 
   const consoleErrors: string[] = [];
   const failedRequests: string[] = [];
