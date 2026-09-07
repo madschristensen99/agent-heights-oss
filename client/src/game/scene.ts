@@ -301,7 +301,7 @@ export class OfficeScene extends Phaser.Scene {
   // Harvest particles for harvesting work metaphor
   private harvestParticles: { arc: Phaser.GameObjects.Arc; vy: number; life: number; maxLife: number }[] = [];
   private harvestEmitTimer = 0;
-  private skyGfx!: Phaser.GameObjects.Graphics;
+  private skyImg!: Phaser.GameObjects.Image;
   private lastSkyView: { x: number; y: number; w: number; h: number } | null = null;
   private clouds: { sprite: Phaser.GameObjects.Image; speed: number; baseAlpha: number; phase: number; fadeSpeed: number; yBase: number }[] = [];
 
@@ -1893,9 +1893,35 @@ export class OfficeScene extends Phaser.Scene {
 
   /** Create a gradient sky background and drifting cloud sprites. */
   private createSky(): void {
-    // Sky gradient drawn as a Graphics object with horizontal color strips.
-    // World-space, repositioned each frame to cover the camera's world view.
-    this.skyGfx = this.add.graphics().setDepth(-2);
+    // Sky gradient drawn as a tiny CanvasTexture (1×256) stretched to fill the camera view.
+    // Uses the browser's native CanvasGradient for a perfectly smooth gradient with zero banding.
+    const skyKey = "__sky_gradient";
+    if (!this.textures.exists(skyKey)) {
+      const tex = this.textures.createCanvas(skyKey, 1, 256);
+      if (tex) {
+        const ctx = tex.getContext();
+        const grad = ctx.createLinearGradient(0, 0, 0, 256);
+
+        const themeStops = this.worldTheme?.sky?.gradientStops;
+        const stops = themeStops ?? [
+          { pos: 0.0,  r: 0x4a, g: 0x7a, b: 0x9e },
+          { pos: 0.4,  r: 0x6a, g: 0x9a, b: 0xbe },
+          { pos: 0.75, r: 0x9a, g: 0xb8, b: 0xd4 },
+          { pos: 1.0,  r: 0xc4, g: 0xd8, b: 0xe8 },
+        ];
+        for (const s of stops) {
+          const r = s.r.toString(16).padStart(2, "0");
+          const g = s.g.toString(16).padStart(2, "0");
+          const b = s.b.toString(16).padStart(2, "0");
+          grad.addColorStop(s.pos, `#${r}${g}${b}`);
+        }
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, 1, 256);
+        tex.refresh();
+      }
+    }
+
+    this.skyImg = this.add.image(0, 0, skyKey).setOrigin(0, 0).setDepth(-2);
 
     const skyCfg = this.worldTheme?.sky;
     const cloudStyle = skyCfg?.cloudStyle ?? "fluffy";
@@ -1943,7 +1969,7 @@ export class OfficeScene extends Phaser.Scene {
     }
   }
 
-  /** Draw the sky gradient as horizontal strips covering the camera world view. */
+  /** Reposition the sky image to cover the camera world view. */
   private drawSkyGradient(): void {
     const cam = this.cameras.main;
     const view = cam.worldView;
@@ -1955,39 +1981,8 @@ export class OfficeScene extends Phaser.Scene {
       return;
     }
     this.lastSkyView = { x: view.x, y: view.y, w: view.width, h: view.height };
-    this.skyGfx.clear();
-
-    // Gradient stops (top to bottom) — theme override or default blue sky
-    const themeStops = this.worldTheme?.sky?.gradientStops;
-    const stops = themeStops ?? [
-      { pos: 0.0,  r: 0x4a, g: 0x7a, b: 0x9e },
-      { pos: 0.4,  r: 0x6a, g: 0x9a, b: 0xbe },
-      { pos: 0.75, r: 0x9a, g: 0xb8, b: 0xd4 },
-      { pos: 1.0,  r: 0xc4, g: 0xd8, b: 0xe8 },
-    ];
-
-    const strips = 16;
-    for (let i = 0; i < strips; i++) {
-      const t = i / (strips - 1);
-      let s0 = stops[0], s1 = stops[stops.length - 1];
-      for (let j = 0; j < stops.length - 1; j++) {
-        if (t >= stops[j].pos && t <= stops[j + 1].pos) {
-          s0 = stops[j];
-          s1 = stops[j + 1];
-          break;
-        }
-      }
-      const localT = (t - s0.pos) / (s1.pos - s0.pos);
-      const r = Math.round(s0.r + (s1.r - s0.r) * localT);
-      const g = Math.round(s0.g + (s1.g - s0.g) * localT);
-      const b = Math.round(s0.b + (s1.b - s0.b) * localT);
-      const color = (r << 16) | (g << 8) | b;
-
-      const stripY = view.y + Math.floor((i / strips) * view.height);
-      const stripH = Math.ceil(view.height / strips) + 1;
-      this.skyGfx.fillStyle(color, 1);
-      this.skyGfx.fillRect(view.x, stripY, view.width, stripH);
-    }
+    this.skyImg.setPosition(view.x, view.y);
+    this.skyImg.setDisplaySize(view.width, view.height);
   }
 
   /** Reposition sky to cover camera view + drift clouds. Called every frame. */

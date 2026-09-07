@@ -70,6 +70,8 @@ export interface NameTag {
   setName: (name: string) => void;
   /** Update the V-model phase progress bar (null = hide). */
   setPhase: (phase: string | null) => void;
+  /** Adjust the vertical offset of the name tag (default -108). */
+  setYOffset: (yOffset: number) => void;
 }
 
 /** Create a name tag (label + dark background with status accent bar + phase bar) for an NPC. */
@@ -88,6 +90,7 @@ function createNameTag(scene: Phaser.Scene, name: string, status: AgentInfo["sta
 
   const nameBg = scene.add.graphics();
   let currentPhase: string | null = null;
+  let labelY = -108;
 
   const PHASE_ORDER = ["requirements", "design", "implementation", "verification", "done"];
   const PHASE_COLORS: Record<string, number> = {
@@ -103,7 +106,7 @@ function createNameTag(scene: Phaser.Scene, name: string, status: AgentInfo["sta
     const w = label.displayWidth + 22;
     const h = 22;
     const x = -w / 2;
-    const y = -126;
+    const y = labelY - 18;
     const r = 5;
     nameBg.clear();
     // Dark opaque background for max contrast
@@ -150,6 +153,11 @@ function createNameTag(scene: Phaser.Scene, name: string, status: AgentInfo["sta
     },
     setPhase: (phase: string | null) => {
       currentPhase = phase;
+      redraw(status);
+    },
+    setYOffset: (yOffset: number) => {
+      labelY = yOffset;
+      label.setPosition(0, yOffset);
       redraw(status);
     },
   };
@@ -399,7 +407,13 @@ export class AgentNPC {
       this.breakFace = null;
       this.wanderAt = 0;
       this.hop();
+      // Move name tag above the monitor screen to avoid blocking it
+      this.nameTag.setYOffset(-170);
       if (!this.huddling && this.assembleUntil === 0) this.path = findPath(this.grid, this.tile(), this.seat);
+    }
+    if (!this.busy && wasBusy) {
+      // Restore name tag to default position
+      this.nameTag.setYOffset(-108);
     }
     if (info.status === "done" && wasStatus !== "done") {
       this.pendingBreak = true;

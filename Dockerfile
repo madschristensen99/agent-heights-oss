@@ -51,7 +51,9 @@ RUN pnpm install --frozen-lockfile --ignore-scripts
 RUN cd node_modules/@railway/cli && node npm-install/postinstall.js
 
 # Install Chromium for Playwright (agent browser feature)
-RUN npx playwright install chromium
+# install-deps installs OS libraries (libglib2.0, libnss3, libatk, etc.)
+# without which the browser binary exists but fails to launch
+RUN npx playwright install --with-deps chromium
 
 # Copy source and build the client
 COPY . .
