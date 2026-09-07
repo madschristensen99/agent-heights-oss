@@ -109,6 +109,7 @@ const FEATURED_AGENTS = [
   "Crossmint Wallet",
   "AgentWallet Trader",
   "ClawPump DeFi Trader",
+  "SECTBOT Analyst",
   // Developer tools
   "GitHub",
   "Supabase",
