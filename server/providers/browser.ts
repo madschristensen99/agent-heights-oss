@@ -147,6 +147,16 @@ export async function browserNavigate(agentId: string, url: string): Promise<str
     }
   }
 
+  // Wait for network idle so Next.js / SPA client-side data fetching completes.
+  // domcontentloaded fires before JS-driven API calls finish, so the DOM may
+  // have empty states ("No data found") even though data is still loading.
+  try {
+    await ab.page.waitForLoadState("networkidle", { timeout: 8_000 });
+  } catch {
+    // networkidle can timeout on pages with persistent connections (polling,
+    // websockets) — that's fine, we gave it a chance to fetch initial data.
+  }
+
   ab.currentUrl = ab.page.url();
   ab.lastActivity = Date.now();
   const finalTitle = await ab.page.title();
@@ -166,6 +176,13 @@ export async function browserScreenshot(agentId: string): Promise<string> {
 /** Extract visible text content from the current page. */
 export async function browserExtractText(agentId: string): Promise<string> {
   const ab = await getAgentBrowser(agentId);
+  // Wait a moment for any pending client-side renders (Next.js RSC hydration,
+  // lazy-loaded components, API-driven data) to settle before reading the DOM.
+  try {
+    await ab.page.waitForLoadState("networkidle", { timeout: 5_000 });
+  } catch {
+    // Ignore timeout — read whatever is available.
+  }
   const text = await ab.page.evaluate(() => document.body?.innerText ?? "");
   ab.lastActivity = Date.now();
   // Truncate to avoid blowing up the context window
