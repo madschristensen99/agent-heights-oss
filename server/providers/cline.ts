@@ -35,7 +35,7 @@ function activeProvider() {
 
 /** Use Kimi to describe a browser screenshot as text (for non-vision primary models). */
 async function describeScreenshotWithKimi(base64Frame: string, agentId: string): Promise<string> {
-  const visionModel = "kimi-k2.5";
+  const visionModel = visionProviderConfig.defaultModel;
   const dataUrl = `data:image/jpeg;base64,${base64Frame}`;
   const res = await fetch(`${visionProviderConfig.baseUrl}/chat/completions`, {
     method: "POST",
