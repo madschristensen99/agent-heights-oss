@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+<link rel="icon" type="image/png" sizes="192x192" href="/favicon-192.png" />
+<link rel="icon" type="image/png" sizes="512x512" href="/favicon-512.png" />
+<link rel="shortcut icon" href="/favicon.ico" />
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+<link rel="manifest" href="/site.webmanifest" />
+<title>Privacy Policy — Agent Heights</title>
+<style>
+:root { --bg: #0d0f1a; --card: #161824; --accent: #58c866; --text: #e0e0e0; --muted: #8a8a9a; --border: #232636; --eye: #58c866; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, sans-serif; line-height: 1.6; padding: 2rem 1rem; }
+.container { max-width: 720px; margin: 0 auto; }
+
+/* Surveillance header */
+.eye-banner {
+  text-align: center;
+  margin-bottom: 1.5rem;
+}
+.eye-svg {
+  display: inline-block;
+  animation: blink 4s infinite;
+  transform-origin: center;
+}
+@keyframes blink {
+  0%, 92%, 100% { transform: scaleY(1); opacity: 1; }
+  94%, 98% { transform: scaleY(0.1); opacity: 0.6; }
+}
+.scan-line {
+  position: fixed;
+  top: 0; left: 0; right: 0; height: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  opacity: 0.15;
+  animation: scan 6s linear infinite;
+  pointer-events: none;
+  z-index: 0;
+}
+@keyframes scan {
+  0% { top: 0; }
+  100% { top: 100vh; }
+}
+
+h1 { color: var(--accent); font-size: 1.8rem; margin-bottom: 0.3rem; text-align: center; }
+.tagline {
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-style: italic;
+  margin-bottom: 0.5rem;
+}
+.tagline .quote { color: var(--accent); font-weight: 600; }
+
+h2 {
+  color: var(--text);
+  font-size: 1.15rem;
+  margin-top: 2rem;
+  margin-bottom: 0.3rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+h2 .icon { display: inline-flex; align-items: center; flex-shrink: 0; }
+h2 .icon svg { width: 18px; height: 18px; }
+.flavor {
+  color: var(--accent);
+  font-size: 0.82rem;
+  font-style: italic;
+  margin-bottom: 0.6rem;
+  opacity: 0.8;
+}
+p, li { color: var(--muted); margin-bottom: 0.5rem; }
+ul { padding-left: 1.5rem; margin-bottom: 1rem; }
+a { color: var(--accent); text-decoration: none; }
+.updated { color: var(--muted); font-size: 0.85rem; margin-bottom: 2rem; text-align: center; }
+.back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 0.5rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  transition: border-color 0.2s, background 0.2s;
+}
+.back-link:hover { border-color: var(--accent); background: rgba(88,200,102,0.08); }
+.back-link svg { width: 16px; height: 16px; }
+
+.disclaimer {
+  margin-top: 2.5rem;
+  padding: 1rem;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  text-align: center;
+  font-size: 0.8rem;
+  color: var(--muted);
+  background: rgba(22,24,36,0.5);
+}
+.disclaimer .eye-sm svg { width: 16px; height: 16px; }
+</style>
+</head>
+<body>
+<div class="scan-line"></div>
+<div class="container">
+
+<a class="back-link" href="/app">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>
+  Back to App
+</a>
+
+<div class="eye-banner">
+  <svg class="eye-svg" width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M4 32s8-18 28-18 28 18 28 18-8 18-28 18S4 32 4 32z" stroke="#58c866" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="32" cy="32" r="10" stroke="#58c866" stroke-width="2.5"/>
+    <circle cx="32" cy="32" r="4" fill="#58c866"/>
+    <circle cx="35" cy="29" r="1.5" fill="#0d0f1a"/>
+  </svg>
+</div>
+<h1>Privacy Policy</h1>
+<p class="tagline"><span class="quote">"I'm watching you, Wazowski. Always watching."</span></p>
+<p class="tagline">— The Office Manager</p>
+<p class="updated">Last updated: August 16, 2025</p>
+
+<h2><span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#58c866" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg></span> Overview</h2>
+<p class="flavor">Welcome to Agent Heights. We see everything. But in a good way.</p>
+<p>Agent Heights ("we", "our", or "the Service") is an AI agent platform that lets users hire and manage AI agents connected to external services via Model Context Protocol (MCP) servers. This Privacy Policy explains what data we collect, how we use it, and the choices you have.</p>
+
+<h2><span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#58c866" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span> What We See</h2>
+<p class="flavor">Don't worry — we're not actually hiding in your closet. We just need a few things to run the office.</p>
+
+<h3>Account Information</h3>
+<ul>
+<li>Email address (for authentication and account management)</li>
+<li>Display name and profile preferences</li>
+</ul>
+
+<h3>Agent and Usage Data</h3>
+<ul>
+<li>Agent configurations, prompts, and conversation history</li>
+<li>API usage records for billing and rate limiting</li>
+<li>WebSocket session data for real-time agent communication</li>
+</ul>
+
+<h3>OAuth Tokens (Google Workspace and other MCP integrations)</h3>
+<ul>
+<li>When you connect an external service (e.g., Gmail, Google Calendar, Google Drive), we store OAuth access and refresh tokens encrypted in our database</li>
+<li>These tokens are used solely to authenticate API requests to the connected service on your behalf</li>
+<li>We never share your OAuth tokens with third parties</li>
+<li>You can revoke access at any time from your account settings or the provider's security settings</li>
+</ul>
+
+<h3>Payment Information</h3>
+<ul>
+<li>Subscription and payment processing is handled by Stripe — we do not store your full credit card number</li>
+<li>We store transaction records and billing history for account management</li>
+</ul>
+
+<h2><span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#58c866" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/><line x1="16" x2="8" y1="13" y2="13"/><line x1="16" x2="8" y1="17" y2="17"/><line x1="10" x2="8" y1="9" y2="9"/></svg></span> How Google Workspace MCP Servers Access Your Data</h2>
+<p class="flavor">When you let an agent peek at your Google stuff, here's exactly what it can see.</p>
+<p>When you connect a Google Workspace agent (Gmail, Google Drive, Google Docs, Google Sheets, Google Slides, Google Calendar, Google Chat, or Google Contacts), the agent accesses your Google data through Google's official MCP servers using OAuth 2.0. The specific data accessed depends on the scopes you authorize:</p>
+<ul>
+<li><strong>Gmail:</strong> Read email threads and create drafts (does not send emails automatically)</li>
+<li><strong>Google Drive:</strong> Search, read, and manage files you've opened or created through the app</li>
+<li><strong>Google Docs:</strong> Read and update documents</li>
+<li><strong>Google Sheets:</strong> Read and update spreadsheet data and formulas</li>
+<li><strong>Google Slides:</strong> Read and update presentations</li>
+<li><strong>Google Calendar:</strong> List, search, create, update, and delete events</li>
+<li><strong>Google Chat:</strong> Read and send messages in spaces the bot is added to</li>
+<li><strong>Google Contacts:</strong> Read your contacts, profile, and directory (read-only)</li>
+</ul>
+<p>All data access is performed through Google's official MCP servers. We do not store the content of your Google Workspace data — only the OAuth tokens needed to make authenticated requests.</p>
+
+<h2><span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#58c866" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg></span> Why We're Watching</h2>
+<p class="flavor">It's not creepy. We promise. It's mostly just... keeping the lights on.</p>
+<ul>
+<li>To provide and maintain the Service</li>
+<li>To authenticate you and manage your account</li>
+<li>To process payments and manage subscriptions</li>
+<li>To communicate with you about your account and the Service</li>
+<li>To monitor and improve Service performance and reliability</li>
+<li>To comply with legal obligations</li>
+</ul>
+
+<h2><span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#58c866" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span> The Surveillance Room</h2>
+<p class="flavor">All footage stored in a secure, encrypted vault. No interns with clipboards.</p>
+<ul>
+<li>Data is stored in Supabase (PostgreSQL) with row-level security policies</li>
+<li>OAuth tokens and API keys are encrypted using AES-256-GCM</li>
+<li>All traffic is served over HTTPS</li>
+<li>Access to sensitive data is restricted to authenticated users only</li>
+</ul>
+
+<h2><span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#58c866" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span> How Long We Keep Watching</h2>
+<p class="flavor">We don't hold grudges. Or data. Once you're out, you're out.</p>
+<ul>
+<li>Account data is retained while your account is active</li>
+<li>You can request account deletion at any time — data is permanently removed within 30 days</li>
+<li>OAuth tokens are removed when you disconnect a service or delete your account</li>
+<li>Billing records may be retained for legal compliance purposes</li>
+</ul>
+
+<h2><span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#58c866" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 4h3a2 2 0 0 1 2 2v14"/><path d="M2 20h3"/><path d="M13 20h9"/><path d="M10 12v.01"/><path d="M13 4.562v16.157a1 1 0 0 1-1.242.97L5 20V5.562a2 2 0 0 1 1.515-1.94l4-1A2 2 0 0 1 13 4.562Z"/></svg></span> Your Right to Be Un-Watched</h2>
+<p class="flavor">You can walk away at any time. We'll stop watching. We might miss you though.</p>
+<ul>
+<li>Access, correct, or delete your personal data</li>
+<li>Revoke OAuth access for any connected service</li>
+<li>Export your agent configurations and conversation history</li>
+<li>Cancel your subscription at any time</li>
+</ul>
+
+<h2><span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#58c866" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span> Who Else Has Eyes On You</h2>
+<p class="flavor">We work with some trusted partners. They have their own eyes. And their own rules.</p>
+<p>The Service integrates with the following third-party providers:</p>
+<ul>
+<li><strong>Supabase:</strong> Authentication and database hosting</li>
+<li><strong>Stripe:</strong> Payment processing</li>
+<li><strong>Google:</strong> Workspace MCP integrations (Gmail, Drive, Docs, Sheets, Slides, Calendar, Chat, People)</li>
+<li><strong>Resend:</strong> Transactional email delivery</li>
+<li><strong>Railway:</strong> Application hosting</li>
+</ul>
+<p>Each provider has its own privacy policy governing how they handle data.</p>
+
+<h2><span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#58c866" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9"/><path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5"/><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5"/><path d="M19.1 4.9C23 8.8 23 15.2 19.1 19.1"/></svg></span> Talk to the Watcher</h2>
+<p class="flavor">Questions? Concerns? Want to know what we saw? Just ask.</p>
+<p>For privacy questions or data requests, contact us at <a href="mailto:remseechannel@gmail.com">remseechannel@gmail.com</a>.</p>
+
+<div class="disclaimer">
+  <span class="eye-sm"><svg viewBox="0 0 24 24" fill="none" stroke="#58c866" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span><br>
+  This policy is not actual surveillance. We just think it's funny.<br>
+  The legal stuff above is real though. We really do care about your privacy.
+</div>
+
+</div>
+</body>
+</html>

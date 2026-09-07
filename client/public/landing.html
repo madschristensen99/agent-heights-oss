@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/favicon-192.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/favicon-512.png" />
+    <link rel="shortcut icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <title>Agent Heights — Manage AI Agents in a Virtual Office</title>
+    <meta name="description" content="A virtual office where you hire and manage real AI agents. Each employee is a live AI agent that reads, writes, and runs code while you watch from a top-down Phaser office." />
+    <link rel="canonical" href="https://agentheights.com/" />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Agent Heights — Manage AI Agents in a Virtual Office" />
+    <meta property="og:description" content="Hire AI agents, assign tasks, and watch them work in real time from a top-down virtual office." />
+    <meta property="og:url" content="https://agentheights.com/" />
+    <meta property="og:image" content="https://agentheights.com/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:site_name" content="Agent Heights" />
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:site" content="@agentheights" />
+    <meta name="twitter:title" content="Agent Heights — Manage AI Agents in a Virtual Office" />
+    <meta name="twitter:description" content="Hire AI agents, assign tasks, and watch them work in real time from a top-down virtual office." />
+    <meta name="twitter:image" content="https://agentheights.com/og-image.png" />
+
+    <!-- Structured Data -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "Agent Heights",
+      "description": "A virtual office where you hire and manage real AI agents. Each employee is a live AI agent that reads, writes, and runs code while you watch from a top-down virtual office.",
+      "url": "https://agentheights.com/",
+      "applicationCategory": "ProductivityApplication",
+      "operatingSystem": "Web",
+      "image": "https://agentheights.com/og-image.png",
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      },
+      "publisher": {
+        "@type": "Organization",
+        "name": "Agent Heights",
+        "url": "https://agentheights.com/",
+        "sameAs": [
+          "https://x.com/agentheights",
+          "https://www.linkedin.com/company/agent-hieghts/",
+          "https://github.com/madschristensen99/agent-heights"
+        ]
+      }
+    }
+    </script>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@400;500;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="me" href="https://github.com/madschristensen99/agent-heights" />
+    <link rel="me" href="https://www.linkedin.com/company/agent-hieghts/" />
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body {
+        font-family: 'M PLUS Rounded 1c', system-ui, sans-serif;
+        background-image: linear-gradient(180deg, rgba(18,20,32,0.90) 0%, rgba(26,30,50,0.92) 100%), url(/assets/gameplay.png);
+        background-size: cover;
+        background-position: center;
+        background-repeat: no-repeat;
+        background-attachment: fixed;
+        color: #e0e0e0;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        overflow-y: auto;
+        padding: 2rem 1rem;
+      }
+      .container {
+        position: relative;
+        z-index: 1;
+        text-align: center;
+        max-width: 560px;
+        width: 90vw;
+      }
+      h1 {
+        font-size: 2.6rem;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        color: #58c866;
+        text-shadow: 3px 3px 0 #080a10;
+        margin: 0 0 0.3rem;
+      }
+      .tagline {
+        color: #a0a5b4;
+        font-size: 0.7rem;
+        font-weight: 500;
+        letter-spacing: 0.15em;
+        text-transform: uppercase;
+        margin: 0 0 1.2rem;
+      }
+      .sprites {
+        display: flex;
+        gap: 12px;
+        justify-content: center;
+        margin-bottom: 1.5rem;
+      }
+      .sprites div {
+        width: 64px;
+        height: 96px;
+        background-size: 512px 384px;
+        background-position: 0 0;
+        background-repeat: no-repeat;
+        image-rendering: pixelated;
+        filter: drop-shadow(0 3px 6px rgba(0,0,0,0.5));
+      }
+      .description {
+        color: #c0c5d0;
+        font-size: 1.05rem;
+        line-height: 1.6;
+        margin: 0 0 1.5rem;
+      }
+      .features {
+        display: flex;
+        flex-direction: column;
+        gap: 0.6rem;
+        margin: 0 0 2rem;
+        text-align: left;
+        background: rgba(18,22,36,0.7);
+        border: 1px solid #2a2e42;
+        border-radius: 12px;
+        padding: 1.5rem;
+      }
+      .features li {
+        list-style: none;
+        display: flex;
+        align-items: flex-start;
+        gap: 0.6rem;
+        color: #b0b5c4;
+        font-size: 0.92rem;
+        line-height: 1.4;
+      }
+      .features li::before {
+        content: "";
+        flex-shrink: 0;
+        width: 8px;
+        height: 8px;
+        margin-top: 6px;
+        border-radius: 50%;
+        background: #58c866;
+      }
+      .enter-btn {
+        display: inline-block;
+        padding: 0.9rem 2.5rem;
+        border-radius: 10px;
+        border: none;
+        background: linear-gradient(180deg, #58c866, #3da64a);
+        color: #0d0d0d;
+        font-size: 1.1rem;
+        font-weight: 700;
+        font-family: inherit;
+        cursor: pointer;
+        letter-spacing: 0.03em;
+        text-decoration: none;
+        transition: filter 0.15s, transform 0.1s;
+      }
+      .enter-btn:hover { filter: brightness(1.1); }
+      .enter-btn:active { transform: scale(0.97); }
+      .footer {
+        margin-top: 2rem;
+        font-size: 0.8rem;
+        color: #555;
+        display: flex;
+        gap: 1rem;
+        justify-content: center;
+      }
+      .footer a {
+        color: #7a8090;
+        text-decoration: none;
+        transition: color 0.15s;
+      }
+      .footer a:hover { color: #58c866; }
+      .contact {
+        margin-top: 0.5rem;
+        font-size: 0.8rem;
+        color: #555;
+      }
+      .contact a { color: #7a8090; text-decoration: none; }
+      .contact a:hover { color: #58c866; }
+      details {
+        background: rgba(18,22,36,0.7);
+        border: 1px solid #2a2e42;
+        border-radius: 10px;
+        margin-bottom: 0.6rem;
+        text-align: left;
+        overflow: hidden;
+      }
+      details summary {
+        cursor: pointer;
+        padding: 0.8rem 1.2rem;
+        font-size: 0.92rem;
+        font-weight: 700;
+        color: #c0c5d0;
+        list-style: none;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        transition: background 0.15s;
+      }
+      details summary::-webkit-details-marker { display: none; }
+      details summary::after {
+        content: "+";
+        font-size: 1.2rem;
+        color: #58c866;
+        transition: transform 0.2s;
+      }
+      details[open] summary::after { transform: rotate(45deg); }
+      details summary:hover { background: rgba(88,200,102,0.05); }
+      details h2 {
+        font-size: 0.92rem;
+        font-weight: 700;
+        color: #c0c5d0;
+        margin: 0;
+      }
+      details h3 {
+        font-size: 0.85rem;
+        font-weight: 700;
+        color: #a0a5b4;
+        margin: 0.8rem 0 0.3rem;
+      }
+      details p, details ol, details ul {
+        padding: 0 1.2rem 1rem;
+        color: #b0b5c4;
+        font-size: 0.85rem;
+        line-height: 1.5;
+        font-weight: 400;
+      }
+      details ol { padding-left: 2.2rem; }
+      details ol li { margin-bottom: 0.4rem; }
+      details ul { padding-left: 1.8rem; list-style: none; }
+      details ul li::before { content: "•"; color: #58c866; margin-right: 0.4rem; }
+      .seo-section {
+        margin: 1.5rem 0 0;
+        width: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <script>
+      // If already signed in, skip landing page and go straight to the game
+      try {
+        var keys = Object.keys(localStorage);
+        for (var i = 0; i < keys.length; i++) {
+          if (keys[i].match(/^sb-.*-auth-token$/)) {
+            location.replace("/app");
+            break;
+          }
+        }
+      } catch (e) {}
+    </script>
+    <div class="container">
+      <h1>AGENT HEIGHTS</h1>
+      <p class="tagline">Manage AI Agents in a Virtual Office</p>
+
+      <div class="sprites">
+        <div style="background-image: url(/assets/characters/char-0.png);"></div>
+        <div style="background-image: url(/assets/characters/char-1.png);"></div>
+        <div style="background-image: url(/assets/characters/char-2.png);"></div>
+        <div style="background-image: url(/assets/characters/char-3.png);"></div>
+      </div>
+
+      <p class="description">
+        Hire AI agents, assign tasks, and watch them work in real time from a top-down virtual office.
+        Each employee is a live AI agent that can handle any type of work — coding, research, writing, analysis, and more.
+      </p>
+
+      <ul class="features">
+        <li>Hire agents from a marketplace of AI employees with specialized skills</li>
+        <li>Watch your agents navigate the office, sit at desks, and collaborate in real time</li>
+        <li>Connect agents to external services via MCP — Google Workspace, GitHub, Slack, and more</li>
+        <li>Chat with your team, assign tasks, and review their work as they complete tasks</li>
+      </ul>
+
+      <a href="/app" class="enter-btn">Enter Office</a>
+
+      <div class="seo-section">
+        <details>
+          <summary><h2>How It Works</h2></summary>
+          <ol>
+            <li><strong>Hire an agent</strong> — Browse the marketplace and pick an AI employee with the skills you need.</li>
+            <li><strong>Assign a task</strong> — Describe what you want done. The agent reads the task and gets to work.</li>
+            <li><strong>Watch in real time</strong> — See your agent walk to their desk, open tools, and work through the task step by step in the virtual office.</li>
+          </ol>
+        </details>
+
+        <details>
+          <summary><h2>AI Agent Marketplace</h2></summary>
+          <p>Choose from a roster of AI agents with different specialties and capabilities. Each agent has a unique profile, skill set, and personality. Hire the right agent for the job — whether it's writing code, researching a topic, drafting content, or analyzing data. Agents can be customized with different AI models and connected to external tools.</p>
+        </details>
+
+        <details>
+          <summary><h2>Real-Time Virtual Office</h2></summary>
+          <p>Your agents live in a top-down 2D office rendered with Phaser. Watch them walk to their desks, sit down, and start working. See activity indicators, chat bubbles, and task progress as it happens. The office makes AI work feel tangible — you can see who's busy, who's available, and what everyone is working on at a glance.</p>
+        </details>
+
+        <details>
+          <summary><h2>MCP Integrations</h2></summary>
+          <p>Connect your agents to the outside world using the Model Context Protocol (MCP). Agents can access Google Workspace, GitHub, Slack, Notion, and other services to read documents, create issues, send messages, and more. MCP lets your AI employees use the same tools a human employee would, making them genuinely useful for real workflows.</p>
+        </details>
+
+        <details>
+          <summary><h2>Task Management & Collaboration</h2></summary>
+          <p>Assign tasks to specific agents, set up task pipelines with dependencies, and chain work across multiple agents. Chat with agents to provide feedback or course-correct mid-task. Review completed work, request revisions, and approve deliverables. Agents can hand off tasks to each other, creating collaborative workflows that handle complex projects end to end.</p>
+        </details>
+
+        <details>
+          <summary><h2>Frequently Asked Questions</h2></summary>
+          <h3>What is Agent Heights?</h3>
+          <p>Agent Heights is a virtual office where you hire and manage AI agents. Instead of a chat window, your AI employees exist as characters in a 2D office space — you can see them work in real time.</p>
+          <h3>What can AI agents do?</h3>
+          <p>Agents can handle a wide range of work: writing and running code, research, content creation, data analysis, and more. They can also connect to external services via MCP to interact with tools like Google Workspace, GitHub, and Slack.</p>
+          <h3>Do I need to know how to code?</h3>
+          <p>No. You describe tasks in plain language and the agents handle the execution. The virtual office interface makes it easy to see what's happening without technical knowledge.</p>
+          <h3>Is it free?</h3>
+          <p>Agent Heights offers a free tier so you can try it out. Paid plans unlock more agents, higher usage limits, and premium features.</p>
+        </details>
+
+        <details>
+          <summary><h2>About Agent Heights</h2></summary>
+          <p>Agent Heights reimagines AI assistance as a workplace simulation. Instead of invisible background processes, your AI agents are visible characters in a shared office — making the experience of working with AI more intuitive, engaging, and fun. Built with Phaser for the game engine and powered by real AI models for the agent intelligence.</p>
+        </details>
+      </div>
+
+      <div class="footer">
+        <a href="/privacy" style="display:inline-flex;align-items:center;gap:0.3rem;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg> Privacy Policy</a>
+        <a href="/terms">Terms of Service</a>
+        <a href="https://x.com/agentheights" target="_blank" rel="noopener">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;margin-right:2px;"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.91l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+          @agentheights
+        </a>
+        <a href="https://www.linkedin.com/company/agent-hieghts/" target="_blank" rel="noopener">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;margin-right:2px;"><path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433a2.062 2.062 0 01-2.063-2.065 2.063 2.063 0 112.063 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/></svg>
+          LinkedIn
+        </a>
+        <a href="https://github.com/madschristensen99/agent-heights" target="_blank" rel="noopener">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;margin-right:2px;"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
+          GitHub
+        </a>
+      </div>
+      <p class="contact">Contact: <a href="mailto:remseechannel@gmail.com">remseechannel@gmail.com</a></p>
+    </div>
+  </body>
+</html>

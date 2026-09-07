@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Meta Harness Architecture</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  body {
+    background: #f5f6f8;
+    color: #1a1d28;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 0;
+    padding: 40px 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  h1 {
+    color: #3d7ee0;
+    margin-bottom: 8px;
+  }
+  p.subtitle {
+    color: #6b7280;
+    margin-top: 0;
+    margin-bottom: 32px;
+    font-size: 14px;
+  }
+  pre.mermaid {
+    background: #ffffff;
+    border: 1px solid #d8dbe2;
+    border-radius: 12px;
+    padding: 32px;
+    max-width: 100%;
+    overflow-x: auto;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+    font-family: inherit;
+    white-space: normal;
+  }
+  .legend {
+    margin-top: 24px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    font-size: 13px;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .legend-swatch {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+  }
+</style>
+</head>
+<body>
+  <h1>Meta Harness Architecture</h1>
+  <p class="subtitle">Cline SDK wrapped with inter-agent communication, shared state, scheduling &amp; orchestration</p>
+
+  <pre class="mermaid">
+graph TD
+    User["User / Platform Events"] -->|assign, createSchedule, createScheduleChain| Mgr
+    Mgr{"Assign Task"} -->|agent busy| Queue["Task Queue (MAX_QUEUE_DEPTH: 5)"]
+    Queue -->|agent idle| StartTask["startTask"]
+    Mgr -->|agent idle| StartTask
+    StartTask -->|monitor| Breaker{"Circuit Breaker (3 dup / 10 per-tool / 20 MCP)"}
+    StartTask -->|monitor| DoneTimer["Done Timer (90s idle timeout)"]
+    Breaker -->|threshold exceeded| Abort["Abort + Error Status"]
+    DoneTimer -->|timeout| Abort
+
+    SchedTick["tickSchedules (60s)"] -->|fires due| SchedMap["Schedules Map"]
+    SchedMap -->|chainTo| ChainTrigger["Chain Trigger"]
+    ChainTrigger -->|assign next agent| Mgr
+    SchedMap -->|assign agent| Mgr
+
+    StartTask --> RtState["Agent State (status, task, memory)"]
+    RtState --> SysPrompt["Build System Prompt + memory + journal"]
+    SysPrompt --> Runner["runCline (ProviderRunner)"]
+    Runner --> EventLoop["Event Stream Loop"]
+    EventLoop --> Sanitize["Message Sanitization & Compaction"]
+    Sanitize -->|compacted history| Runner
+
+    Runner -->|creates| SDKAgent["Cline SDK Agent"]
+    SDKAgent -->|invokes| SDKTools["createDefaultTools / createDefaultExecutors"]
+    SDKAgent -->|uses| Tools["makeTools (cline.ts)"]
+    Tools -->|tool results| SDKAgent
+    SDKAgent -->|events / output| EventLoop
+
+    Tools --> T_Bash["bash"]
+    Tools --> T_Read["read_files"]
+    Tools --> T_Write["write_files"]
+    Tools --> T_Editor["editor"]
+    Tools --> T_ReadShared["read_shared"]
+    Tools --> T_WriteShared["write_shared"]
+    Tools --> T_ListShared["list_shared"]
+    Tools --> T_Post["post_message"]
+    Tools --> T_ReadMsg["read_messages"]
+    Tools --> T_WaitReply["wait_for_reply"]
+    Tools --> T_AskMgr["ask_manager"]
+    Tools --> T_Propose["propose_action"]
+    Tools --> T_ReadBoard["read_board"]
+    Tools --> T_ClaimCard["claim_card"]
+    Tools --> T_CreateSched["create_schedule"]
+    Tools --> T_ListSched["list_schedules"]
+    Tools --> T_UpdateSched["update_schedule"]
+    Tools --> T_DeleteSched["delete_schedule"]
+    Tools --> T_Hire["hire_agent"]
+    Tools --> T_Delegate["delegate_task"]
+    Tools --> T_RequestHire["request_hire"]
+    Tools --> T_RegisterMcp["register_mcp_server"]
+    Tools --> T_ListMcp["list_office_tools"]
+    Tools --> T_Railway["Railway"]
+    Tools --> T_Google["Google Workspace"]
+    Tools --> T_CDPSolana["CDP Solana"]
+    Tools --> T_Crossmint["Crossmint Wallet"]
+    Tools --> T_Circle["Circle Services"]
+    Tools --> T_Monid["Monid"]
+    Tools --> T_Wizard["Wizard GitHub"]
+
+    Runner -->|reads context| OSContext["getAgentContext / getCriticalPath / findBlockers"]
+    Runner -->|addNode / addEdge| OSNodes["OfficeState Nodes (task, decision, blocker, observation)"]
+    OSContext -->|shared context| Runner
+    OSContext -->|queries| OSNodes
+    OSNodes --- OSEdges["Edges (depends_on, blocks, produced_by, decided_in, contradicts)"]
+    OSContext -->|queries| OSEdges
+
+    T_Post -->|onPostMessage callback| Mgr
+    Mgr -->|shouldCreateTask?| ShouldCreateTask["shouldCreateTask"]
+    ShouldCreateTask -->|yes: create task| Mgr
+    T_ReadMsg -->|reads| Mailbox["Agent Inbox"]
+    T_WaitReply -->|polls| Mailbox
+    Performatives["Performatives (request, inform, query, propose, subscribe)"] --> Mailbox
+    Priorities["Priority (low, normal, urgent)"] --> Mailbox
+    Mailbox --> ShouldCreateTask
+
+    T_Bash -->|production| Bwrap["bubblewrap confinement (bwrapCommand)"]
+    BwrapCheck["checkBwrap"] -->|verifies| Bwrap
+
+    EventLoop -->|task complete| Handoff{"Process Result (handoffTo?)"}
+    Handoff -->|yes: handoffTo| Mgr
+    Handoff -->|no| BoardUpdate["Update Task Board"]
+    Handoff -->|update| OSNodes
+
+    style Mgr fill:#6c7ae0,stroke:#333,stroke-width:2px,color:#fff
+    style StartTask fill:#6c7ae0,stroke:#333,stroke-width:2px,color:#fff
+    style Handoff fill:#6c7ae0,stroke:#333,stroke-width:2px,color:#fff
+    style Breaker fill:#e74c3c,stroke:#333,stroke-width:2px,color:#fff
+    style Abort fill:#e74c3c,stroke:#333,stroke-width:1px,color:#fff
+    style Runner fill:#27ae60,stroke:#333,stroke-width:2px,color:#fff
+    style SDKAgent fill:#2ecc71,stroke:#333,stroke-width:2px,color:#fff
+    style Tools fill:#f39c12,stroke:#333,stroke-width:2px,color:#fff
+    style OSNodes fill:#9b59b6,stroke:#333,stroke-width:2px,color:#fff
+    style OSContext fill:#9b59b6,stroke:#333,stroke-width:1px,color:#fff
+    style Mailbox fill:#e67e22,stroke:#333,stroke-width:2px,color:#fff
+    style ShouldCreateTask fill:#e67e22,stroke:#333,stroke-width:1px,color:#fff
+    style Bwrap fill:#95a5a6,stroke:#333,stroke-width:2px,color:#fff
+    style SchedTick fill:#3498db,stroke:#333,stroke-width:2px,color:#fff
+    style ChainTrigger fill:#3498db,stroke:#333,stroke-width:1px,color:#fff
+    style Queue fill:#bdc3c7,stroke:#333,stroke-width:1px
+    style DoneTimer fill:#e74c3c,stroke:#333,stroke-width:1px,color:#fff
+  </pre>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-swatch" style="background:#6c7ae0"></div> Orchestration</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#27ae60"></div> Execution (Cline SDK)</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#f39c12"></div> Tool Layer</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#9b59b6"></div> OfficeState (Shared DAG)</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#e67e22"></div> AgentMail</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#3498db"></div> Scheduler</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#e74c3c"></div> Safety / Circuit Breaker</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#95a5a6"></div> Sandboxing</div>
+  </div>
+
+  <script>
+    mermaid.initialize({ startOnLoad: true, theme: 'default' });
+  </script>
+</body>
+</html>

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/favicon-192.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/favicon-512.png" />
+    <link rel="shortcut icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <title>Agent Heights — Manage AI Agents in a Virtual Office</title>
+    <meta name="description" content="A virtual office where you hire and manage real AI agents. Each employee is a live AI agent that can handle any type of work — coding, research, writing, analysis, and more." />
+    <link rel="canonical" href="https://agentheights.com/" />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Agent Heights — Manage AI Agents in a Virtual Office" />
+    <meta property="og:description" content="Hire AI agents, assign tasks, and watch them work in real time from a top-down virtual office." />
+    <meta property="og:url" content="https://agentheights.com/" />
+    <meta property="og:image" content="https://agentheights.com/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:site_name" content="Agent Heights" />
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:site" content="@agentheights" />
+    <meta name="twitter:title" content="Agent Heights — Manage AI Agents in a Virtual Office" />
+    <meta name="twitter:description" content="Hire AI agents, assign tasks, and watch them work in real time from a top-down virtual office." />
+    <meta name="twitter:image" content="https://agentheights.com/og-image.png" />
+    <style>
+      @font-face { font-family: 'Inter'; font-style: normal; font-weight: 400; font-display: swap; src: url(/fonts/inter-400.woff2) format('woff2'), url(/fonts/inter-400.ttf) format('truetype'); }
+      @font-face { font-family: 'Inter'; font-style: normal; font-weight: 500; font-display: swap; src: url(/fonts/inter-500.woff2) format('woff2'), url(/fonts/inter-500.ttf) format('truetype'); }
+      @font-face { font-family: 'Inter'; font-style: normal; font-weight: 600; font-display: swap; src: url(/fonts/inter-600.woff2) format('woff2'), url(/fonts/inter-600.ttf) format('truetype'); }
+      @font-face { font-family: 'Inter'; font-style: normal; font-weight: 700; font-display: swap; src: url(/fonts/inter-700.woff2) format('woff2'), url(/fonts/inter-700.ttf) format('truetype'); }
+      @font-face { font-family: 'M PLUS Rounded 1c'; font-style: normal; font-weight: 400; font-display: swap; src: url(/fonts/mplus-400.woff2) format('woff2'), url(/fonts/mplus-400.ttf) format('truetype'); }
+      @font-face { font-family: 'M PLUS Rounded 1c'; font-style: normal; font-weight: 500; font-display: swap; src: url(/fonts/mplus-500.woff2) format('woff2'), url(/fonts/mplus-500.ttf) format('truetype'); }
+      @font-face { font-family: 'M PLUS Rounded 1c'; font-style: normal; font-weight: 700; font-display: swap; src: url(/fonts/mplus-700.woff2) format('woff2'), url(/fonts/mplus-700.ttf) format('truetype'); }
+      @font-face { font-family: 'M PLUS Rounded 1c'; font-style: normal; font-weight: 800; font-display: swap; src: url(/fonts/mplus-800.woff2) format('woff2'), url(/fonts/mplus-800.ttf) format('truetype'); }
+    </style>
+    <!-- Preload critical assets so the browser starts fetching before Phaser's loader initializes -->
+    <link rel="preload" as="image" href="/assets/atlases/ai-tiles-atlas.webp?v=277" />
+    <link rel="preload" as="image" href="/assets/atlases/ai-sprites-atlas.webp?v=277" />
+    <link rel="preload" as="image" href="/assets/atlases/ai-hair-atlas.webp?v=277" />
+    <link rel="preconnect" href="https://agentheights.com" />
+    <link rel="stylesheet" href="/src/style.css" />
+    <link rel="me" href="https://github.com/madschristensen99/agent-heights" />
+    <link rel="me" href="https://www.linkedin.com/company/agent-hieghts/" />
+  </head>
+  <body>
+    <div id="game"></div>
+    <div id="hud"></div>
+    <script type="module" src="/src/main.ts"></script>
+    <script>
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("/sw.js").catch((err) => {
+            console.warn("[sw] registration failed:", err);
+          });
+        });
+      }
+    </script>
+  </body>
+</html>

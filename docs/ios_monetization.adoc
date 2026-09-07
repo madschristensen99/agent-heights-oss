@@ -1,0 +1,219 @@
+= Agent Heights iOS — Capacitor + RevenueCat + AdMob
+
+== Overview
+
+Agent Heights ships as a native iOS app via Capacitor, wrapping the existing
+Vite-built web client (Phaser 3 + DOM HUD) as a WKWebView app. The server stays
+on Railway. Three monetization systems operate in parallel:
+
+[cols="1,1,2,2"]
+|===
+| System | Provider | Purpose | Shipaton Award
+
+| In-App Purchases | RevenueCat | Subscriptions + entry fee + asset upgrades | Best Game, Grand Prize
+| Rewarded Ads | Google AdMob | Watch ad → free entry fee / inference credit | HAMM Award ($20k)
+| Web Payments | Stripe | Subscriptions on desktop web | Funnel Vision Award
+|===
+
+== Architecture
+
+=== Monetization Flow (iOS)
+
+[source,text]
+----
+User opens app
+  → Auth overlay (email/password, Google, GitHub, Apple Sign-In)
+  → Payment overlay:
+     [Enter for 99¢]            ← RevenueCat IAP
+     [▶ Watch Ad to Enter Free]  ← AdMob rewarded ad
+     [Subscribe $3.99–$19.99/mo] ← RevenueCat IAP
+  → Free-tier user hits usage cap:
+     [▶ WATCH AD]               ← AdMob rewarded ad (inference_boost)
+     [Subscribe to continue]     ← RevenueCat IAP
+----
+
+=== Rewarded Ad Reward Types
+
+[cols="1,1,1,1"]
+|===
+| Reward Type | Amount | Daily Limit | Effect
+
+| `entry_fee` | 1 | 5/day | Unlocks entrance (marks `entrance_paid=true`)
+| `usage_credits` | 50 | 5/day | 50 usage credits via negative `api_usage_records`
+| `agent_hire` | 1 | 5/day | Free agent hire token
+| `inference_boost` | $0.05 | 20/day | Inference credit via negative `api_usage_records`
+|===
+
+The `inference_boost` type is the core of the HAMM Award pitch: ad-supported
+free inference. Users watch ads to keep their agents working instead of paying.
+
+=== Conversion Funnel
+
+[source,text]
+----
+Free (ads, 20/day max) → $0.99 entry fee (no ads) → $3.99/mo starter → $19.99/mo pro
+----
+
+== Files
+
+=== Created
+
+[cols="2,1"]
+|===
+| File | Description
+
+| `capacitor.config.ts` | Capacitor config — appId `com.agentheights.app`, webDir `dist`
+| `client/src/platform.ts` | Platform detection + feature flags (`isNative()`, `isFeatureEnabled()`)
+| `client/src/iap.ts` | RevenueCat IAP client — init, purchase, restore, getCustomerInfo
+| `client/src/ads.ts` | AdMob rewarded ads client — init, show, preload, server sync
+| `server/iap.ts` | RevenueCat server handler — sync verification, webhook
+| `server/ads.ts` | Ad reward endpoint — `POST /api/ads/reward`, per-type rate limits
+| `supabase/migrations/20250824000002_ad_rewards.sql` | `ad_rewards` table with RLS
+| `docs/snow_crash_and_true_names.md` | Thesis doc — Snow Crash / True Names inspiration
+|===
+
+=== Modified
+
+[cols="2,1"]
+|===
+| File | Changes
+
+| `client/src/auth.ts` | Apple Sign-In button + `signInWithAppleNative()` function
+| `client/src/payment.ts` | RevenueCat branching on iOS, "Watch Ad" button, Restore Purchases
+| `client/src/main.ts` | RevenueCat + AdMob init on auth change (native only)
+| `client/src/net.ts` | `getServerHost()` for native WebSocket connection
+| `client/src/ui/hud.ts` | Feature-flag gating: voice, speaker, IDE, CDP, Crossmint, premium
+| `client/src/style.css` | Mobile UX: safe areas, touch optimization, no-pull-to-refresh
+| `client/index.html` | Local @font-face (8 TTF files, no CDN dependency)
+| `server/index.ts` | IAP routes (`/api/iap/*`) + ad routes (`/api/ads/*`)
+| `.gitignore` | `ios/`, `android/`, Xcode entries
+| `package.json` | `build:ios`, `cap:add:ios`, `cap:open:ios`, `cap:sync` scripts
+| `.env.example` | `REVENUECAT_SECRET_KEY`, `VITE_REVENUECAT_PUBLIC_KEY`
+|===
+
+== Dependencies
+
+[cols="2,1"]
+|===
+| Package | Purpose
+
+| `@capacitor/core` | Capacitor runtime
+| `@capacitor/cli` | Capacitor CLI
+| `@capacitor/ios` | iOS platform
+| `@capacitor/preferences` | Native key-value storage
+| `@capacitor/app` | App lifecycle events
+| `@revenuecat/purchases-capacitor` | RevenueCat IAP SDK
+| `@capacitor-community/admob` | Google AdMob rewarded ads
+| `@capacitor-community/apple-sign-in` | Apple Sign-In
+|===
+
+== iOS Feature Flags
+
+Disabled on native iOS via `isFeatureEnabled()` in `client/src/platform.ts`:
+
+[cols="1,1"]
+|===
+| Feature | Reason
+
+| `cdpSolana` | Crypto not allowed on App Store
+| `crossmintWallet` | Crypto not allowed on App Store
+| `premiumMarketplace` | Depends on crypto infrastructure
+| `screenShare` | WKWebView limitation
+| `webcam` | WKWebView limitation
+| `voice` | WebRTC not supported in WKWebView
+| `monacoEditor` | Too heavy for mobile, IDE bridge not relevant
+| `stripeCheckout` | Use RevenueCat IAP instead
+|===
+
+== IAP Product IDs
+
+Must be created in App Store Connect:
+
+[cols="1,1,1"]
+|===
+| Product ID | Price | Type
+
+| `agent_heights_entry` | $0.99 | Consumable
+| `agent_heights_starter_monthly` | $3.99/mo | Auto-renewable
+| `agent_heights_starter_annual` | $39.90/yr | Auto-renewable
+| `agent_heights_pro_monthly` | $19.99/mo | Auto-renewable
+| `agent_heights_pro_annual` | $199.90/yr | Auto-renewable
+| `agent_heights_asset_upgrade` | $19.99 | Non-consumable
+|===
+
+== RevenueCat Entitlements
+
+[cols="1,1"]
+|===
+| Entitlement | Maps To
+
+| `entry` | Entrance fee paid
+| `starter` | Starter subscription tier
+| `pro` | Pro subscription tier
+| `asset_upgrade` | AI asset upgrade unlocked
+|===
+
+== AdMob Configuration
+
+Using Google test ad unit IDs during development:
+
+[cols="1,1"]
+|===
+| Config | Test Value
+
+| App ID | `ca-app-pub-3940256099942544~1458002511`
+| Rewarded Ad Unit ID | `ca-app-pub-3940256099942544/1719395716`
+|===
+
+*Replace with real IDs from https://apps.admob.com before submission.*
+Set `initializeForTesting: false` in `initAdMob()` for production.
+
+== Environment Variables
+
+[cols="1,1,1"]
+|===
+| Variable | Scope | Purpose
+
+| `REVENUECAT_SECRET_KEY` | Server | RevenueCat REST API verification
+| `VITE_REVENUECAT_PUBLIC_KEY` | Client | RevenueCat SDK initialization
+|===
+
+Both are set in `.env` (gitignored). Public key is bundled into the client
+build via Vite's `import.meta.env`.
+
+== API Endpoints
+
+[cols="1,1,1"]
+|===
+| Endpoint | Method | Purpose
+
+| `/api/iap/sync` | POST | Client-notified purchase sync (verifies via RC REST API)
+| `/api/iap/webhook` | POST | RevenueCat server-to-server webhook
+| `/api/ads/reward` | POST | Grant ad reward (authenticated, rate-limited)
+|===
+
+== Pending (Blocked on User)
+
+[cols="1,1"]
+|===
+| Task | Requirement
+
+| AdMob account + real ad unit IDs | Google account, free
+| Run Supabase migration | Paste SQL into Supabase SQL Editor
+| App Store Connect IAP products | Apple Developer Account ($99/yr)
+| Apple Sign-In config | Apple Developer Portal — Service ID + Sign In with Apple
+| iOS Xcode project | macOS machine (`npx cap add ios`)
+| Shipaton submission | Demo video (≤2 min), 1024×1024 icon, 1179×2556 screenshot
+|===
+
+== Shipaton Award Targets
+
+[cols="1,1"]
+|===
+| Award | How We Qualify
+
+| HAMM Award ($20k) | Ad-supported free inference — rewarded ads fund compute
+| Best Game Award | Phaser 3 spatial office game with AI agents
+| Funnel Vision Award | Stripe web funnel + RevenueCat iOS funnel
+| Grand Prize | Full-stack AI agent platform with spatial UI
+|===

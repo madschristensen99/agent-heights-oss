@@ -1,0 +1,4984 @@
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { WebSocketServer, WebSocket } from "ws";
+import { fileURLToPath } from "node:url";
+import { dirname, join, extname, normalize, resolve, relative } from "node:path";
+import { readFile, stat, readdir, writeFile, unlink, mkdir, lstat } from "node:fs/promises";
+import type { ClientMsg, ServerMsg, SavedOutfit, CharAppearance, Presenter, OfficeInviteEntry } from "../shared/types.js";
+import { SERVER_PORT, isValidAppearance, MAX_PRESENTERS, COMMAND_CENTER_ADMINS, OFFICE_MANAGER_ID } from "../shared/types.js";
+import { isSupabaseConfigured, verifyToken, getTokenExpiry, type AuthUser, supabaseAdmin } from "./supabase.js";
+import { handleMarketplaceRequest } from "./marketplace.js";
+import { handleMcpCatalogRequest } from "./mcp-store.js";
+import { searchPulseMCPStructured } from "./pulsemcp.js";
+import { handleOfficeManagerRequest } from "./office-manager.js";
+import { handlePublishRequest } from "./publish.js";
+import { stopRailwayMCP, checkRailwayStatus, queryRailway, deployWorldToRailway, listWorldDeployments, stopWorldDeployment } from "./providers/railway-mcp.js";
+import { listWorldTemplates, generateWorld } from "./world-templates.js";
+import { getTemplateById } from "./pipeline-templates.js";
+import { getAuthenticatedUser, forkSourceRepo, createBranch, listBranches, deleteBranch, getGithubToken, listRepoDir, readRepoFile, writeRepoFile, createRepoFile, deleteRepoFile } from "./github.js";
+import { rateLimitAsync, rateLimit } from "./ratelimit.js";
+import { setUserApiKey, deleteUserApiKey, setUserMcpKey, deleteUserMcpKey, getUserMcpKeys, getUserMcpKeyUrls } from "./apikeys.js";
+import { startOAuthFlow, handleOAuthCallback, exchangeOAuthCode } from "./mcp-oauth.js";
+import { getAgentWalletAddress, getAgentBalances, getAgentPolicy, updateAgentPolicy, getAgentTxHistory, createOnrampUrl, getAgentLpPositions } from "./providers/cdp-solana.js";
+import { getAgentBalances as getCrossmintBalances, getAgentPolicy as getCrossmintPolicy, getAgentTxHistory as getCrossmintTxHistory, fundAgentWallet, createCrossmintOnrampUrl } from "./providers/crossmint-wallets.js";
+import { startBalanceMonitor as startCircleBalanceMonitor, isCircleGatewayConfigured, ensureGatewayBalance } from "./providers/x402-pay.js";
+import { TenantManager, HQ2_ROOM_ID, type UserSession } from "./tenant.js";
+import { ScreenshotManager } from "./providers/screenshot.js";
+import { browserLastFrame, closeAgentBrowser, destroyAllBrowsers, cleanupIdleBrowsers } from "./providers/browser.js";
+import { startLogMaintenance } from "./log-retention.js";
+import { isRedisConfigured, stopRedis, serverId } from "./redis.js";
+import { handleStripeRequest, getUserPaymentStatus, isStripeConfigured } from "./stripe.js";
+import { handleAssetUpgradeRequest, runAssetGenerationJob } from "./asset-upgrade.js";
+import { handleIapRequest } from "./iap.js";
+import { handleAdRequest } from "./ads.js";
+import { handlePromoRequest } from "./promo-codes.js";
+import { getUsageSummary, flushUsageBuffer, getMonthlySpend } from "./usage.js";
+import {
+  getOverviewStats, getUserTimeseries, getRevenueBreakdown, getRevenueHistory,
+  getUsageStats, getConversionFunnel, getSubscriptions, getRealtimeStats, getEngagementStats,
+  getFinancialMetrics,
+} from "./admin-stats.js";
+import { getProviderConfig, resolveModel } from "./providers/api-config.js";
+import { applySecurityHeaders, escapeHtml } from "./security.js";
+import { scheduleDeletion, cancelDeletion, getDeletionStatus, processExpiredDeletions, GRACE_PERIOD_DAYS } from "./account.js";
+import { HermesProcessManager } from "./hermes-process.js";
+import {
+  TOKEN_MINT, GATE_ROOM_ID, MIN_BALANCE,
+  generateNonce, buildSignMessage,
+  verifyTokenGate, checkAgentWalletsForToken,
+  getVerificationFromDB, saveVerificationToDB,
+} from "./token-gate.js";
+import { startRetentionLoop, type RetentionManagerEntry } from "./retention.js";
+import { ProfileManager } from "./profile.js";
+import { getLeaderboard, getTrophyProfile } from "./leaderboards.js";
+import { renderTrophyPage, renderTrophyNotFound } from "./trophy-room.js";
+import { dismissNudge, trackActivity } from "./concierge.js";
+import { recordSignalByKey, preloadProfile, getCachedProfile, getUnlocks, seedAspirations, getSignalHistory, UNLOCK_THRESHOLDS_EXPORT, ASPIRATION_LABELS, onDominantShift, flushProfileBuffer } from "./aspirations.js";
+import { generateAwayReport } from "./away-report.js";
+import { logAgentHire, logAgentFire, logAgentRecruit, getEntries, updateEntry, detectConfigChange, getExperimentStats } from "./experiment-log.js";
+import { getDecorations, placeDecoration, removeDecoration, moveDecoration } from "./office-deco.js";
+import { getSocialState, leaveStickyNote, likeOffice, unlikeOffice, recordVisit } from "./office-social.js";
+import { getProgress, addXp, getMaxAgents, prestige as doPrestige } from "./office-progression.js";
+import { getGrowth, clearGrowth } from "./agent-growth.js";
+import { sendFriendRequest, acceptFriendRequest, declineFriendRequest, removeFriend, getFriendsList, getAcceptedFriendIds, invalidateFriendsListCache } from "./friends.js";
+import { compareAgents } from "./ab-comparison.js";
+import { computeEfficiency } from "./efficiency-score.js";
+import { getCurrentSeasonalEvent } from "./seasonal-events.js";
+import { getAllocation, validateAllocations } from "./resource-allocation.js";
+import { computeFulfillment } from "./fulfillment.js";
+import { ideBridge, IdeBridge } from "./ide-bridge.js";
+import { snapshotVelocity, getVelocityTrends, getStandupSummary, detectAnomalies, formatStandupText } from "./velocity.js";
+import { createInvite, claimInvite, getPendingInvites, revokeInvite } from "./office-invites.js";
+
+// ── User activity persistence (retention system) ─────────────────────────
+
+/** Map a DB invite row to the OfficeInviteEntry wire format. */
+function mapInviteEntry(r: any): OfficeInviteEntry {
+  return {
+    id: r.id,
+    inviteeEmail: r.inviteeEmail,
+    status: r.status,
+    createdAt: r.createdAt,
+    claimedAt: r.claimedAt,
+    claimedByName: null,
+  };
+}
+
+async function persistUserActivity(userId: string, lastActiveAt: number, lastPlatformEngagementAt: number): Promise<void> {
+  if (!isSupabaseConfigured) return;
+  await supabaseAdmin
+    .from("user_payments")
+    .update({ last_active_at: lastActiveAt, last_platform_engagement_at: lastPlatformEngagementAt })
+    .eq("user_id", userId);
+}
+
+async function loadUserActivity(userId: string): Promise<{ lastActiveAt: number; lastPlatformEngagementAt: number; retentionEmailTier: number; lastRetentionEmailAt: number | null }> {
+  if (!isSupabaseConfigured) return { lastActiveAt: Date.now(), lastPlatformEngagementAt: 0, retentionEmailTier: 0, lastRetentionEmailAt: null };
+  const { data } = await supabaseAdmin
+    .from("user_payments")
+    .select("last_active_at, last_platform_engagement_at, retention_email_tier, last_retention_email_at")
+    .eq("user_id", userId)
+    .single();
+  return {
+    lastActiveAt: data?.last_active_at ?? Date.now(),
+    lastPlatformEngagementAt: data?.last_platform_engagement_at ?? 0,
+    retentionEmailTier: data?.retention_email_tier ?? 0,
+    lastRetentionEmailAt: data?.last_retention_email_at ?? null,
+  };
+}
+
+/** Throttle map for rate-limit toasts — one per 5s per user. */
+const rateLimitToastMap = new Map<string, number>();
+
+/** High-frequency message types that use sync in-memory rate limiting (no Redis round-trip). */
+const FAST_PATH_TYPES = new Set(["player_move", "npc_update"]);
+
+// ── Saved outfits helpers ────────────────────────────────────────────────
+
+type OutfitScope =
+  | { type: "user"; userId: string }
+  | { type: "org"; orgId: string };
+
+async function loadOutfits(scope: OutfitScope): Promise<SavedOutfit[]> {
+  if (!isSupabaseConfigured) return [];
+  try {
+    let query = supabaseAdmin
+      .from("agent_heights_saved_outfits")
+      .select("id, name, appearance, created_at");
+    if (scope.type === "user") {
+      query = query.eq("user_id", scope.userId).is("org_id", null);
+    } else {
+      query = query.eq("org_id", scope.orgId);
+    }
+    const { data, error } = await query.order("created_at", { ascending: false });
+    if (error || !data) return [];
+    return data
+      .filter((r: any) => isValidAppearance(r.appearance))
+      .map((r: any) => ({
+        id: r.id,
+        name: r.name,
+        appearance: r.appearance as CharAppearance,
+        createdAt: r.created_at,
+      }));
+  } catch {
+    return [];
+  }
+}
+
+/** Resolve which wardrobe scope applies to the user's current room. */
+function resolveOutfitScope(sess: UserSession): { scope: OutfitScope; editable: boolean } | null {
+  if (!sess.roomId) return null;
+  const room = tenants.getRoom(sess.roomId);
+  if (!room) return null;
+
+  if (room.roomType === "organization" && room.orgId) {
+    const editable = tenants.isOrgAdmin(room.orgId, sess.user.id);
+    return { scope: { type: "org", orgId: room.orgId }, editable };
+  }
+
+  // Personal room — show the owner's outfits
+  const isOwner = room.ownerId === sess.user.id;
+  return { scope: { type: "user", userId: room.ownerId }, editable: isOwner };
+}
+
+async function sendOutfits(ws: WebSocket, sess: UserSession): Promise<void> {
+  const resolved = resolveOutfitScope(sess);
+  if (!resolved) {
+    ws.send(JSON.stringify({ type: "outfits", outfits: [], editable: false } satisfies ServerMsg));
+    return;
+  }
+  const outfits = await loadOutfits(resolved.scope);
+  ws.send(JSON.stringify({ type: "outfits", outfits, editable: resolved.editable } satisfies ServerMsg));
+}
+
+const rootDir = join(dirname(fileURLToPath(import.meta.url)), "..");
+const distDir = join(rootDir, "dist");
+const distDashboardDir = join(rootDir, "dist-dashboard");
+
+// ── Global error handlers ────────────────────────────────────────────────
+// Stray promise rejections from the Cline SDK or fetch calls should not
+// crash the server. Log them and continue.
+process.on("unhandledRejection", (err) => {
+  console.error("[fatal] Unhandled promise rejection:", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[fatal] Uncaught exception:", err);
+});
+
+// ── static file serving ──────────────────────────────────────────────────
+
+const MIME: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".eot": "application/vnd.ms-fontobject",
+  ".map": "application/json",
+  ".webmanifest": "application/manifest+json",
+  ".xml": "application/xml; charset=utf-8",
+  ".txt": "text/plain; charset=utf-8",
+  ".pdf": "application/pdf",
+};
+
+const CLIENT_ENV_ALLOWLIST = [
+  "VITE_SUPABASE_URL",
+  "VITE_SUPABASE_ANON_KEY",
+  "VITE_WS_HOST",
+  "VITE_APP_URL",
+  "VITE_TURN_SERVER",
+  "VITE_TURN_USERNAME",
+  "VITE_TURN_CREDENTIAL",
+];
+
+function getEnvScript(): string {
+  const envVars: Record<string, string> = {};
+  for (const key of CLIENT_ENV_ALLOWLIST) {
+    const val = process.env[key];
+    if (val) envVars[key] = val;
+  }
+  // Escape </script> to prevent XSS via env values breaking out of the script tag
+  const json = JSON.stringify(envVars).replace(/</g, "\\u003c");
+  return `<script>window.__ENV__=${json};</script>`;
+}
+
+function absoluteUrl(req: IncomingMessage, path: string): string {
+  const proto = (req.headers["x-forwarded-proto"] as string) || "https";
+  const host = (req.headers["x-forwarded-host"] as string) || req.headers.host || "localhost";
+  return `${proto}://${host}${path}`;
+}
+
+async function injectMeta(html: string, req: IncomingMessage): Promise<string> {
+  let result = html.replace("<head>", `<head>\n    ${getEnvScript()}`);
+  // Rewrite relative og:image / twitter:image to absolute URLs with cache-busting
+  try {
+    const ogStat = await stat(join(distDir, "og-image.png"));
+    const v = Math.floor(ogStat.mtimeMs);
+    const absUrl = absoluteUrl(req, `/og-image.png?v=${v}`);
+    result = result.replace(/content="\/og-image\.png"/g, `content="${absUrl}"`);
+  } catch {
+    // og-image.png missing — leave relative URLs as-is
+  }
+  return result;
+}
+
+async function serveDashboard(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let urlPath = req.url?.split("?")[0] ?? "/dashboard";
+  // Strip the /dashboard prefix so we can map to dist-dashboard/
+  const subPath = urlPath === "/dashboard" ? "/index.html" : urlPath.replace(/^\/dashboard\//, "/");
+
+  const filePath = normalize(join(distDashboardDir, subPath));
+  if (!filePath.startsWith(distDashboardDir)) {
+    res.writeHead(403, applySecurityHeaders());
+    res.end("Forbidden");
+    return;
+  }
+
+  try {
+    const info = await stat(filePath);
+    if (info.isDirectory()) throw new Error("is directory");
+    const data = await readFile(filePath);
+    const mime = MIME[extname(filePath)] ?? "application/octet-stream";
+    const headers: Record<string, string> = applySecurityHeaders({ "Content-Type": mime });
+    if (subPath === "/index.html") {
+      headers["Cache-Control"] = "no-cache, no-store, must-revalidate";
+    } else {
+      headers["Cache-Control"] = "public, max-age=31536000, immutable";
+    }
+    if (subPath === "/index.html") {
+      const html = data.toString("utf-8");
+      const injected = await injectMeta(html, req);
+      res.writeHead(200, applySecurityHeaders({ "Content-Type": "text/html; charset=utf-8" }));
+      res.end(Buffer.from(injected, "utf-8"));
+      return;
+    }
+    res.writeHead(200, headers);
+    res.end(data);
+  } catch {
+    // SPA fallback — serve index.html for any unmatched route under /dashboard
+    try {
+      const indexPath = join(distDashboardDir, "index.html");
+      const data = await readFile(indexPath);
+      const html = data.toString("utf-8");
+      const injected = await injectMeta(html, req);
+      res.writeHead(200, applySecurityHeaders({ "Content-Type": "text/html; charset=utf-8" }));
+      res.end(Buffer.from(injected, "utf-8"));
+    } catch {
+      res.writeHead(404, applySecurityHeaders());
+      res.end("Dashboard not built. Run: cd dashboard && pnpm install && pnpm build");
+    }
+  }
+}
+
+async function serveStatic(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let urlPath = req.url?.split("?")[0] ?? "/";
+
+  // Serve the static landing page at / (no login required, for Google OAuth verification)
+  if (urlPath === "/") {
+    try {
+      const landingPath = join(distDir, "landing.html");
+      const data = await readFile(landingPath);
+      res.writeHead(200, applySecurityHeaders({ "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache, no-store, must-revalidate" }));
+      res.end(data);
+      return;
+    } catch {
+      // landing.html missing — fall through to SPA index.html
+      urlPath = "/index.html";
+    }
+  }
+
+  // Serve the SPA at /app and /app/* (rewrite to index.html or stripped path)
+  if (urlPath === "/app" || urlPath.startsWith("/app/")) {
+    urlPath = urlPath === "/app" ? "/index.html" : urlPath.replace(/^\/app/, "");
+    if (urlPath === "") urlPath = "/index.html";
+  }
+
+  // Serve static files (assets, etc.) — anything that's not index.html
+  if (urlPath !== "/index.html") {
+    const filePath = normalize(join(distDir, urlPath));
+    if (!filePath.startsWith(distDir)) {
+      res.writeHead(403, applySecurityHeaders());
+      res.end("Forbidden");
+      return;
+    }
+
+    try {
+      const info = await stat(filePath);
+      if (info.isDirectory()) throw new Error("is directory");
+      const data = await readFile(filePath);
+      const mime = MIME[extname(filePath)] ?? "application/octet-stream";
+      const headers: Record<string, string> = applySecurityHeaders({ "Content-Type": mime });
+      if (extname(filePath) === ".json") {
+        headers["Cache-Control"] = "no-cache, no-store, must-revalidate";
+      } else {
+        headers["Cache-Control"] = "public, max-age=31536000, immutable";
+      }
+      res.writeHead(200, headers);
+      res.end(data);
+      return;
+    } catch {
+      // File not found — fall through to SPA fallback below
+    }
+  }
+
+  // SPA fallback: serve index.html with env injection (for /app, /index.html, and unknown routes)
+  try {
+    const indexPath = join(distDir, "index.html");
+    let data = await readFile(indexPath);
+    const html = data.toString("utf-8");
+    const injected = await injectMeta(html, req);
+    data = Buffer.from(injected, "utf-8");
+    res.writeHead(200, applySecurityHeaders({ "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache, no-store, must-revalidate" }));
+    res.end(data);
+  } catch {
+    res.writeHead(404, applySecurityHeaders());
+    res.end("Not found");
+  }
+}
+
+// ── tenant management ─────────────────────────────────────────────────────
+
+const tenants = new TenantManager(rootDir);
+const screenshots = new ScreenshotManager();
+
+// Wire IDE bridge with tenant manager for org-level session sharing
+ideBridge.setDependencies({
+  getUserName: (userId: string) => tenants.getPlayerName(userId),
+  getUserEmail: (userId: string) => tenants.get(userId)?.user.email ?? null,
+  getOrgMemberIds: (userId: string) => {
+    const orgs = tenants.getOrgsForUser(userId);
+    const memberIds = new Set<string>();
+    for (const org of orgs) {
+      for (const m of tenants.getOrgMembers(org.id)) {
+        if (!m.userId.startsWith("pending:")) memberIds.add(m.userId);
+      }
+    }
+    return [...memberIds];
+  },
+  getBroadcast: (userId: string) => tenants.getSessionBroadcast(userId),
+  onBranchDetected: (userId: string, gitBranch: string) => {
+    // Sprint board integration: match branch to task card
+    const sess = tenants.get(userId);
+    if (!sess?.manager) return;
+    const cardIds = sess.manager.getCardIds();
+    const matchedCardId = IdeBridge.matchBranchToCardId(gitBranch, cardIds);
+    if (matchedCardId) {
+      sess.manager.linkBranchToCard(matchedCardId, gitBranch);
+    }
+  },
+});
+
+// Notify friends when a user goes offline (after 30s grace period)
+tenants.onUserOffline = (userId: string) => {
+  void getAcceptedFriendIds(userId).then((friendIds) => {
+    for (const fid of friendIds) {
+      const fb = tenants.getSessionBroadcast(fid);
+      if (fb) fb({ type: "friend_offline", userId });
+    }
+  }).catch(() => {});
+};
+
+// Aspiration dominant shift detection — notify user when their dominant aspiration changes
+onDominantShift((userId, oldDominant, newDominant) => {
+  const fb = tenants.getSessionBroadcast(userId);
+  if (!fb) return;
+  if (newDominant && oldDominant !== newDominant) {
+    const label = ASPIRATION_LABELS[newDominant as keyof typeof ASPIRATION_LABELS];
+    if (label) {
+      fb({ type: "toast", text: `${label.icon} Your dominant aspiration shifted to ${label.label}!` });
+    }
+    fb({ type: "aspiration_shift", oldDominant, newDominant });
+  }
+});
+
+// ── HTTP + WebSocket server ───────────────────────────────────────────────
+
+const server = createServer((req, res) => {
+  // Office Manager chat proxy — needs HQ context from the session
+  if (req.url?.split("?")[0] === "/api/office-manager") {
+    void handleOfficeManagerRequest(req, res, async () => {
+      if (isSupabaseConfigured) {
+        const authHeader = req.headers["authorization"];
+        const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+        if (!token) return null;
+        const user = await verifyToken(token);
+        if (!user) return null;
+        const sess = tenants.get(user.id);
+        if (!sess) return null;
+        const snap = sess.manager.snapshot();
+        return { agents: snap.agents, board: snap.board, bossName: sess.manager.bossName };
+      }
+      // Dev mode — use dev session
+      const sess = tenants.get("dev");
+      if (!sess) return null;
+      const snap = sess.manager.snapshot();
+      return { agents: snap.agents, board: snap.board, bossName: sess.manager.bossName };
+    }).then((handled) => {
+      if (!handled) {
+        serveStatic(req, res).catch(() => {
+          res.writeHead(500, applySecurityHeaders());
+          res.end("Internal server error");
+        });
+      }
+    });
+    return;
+  }
+
+  // Publish agent to marketplace
+  if (req.url?.split("?")[0] === "/api/publish-agent") {
+    void handlePublishRequest(req, res).then((handled) => {
+      if (!handled) {
+        serveStatic(req, res).catch(() => {
+          res.writeHead(500, applySecurityHeaders());
+          res.end("Internal server error");
+        });
+      }
+    });
+    return;
+  }
+
+  // Stripe payment routes (checkout, webhook, portal, status)
+  if (req.url?.split("?")[0]?.startsWith("/api/stripe")) {
+    void handleStripeRequest(req, res).then((handled) => {
+      if (!handled) {
+        serveStatic(req, res).catch(() => {
+          res.writeHead(500, applySecurityHeaders());          res.end("Internal server error");
+        });
+      }
+    });
+    return;
+  }
+
+  // Asset upgrade routes (checkout, status)
+  if (req.url?.split("?")[0]?.startsWith("/api/asset-upgrade")) {
+    void handleAssetUpgradeRequest(req, res).then((handled) => {
+      if (!handled) {
+        res.writeHead(404, applySecurityHeaders());
+        res.end("Not found");
+      }
+    });
+    return;
+  }
+
+  // RevenueCat IAP routes (sync, webhook)
+  if (req.url?.split("?")[0]?.startsWith("/api/iap")) {
+    void handleIapRequest(req, res).then((handled) => {
+      if (!handled) {
+        res.writeHead(404, applySecurityHeaders());
+        res.end("Not found");
+      }
+    });
+    return;
+  }
+
+  // Ad reward routes (rewarded ad grants)
+  if (req.url?.split("?")[0]?.startsWith("/api/ads")) {
+    void handleAdRequest(req, res).then((handled) => {
+      if (!handled) {
+        res.writeHead(404, applySecurityHeaders());
+        res.end("Not found");
+      }
+    });
+    return;
+  }
+
+  // Promo code routes (user redemption + admin CRUD)
+  if (req.url?.split("?")[0]?.startsWith("/api/promo") || req.url?.split("?")[0]?.startsWith("/api/admin/promo-codes")) {
+    void handlePromoRequest(req, res).then((handled) => {
+      if (!handled) {
+        res.writeHead(404, applySecurityHeaders());
+        res.end("Not found");
+      }
+    });
+    return;
+  }
+
+  // API usage summary — per-user spend tracking
+  if (req.url?.split("?")[0] === "/api/usage" && req.method === "GET") {
+    if (!isSupabaseConfigured) {
+      res.writeHead(503, applySecurityHeaders({ "Content-Type": "application/json" }));
+      res.end(JSON.stringify({ error: "Supabase not configured" }));
+      return;
+    }
+    const authHeader = req.headers["authorization"];
+    const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!token) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Authentication required" }));
+      return;
+    }
+    void verifyToken(token).then(async (user) => {
+      if (!user) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid or expired token" }));
+        return;
+      }
+      const params = new URLSearchParams(req.url?.split("?")[1] ?? "");
+      const daysParam = parseInt(params.get("days") ?? "30", 10);
+      const days = isNaN(daysParam) ? 30 : Math.min(daysParam, 365);
+      const startDate = new Date();
+      startDate.setDate(startDate.getDate() - days);
+      const summary = await getUsageSummary(user.id, startDate);
+      res.writeHead(200, applySecurityHeaders({ "Content-Type": "application/json" }));
+      res.end(JSON.stringify(summary ?? { error: "Failed to load usage data" }));
+    });
+    return;
+  }
+
+  // ── Admin platform stats (admin-only) ──────────────────────────────────
+  if (req.url?.split("?")[0]?.startsWith("/api/admin/stats")) {
+    const headers = applySecurityHeaders({ "Content-Type": "application/json" });
+    if (!isSupabaseConfigured) {
+      res.writeHead(503, headers);
+      res.end(JSON.stringify({ error: "Supabase not configured" }));
+      return;
+    }
+    const authHeader = req.headers["authorization"];
+    const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!token) {
+      res.writeHead(401, headers);
+      res.end(JSON.stringify({ error: "Authentication required" }));
+      return;
+    }
+    void verifyToken(token).then(async (user) => {
+      if (!user || !user.email || !COMMAND_CENTER_ADMINS.includes(user.email.toLowerCase())) {
+        res.writeHead(403, headers);
+        res.end(JSON.stringify({ error: "Admin access required" }));
+        return;
+      }
+      const path = req.url!.split("?")[0];
+      const params = new URLSearchParams(req.url!.split("?")[1] ?? "");
+
+      try {
+        if (path === "/api/admin/stats/overview") {
+          const stats = await getOverviewStats(tenants);
+          res.writeHead(200, headers);
+          res.end(JSON.stringify(stats));
+        } else if (path === "/api/admin/stats/users") {
+          const days = Math.min(parseInt(params.get("days") ?? "30", 10) || 30, 365);
+          const stats = await getUserTimeseries(days);
+          res.writeHead(200, headers);
+          res.end(JSON.stringify(stats));
+        } else if (path === "/api/admin/stats/revenue") {
+          const months = Math.min(parseInt(params.get("months") ?? "12", 10) || 12, 24);
+          const [breakdown, history] = await Promise.all([
+            getRevenueBreakdown(),
+            getRevenueHistory(months),
+          ]);
+          res.writeHead(200, headers);
+          res.end(JSON.stringify({ ...breakdown, history }));
+        } else if (path === "/api/admin/stats/usage") {
+          const days = Math.min(parseInt(params.get("days") ?? "30", 10) || 30, 365);
+          const stats = await getUsageStats(days);
+          res.writeHead(200, headers);
+          res.end(JSON.stringify(stats));
+        } else if (path === "/api/admin/stats/conversion") {
+          const stats = await getConversionFunnel();
+          res.writeHead(200, headers);
+          res.end(JSON.stringify(stats));
+        } else if (path === "/api/admin/stats/subscriptions") {
+          const stats = await getSubscriptions();
+          res.writeHead(200, headers);
+          res.end(JSON.stringify(stats));
+        } else if (path === "/api/admin/stats/realtime") {
+          const stats = await getRealtimeStats(tenants);
+          res.writeHead(200, headers);
+          res.end(JSON.stringify(stats));
+        } else if (path === "/api/admin/stats/engagement") {
+          const stats = await getEngagementStats();
+          res.writeHead(200, headers);
+          res.end(JSON.stringify(stats));
+        } else if (path === "/api/admin/stats/financials") {
+          const days = Math.min(parseInt(params.get("days") ?? "30", 10) || 30, 365);
+          const stats = await getFinancialMetrics(days);
+          res.writeHead(200, headers);
+          res.end(JSON.stringify(stats));
+        } else {
+          res.writeHead(404, headers);
+          res.end(JSON.stringify({ error: "Unknown stats endpoint" }));
+        }
+      } catch (err) {
+        console.error("[admin-stats] error:", err);
+        res.writeHead(500, headers);
+        res.end(JSON.stringify({ error: "Failed to fetch stats" }));
+      }
+    });
+    return;
+  }
+
+  // OAuth callback for MCP servers (e.g. Robinhood)
+  if (req.url?.split("?")[0] === "/oauth/callback") {
+    const urlObj = new URL(req.url, `http://${req.headers.host}`);
+    const code = urlObj.searchParams.get("code");
+    const state = urlObj.searchParams.get("state");
+    const errorParam = urlObj.searchParams.get("error");
+
+    if (errorParam) {
+      res.writeHead(200, applySecurityHeaders({ "Content-Type": "text/html" }));
+      res.end(`<html><body><h2>Authentication failed</h2><p>${escapeHtml(errorParam)}</p><script>window.close();</script></body></html>`);
+      return;
+    }
+    if (!code || !state) {
+      res.writeHead(400, applySecurityHeaders({ "Content-Type": "text/html" }));
+      res.end("<html><body><h2>Missing code or state</h2></body></html>");
+      return;
+    }
+
+    void handleOAuthCallback(code, state).then(async (result) => {
+      console.log(`[oauth-callback] result: success=${result.success}, serverUrl=${result.serverUrl}, userId=${result.userId ?? "none"}, error=${result.error ?? "none"}`);
+      // Notify the user's WS session if they're online
+      if (result.userId) {
+        const sess = tenants.get(result.userId);
+        if (sess) {
+          if (result.success) {
+            // Refresh manager keys
+            const mcpKeys = await getUserMcpKeys(sess.user.id);
+            sess.manager.setMcpKeys(mcpKeys);
+            console.log(`[oauth-callback] Updated MCP keys for user ${result.userId} (${Object.keys(mcpKeys).length} keys)`);
+          }
+          sess.broadcast({
+            type: "mcp_oauth_complete",
+            serverUrl: result.serverUrl ?? "",
+            success: result.success,
+            error: result.error,
+          });
+        }
+      }
+      res.writeHead(200, applySecurityHeaders({ "Content-Type": "text/html" }));
+      if (result.success) {
+        res.end(`<html><body style="background:#111;color:#e0e0e0;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;"><div style="text-align:center;"><h2 style="color:#53b86b;">✓ Connected!</h2><p>You can close this window.</p></div><script>setTimeout(function(){try{window.close();}catch(e){}setTimeout(function(){window.location.href='/';},1000);},500);</script></body></html>`);
+      } else {
+        res.end(`<html><body style="background:#111;color:#e0e0e0;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;"><div style="text-align:center;"><h2 style="color:#e05d5d;">Authentication failed</h2><p>${escapeHtml(result.error ?? "Unknown error")}</p></div><script>setTimeout(function(){try{window.close();}catch(e){}setTimeout(function(){window.location.href='/';},2000);},1000);</script></body></html>`);
+      }
+    });
+    return;
+  }
+
+  // Agent screenshot endpoint — serves the latest browser frame as JPEG for iframe src
+  if (req.url?.split("?")[0]?.startsWith("/api/agent-screenshot/")) {
+    const agentId = req.url.split("/api/agent-screenshot/")[1]?.split("?")[0];
+    if (!agentId) {
+      res.writeHead(400, applySecurityHeaders({ "Content-Type": "text/plain" }));
+      res.end("Missing agent id");
+      return;
+    }
+    // Require authentication (skip in dev mode where auth is disabled)
+    if (isSupabaseConfigured) {
+      const params = new URLSearchParams(req.url?.split("?")[1] ?? "");
+      const token = params.get("token");
+      if (!token) {
+        res.writeHead(401, applySecurityHeaders({ "Content-Type": "text/plain" }));
+        res.end("Unauthorized");
+        return;
+      }
+      void verifyToken(token).then((verified) => {
+        if (!verified) {
+          res.writeHead(403, applySecurityHeaders({ "Content-Type": "text/plain" }));
+          res.end("Invalid or expired token");
+          return;
+        }
+        const frame = browserLastFrame(agentId);
+        if (frame) {
+          res.writeHead(200, applySecurityHeaders({
+            "Content-Type": "image/jpeg",
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+          }));
+          res.end(Buffer.from(frame, "base64"));
+        } else {
+          res.writeHead(404, applySecurityHeaders({ "Content-Type": "text/plain" }));
+          res.end("No screenshot available");
+        }
+      });
+      return;
+    }
+    const frame = browserLastFrame(agentId);
+    if (frame) {
+      res.writeHead(200, applySecurityHeaders({
+        "Content-Type": "image/jpeg",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+      }));
+      res.end(Buffer.from(frame, "base64"));
+    } else {
+      res.writeHead(404, applySecurityHeaders({ "Content-Type": "text/plain" }));
+      res.end("No screenshot available");
+    }
+    return;
+  }
+
+  // Agent workspace file server — serves files from an agent's workspace for iframe embedding
+  if (req.url?.split("?")[0]?.startsWith("/api/agent-workspace/")) {
+    const urlObj = new URL(req.url, `http://${req.headers.host}`);
+    const pathAfterPrefix = urlObj.pathname.slice("/api/agent-workspace/".length);
+    const slashIdx = pathAfterPrefix.indexOf("/");
+    if (slashIdx === -1) {
+      res.writeHead(400, applySecurityHeaders({ "Content-Type": "text/plain" }));
+      res.end("Missing file path");
+      return;
+    }
+    const agentId = pathAfterPrefix.slice(0, slashIdx);
+    const filePath = pathAfterPrefix.slice(slashIdx + 1);
+
+    const token = urlObj.searchParams.get("token");
+    if (!token) {
+      res.writeHead(401, applySecurityHeaders({ "Content-Type": "text/plain" }));
+      res.end("Unauthorized");
+      return;
+    }
+
+    void verifyToken(token).then(async (user) => {
+      if (!user) {
+        res.writeHead(403, applySecurityHeaders({ "Content-Type": "text/plain" }));
+        res.end("Invalid or expired token");
+        return;
+      }
+      const sess = tenants.get(user.id);
+      if (!sess) {
+        res.writeHead(404, applySecurityHeaders({ "Content-Type": "text/plain" }));
+        res.end("Session not found");
+        return;
+      }
+      const agentWs = sess.manager.getAgentWorkspace(agentId);
+      if (!agentWs) {
+        res.writeHead(404, applySecurityHeaders({ "Content-Type": "text/plain" }));
+        res.end("Agent workspace not found");
+        return;
+      }
+
+      // Path traversal protection
+      if (/(^|\/)\.\.(\/|$)/.test(filePath) || /[\x00-\x1f]/.test(filePath)) {
+        res.writeHead(400, applySecurityHeaders({ "Content-Type": "text/plain" }));
+        res.end("Invalid file path");
+        return;
+      }
+      const safePath = resolve(agentWs, filePath);
+      const rel = relative(agentWs, safePath);
+      if (rel.startsWith("..")) {
+        res.writeHead(403, applySecurityHeaders({ "Content-Type": "text/plain" }));
+        res.end("Path outside workspace");
+        return;
+      }
+
+      // Symlink protection
+      try {
+        const linkInfo = await lstat(safePath).catch(() => null);
+        if (linkInfo?.isSymbolicLink()) {
+          res.writeHead(403, applySecurityHeaders({ "Content-Type": "text/plain" }));
+          res.end("Symlinks are not allowed");
+          return;
+        }
+        let checkDir = safePath;
+        const wsRoot = resolve(agentWs);
+        while (checkDir !== wsRoot && checkDir !== dirname(checkDir)) {
+          const dirLink = await lstat(checkDir).catch(() => null);
+          if (dirLink?.isSymbolicLink()) {
+            res.writeHead(403, applySecurityHeaders({ "Content-Type": "text/plain" }));
+            res.end("Symlinks are not allowed");
+            return;
+          }
+          checkDir = dirname(checkDir);
+        }
+      } catch { /* file doesn't exist — 404 below */ }
+
+      // Content-Type mapping
+      const ext = extname(safePath).toLowerCase();
+      const contentTypes: Record<string, string> = {
+        ".html": "text/html; charset=utf-8",
+        ".htm": "text/html; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".js": "text/javascript; charset=utf-8",
+        ".mjs": "text/javascript; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".svg": "image/svg+xml",
+        ".webp": "image/webp",
+        ".ico": "image/x-icon",
+        ".woff": "font/woff",
+        ".woff2": "font/woff2",
+        ".ttf": "font/ttf",
+        ".otf": "font/otf",
+        ".txt": "text/plain; charset=utf-8",
+        ".md": "text/plain; charset=utf-8",
+        ".csv": "text/csv; charset=utf-8",
+        ".xml": "application/xml; charset=utf-8",
+        ".pdf": "application/pdf",
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+      };
+      const contentType = contentTypes[ext] ?? "application/octet-stream";
+
+      try {
+        const data = await readFile(safePath);
+        res.writeHead(200, applySecurityHeaders({
+          "Content-Type": contentType,
+          "Cache-Control": "no-store, no-cache, must-revalidate",
+          "X-Frame-Options": "SAMEORIGIN",
+          "Content-Security-Policy": "default-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:; frame-ancestors 'self';",
+        }));
+        res.end(data);
+      } catch {
+        res.writeHead(404, applySecurityHeaders({ "Content-Type": "text/plain" }));
+        res.end("File not found");
+      }
+    });
+    return;
+  }
+
+  // MCP catalog — curated server directory
+  if (req.url?.split("?")[0]?.startsWith("/api/mcp-catalog")) {
+    handleMcpCatalogRequest(req, res).catch(err => {
+      console.error("[mcp-catalog] Error:", err);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal server error" }));
+      }
+    });
+    return;
+  }
+
+  // PulseMCP community search — search 22k+ community MCP servers
+  if (req.url?.split("?")[0] === "/api/pulsemcp-search") {
+    if (isSupabaseConfigured) {
+      const authHeader = req.headers["authorization"];
+      const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+      if (!token) {
+        res.writeHead(401, applySecurityHeaders({ "Content-Type": "application/json" }));
+        res.end(JSON.stringify({ error: "Authentication required" }));
+        return;
+      }
+      void verifyToken(token).then((user) => {
+        if (!user) {
+          res.writeHead(403, applySecurityHeaders({ "Content-Type": "application/json" }));
+          res.end(JSON.stringify({ error: "Invalid or expired token" }));
+          return;
+        }
+        const params = new URLSearchParams(req.url?.split("?")[1] ?? "");
+        const search = params.get("search") ?? "";
+        if (!search) {
+          res.writeHead(400, applySecurityHeaders({ "Content-Type": "application/json" }));
+          res.end(JSON.stringify({ error: "Missing search parameter" }));
+          return;
+        }
+        searchPulseMCPStructured(search, 20).then((results) => {
+          res.writeHead(200, applySecurityHeaders({ "Content-Type": "application/json" }));
+          res.end(JSON.stringify({ results, count: results.length }));
+        }).catch(() => {
+          res.writeHead(500, applySecurityHeaders({ "Content-Type": "application/json" }));
+          res.end(JSON.stringify({ error: "Search failed" }));
+        });
+      });
+      return;
+    }
+    const params = new URLSearchParams(req.url?.split("?")[1] ?? "");
+    const search = params.get("search") ?? "";
+    if (!search) {
+      res.writeHead(400, applySecurityHeaders({ "Content-Type": "application/json" }));
+      res.end(JSON.stringify({ error: "Missing search parameter" }));
+      return;
+    }
+    searchPulseMCPStructured(search, 20).then((results) => {
+      res.writeHead(200, applySecurityHeaders({ "Content-Type": "application/json" }));
+      res.end(JSON.stringify({ results, count: results.length }));
+    }).catch(() => {
+      res.writeHead(500, applySecurityHeaders({ "Content-Type": "application/json" }));
+      res.end(JSON.stringify({ error: "Search failed" }));
+    });
+    return;
+  }
+
+  // Legal pages — serve from distDir (Vite copies from client/public/)
+  const legalPath = req.url?.split("?")[0] ?? "";
+  if (legalPath === "/privacy" || legalPath === "/terms") {
+    const htmlFile = legalPath.slice(1) + ".html"; // "/privacy" → "privacy.html"
+    readFile(join(distDir, htmlFile)).then((data) => {
+      res.writeHead(200, applySecurityHeaders({ "Content-Type": "text/html; charset=utf-8" }));
+      res.end(data);
+    }).catch(() => {
+      res.writeHead(404, applySecurityHeaders());
+      res.end("Not found");
+    });
+    return;
+  }
+
+  // Public trophy room: /u/{username}
+  const trophyPath = req.url?.split("?")[0] ?? "";
+  if (trophyPath.startsWith("/u/")) {
+    const username = decodeURIComponent(trophyPath.slice(3));
+    if (username) {
+      void (async () => {
+        try {
+          const profile = await getTrophyProfile(username);
+          if (!profile) {
+            res.writeHead(404, applySecurityHeaders({ "Content-Type": "text/html; charset=utf-8" }));
+            res.end(renderTrophyNotFound(username));
+            return;
+          }
+          res.writeHead(200, applySecurityHeaders({ "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=300" }));
+          res.end(renderTrophyPage(profile));
+        } catch (err) {
+          console.error("[trophy] page error:", err);
+          res.writeHead(500, applySecurityHeaders());
+          res.end("Internal server error");
+        }
+      })();
+      return;
+    }
+  }
+
+  // Docs — serve static files from the project's docs/ directory
+  const docsPath = req.url?.split("?")[0] ?? "";
+  if (docsPath === "/docs" || docsPath.startsWith("/docs/")) {
+    void (async () => {
+      const subPath = docsPath === "/docs" ? "/index.html" : docsPath.replace(/^\/docs\//, "/");
+      const filePath = normalize(join(rootDir, "docs", subPath));
+      if (!filePath.startsWith(join(rootDir, "docs"))) {
+        res.writeHead(403, applySecurityHeaders());
+        res.end("Forbidden");
+        return;
+      }
+      try {
+        const info = await stat(filePath);
+        if (info.isDirectory()) throw new Error("is directory");
+        const data = await readFile(filePath);
+        const mime = MIME[extname(filePath)] ?? "application/octet-stream";
+        const docsHeaders: Record<string, string> = {
+          "Content-Type": mime,
+          "Cache-Control": "no-cache",
+          "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: blob: https:; connect-src 'self' wss: https:; font-src 'self' data: https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' https:; frame-ancestors 'none'; worker-src 'self' blob:;",
+        };
+        res.writeHead(200, docsHeaders);
+        res.end(data);
+      } catch {
+        res.writeHead(404, applySecurityHeaders());
+        res.end("Not found");
+      }
+    })();
+    return;
+  }
+
+  // Pitch deck PDF — serve from pitchdeck/ directory
+  const urlPath = req.url?.split("?")[0] ?? "/";
+  if (urlPath === "/pitchdeck.pdf") {
+    void (async () => {
+      try {
+        const pdfPath = join(rootDir, "pitchdeck", "Agent_Heights.pdf");
+        const data = await readFile(pdfPath);
+        res.writeHead(200, applySecurityHeaders({
+          "Content-Type": "application/pdf",
+          "Cache-Control": "public, max-age=3600",
+          "Content-Disposition": 'inline; filename="Agent_Heights_Pitch_Deck.pdf"',
+        }));
+        res.end(data);
+      } catch {
+        res.writeHead(404, applySecurityHeaders());
+        res.end("Pitch deck not found");
+      }
+    })();
+    return;
+  }
+
+  // Dashboard routes — serve from dist-dashboard/
+  if (urlPath === "/dashboard" || urlPath.startsWith("/dashboard/")) {
+    serveDashboard(req, res).catch(() => {
+      res.writeHead(500, applySecurityHeaders());
+      res.end("Internal server error");
+    });
+    return;
+  }
+
+  handleMarketplaceRequest(req, res).then((handled) => {
+    if (!handled) {
+      serveStatic(req, res).catch(() => {
+        res.writeHead(500, applySecurityHeaders());
+        res.end("Internal server error");
+      });
+    }
+  });
+});
+
+const wss = new WebSocketServer({ server });
+
+// Allowed origins for WebSocket connections (same-origin + explicit overrides)
+const WS_ALLOWED_ORIGINS = new Set<string>(
+  (process.env.WS_ALLOWED_ORIGINS ?? "").split(",").map(s => s.trim()).filter(Boolean),
+);
+
+function isWsOriginAllowed(origin: string | undefined, req: IncomingMessage): boolean {
+  // No origin header = non-browser client (e.g. curl) — allow in dev only
+  if (!origin) return process.env.NODE_ENV !== "production";
+  // Always allow localhost / 127.0.0.1 for dev
+  try {
+    const parsed = new URL(origin);
+    if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") return true;
+  } catch { /* invalid origin */ }
+  // Check explicit allowlist
+  if (WS_ALLOWED_ORIGINS.has(origin)) return true;
+  // Check same-origin: origin matches the request's host
+  const host = (req.headers["x-forwarded-host"] as string) || req.headers.host || "";
+  if (host && origin.replace(/\/$/, "") === `${new URL(origin).protocol}//${host}`) return true;
+  return false;
+}
+
+/** Wait for an auth message from the client with a timeout. Returns the token or null. */
+function waitForAuthMessage(ws: WebSocket, timeoutMs: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        ws.removeAllListeners("message");
+        resolve(null);
+      }
+    }, timeoutMs);
+
+    ws.on("message", (raw: Buffer) => {
+      if (settled) return;
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === "auth" && typeof msg.token === "string") {
+          settled = true;
+          clearTimeout(timer);
+          ws.removeAllListeners("message");
+          resolve(msg.token as string);
+        }
+      } catch {
+        // ignore non-JSON or malformed messages while waiting for auth
+      }
+    });
+  });
+}
+
+/** Broadcast current presenters to all players in a room. */
+function broadcastPresenters(roomId: string): void {
+  const room = tenants.getRoom(roomId);
+  if (!room) return;
+  const presenters = tenants.getRoomPresenters(roomId);
+  for (const [pid] of room.players) {
+    const peerSess = tenants.get(pid);
+    if (peerSess) {
+      peerSess.broadcast({ type: "presenters_update", roomId, presenters });
+    }
+  }
+}
+
+wss.on("connection", async (ws, req) => {
+  // Validate WebSocket origin to prevent cross-site WebSocket hijacking
+  const origin = req.headers["origin"] as string | undefined;
+  if (!isWsOriginAllowed(origin, req)) {
+    console.warn(`[ws] Rejected connection from origin: ${origin ?? "(none)"}`);
+    ws.close(4003, "Origin not allowed");
+    return;
+  }
+
+  const url = new URL(req.url ?? "", "http://localhost");
+
+  // ── Spectator connection (read-only) ───────────────────────────────
+  // Spectator mode is only allowed when LIVESTREAM_USER_ID is explicitly set.
+  // In production, we also require it to not be "dev" to avoid leaking dev data.
+  if (url.searchParams.get("spectator") === "1") {
+    const livestreamUserId = process.env.LIVESTREAM_USER_ID ?? "";
+    const isProd = process.env.NODE_ENV === "production";
+    if (!livestreamUserId || (isProd && livestreamUserId === "dev")) {
+      ws.close(4003, "Spectator mode is not enabled");
+      return;
+    }
+
+    // Ensure the observed session exists
+    let sess: UserSession;
+    try {
+      sess = await tenants.getOrCreate({ id: livestreamUserId, email: null });
+    } catch (err) {
+      console.error("[spectator] failed to get livestream session:", err);
+      ws.close(1011, "Livestream office not available");
+      return;
+    }
+
+    // Register as spectator
+    sess.spectators.add(ws);
+    console.log(`[spectator] connected — observing office of ${livestreamUserId} (${sess.spectators.size} spectators total)`);
+
+    // Send snapshot of the observed office
+    const snap = sess.manager.snapshot();
+    ws.send(JSON.stringify({
+      type: "snapshot",
+      agents: snap.agents,
+      logs: snap.logs,
+      player: null,
+      settings: sess.manager.settings,
+      board: snap.board,
+      schedules: sess.manager.snapshotSchedules(),
+      world: sess.manager.worldState(),
+    } satisfies ServerMsg));
+
+    // Send mailbox states
+    for (const mb of sess.manager.getMailboxSnapshots()) {
+      ws.send(JSON.stringify({ type: "mailbox_update", ...mb } satisfies ServerMsg));
+    }
+
+    ws.on("message", async (raw) => {
+      let msg: ClientMsg;
+      try {
+        msg = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+
+      // Only spectator_chat is accepted — forward to the Office Manager
+      if (msg.type === "spectator_chat") {
+        const text = `[${msg.fromName}]: ${msg.text}`.slice(0, 500);
+        console.log(`[spectator] chat from ${msg.fromName}: ${msg.text}`);
+        sess.manager.chat("office-manager", text);
+        return;
+      }
+
+      // Ignore all other message types from spectators
+      console.warn(`[spectator] rejected message type: ${msg.type}`);
+    });
+
+    ws.on("close", () => {
+      sess.spectators.delete(ws);
+      console.log(`[spectator] disconnected (${sess.spectators.size} spectators remaining)`);
+    });
+
+    return;
+  }
+
+  // ── Normal authenticated connection ─────────────────────────────────
+  let user: AuthUser;
+
+  if (isSupabaseConfigured) {
+    // Backward-compatible fallback: token in URL query param
+    // (preferred path is auth message, but old clients still use this)
+    const urlToken = url.searchParams.get("token");
+    if (urlToken) {
+      const verified = await verifyToken(urlToken);
+      if (!verified) {
+        ws.close(4003, "Invalid or expired token");
+        return;
+      }
+      user = verified;
+    } else {
+      // New pattern: send auth_required, wait for auth message
+      ws.send(JSON.stringify({ type: "auth_required" } satisfies ServerMsg));
+
+      // Wait for auth message with a 10s timeout
+      const authResult = await waitForAuthMessage(ws, 10_000);
+      if (!authResult) {
+        ws.close(4001, "No token provided within timeout");
+        return;
+      }
+      const verified = await verifyToken(authResult);
+      if (!verified) {
+        ws.close(4003, "Invalid or expired token");
+        return;
+      }
+      user = verified;
+    }
+  } else {
+    user = { id: "dev", email: null };
+  }
+
+  const t0 = Date.now();
+  const existingBefore = tenants.get(user.id);
+  const sess = await tenants.getOrCreate(user);
+  console.log(`[ws] getOrCreate ${user.id} took ${Date.now() - t0}ms (existing=${!!existingBefore})`);
+  // If this is a reconnect for an existing session, cancel any pending disconnect timer
+  if (existingBefore) {
+    tenants.handleClientReconnect(user.id);
+  }
+  sess.clients.add(ws);
+
+  // Notify friends that this user is now online
+  if (user.id !== "dev") {
+    void getAcceptedFriendIds(user.id).then((friendIds) => {
+      const name = sess.player?.name ?? "Boss";
+      const roomId = sess.roomId;
+      const room = roomId ? tenants.getRoom(roomId) : null;
+      for (const fid of friendIds) {
+        const fb = tenants.getSessionBroadcast(fid);
+        if (fb) {
+          fb({ type: "friend_online", userId: user.id, name, roomId, roomName: room?.name ?? "" });
+        }
+      }
+    }).catch(() => {});
+  }
+
+  // Load persisted activity timestamps for retention system
+  if (user.id !== "dev") {
+    void loadUserActivity(user.id).then(async (activity) => {
+      const prevActiveAt = activity.lastActiveAt;
+      sess.manager.lastActiveAt = Date.now(); // they're active right now
+      sess.manager.lastPlatformEngagementAt = activity.lastPlatformEngagementAt;
+
+      // Generate "while you were away" report if away > 2h
+      if (prevActiveAt > 0 && Date.now() - prevActiveAt >= 2 * 60 * 60 * 1000) {
+        try {
+          const report = await generateAwayReport(sess.manager, user.id, prevActiveAt);
+          if (report) {
+            ws.send(JSON.stringify({ type: "away_report", report } satisfies ServerMsg));
+          }
+        } catch (err) {
+          console.warn("[away-report] failed to generate:", err);
+        }
+      }
+
+      // Daily return streak — fires when user returns on a different calendar day
+      if (prevActiveAt > 0) {
+        const prevDay = new Date(prevActiveAt).toDateString();
+        const today = new Date().toDateString();
+        if (prevDay !== today) {
+          void recordSignalByKey(user.id, "daily_return_streak");
+          const xpResult = addXp(user.id, 25);
+          if (xpResult.leveledUp) {
+            const progress = getProgress(user.id);
+            ws.send(JSON.stringify({ type: "office_progress", progress } satisfies ServerMsg));
+          }
+        }
+      }
+    }).catch(() => {});
+    // Preload aspiration profile into cache for sync access by concierge
+    void preloadProfile(user.id).catch(() => {});
+  }
+
+  // Send snapshot based on which room the user is in
+  const currentRoom = sess.roomId ? tenants.getRoom(sess.roomId) : null;
+  const accessLevel = currentRoom ? tenants.computeAccessLevel(currentRoom, sess.user.id) : "no_access";
+
+  // ── Send room_state BEFORE snapshot ──────────────────────────────────
+  // The client sets initialDataReady when snapshot arrives and uses roomId
+  // from room_state to pick the correct theme. Sending room_state first
+  // ensures roomId is set before the office scene starts.
+  if (sess.roomId && currentRoom) {
+    ws.send(JSON.stringify({
+      type: "room_state",
+      roomId: sess.roomId,
+      name: currentRoom.name,
+      players: tenants.getRoomPlayers(sess.roomId),
+      privateOfficeId: sess.privateOfficeId ?? undefined,
+      projectorChannel: currentRoom.projectorChannel,
+      accessLevel,
+      roomType: currentRoom.roomType,
+    } satisfies ServerMsg));
+  }
+
+  if (currentRoom && accessLevel !== "no_access") {
+    // Use the room's agent manager (personal for private, shared for org)
+    const roomMgr = tenants.getRoomManager(currentRoom.id);
+    if (roomMgr) {
+      const snap = roomMgr.snapshot();
+      const logCount = Object.fromEntries(Object.entries(snap.logs).map(([id, l]) => [id, l.length]));
+      console.log(`[snapshot] initial: user=${sess.user.id} room=${currentRoom.id} agents=${snap.agents.length} logs=${JSON.stringify(logCount)}`);
+      const cachedProfile = getCachedProfile(sess.user.id);
+      ws.send(JSON.stringify({
+        type: "snapshot",
+        agents: snap.agents,
+        logs: snap.logs,
+        player: sess.player,
+        settings: roomMgr.settings,
+        board: snap.board,
+        schedules: roomMgr.snapshotSchedules(),
+        world: roomMgr.worldState(),
+        aspirationProfile: cachedProfile ? { warrior: cachedProfile.warrior, builder: cachedProfile.builder, explorer: cachedProfile.explorer, puzzle_solver: cachedProfile.puzzle_solver, creator: cachedProfile.creator, strategist: cachedProfile.strategist, dominant: cachedProfile.dominant } : undefined,
+        aspirationUnlocks: getUnlocks(sess.user.id),
+      } satisfies ServerMsg));
+      // Send mailbox states so flags are correct on initial load
+      for (const mb of roomMgr.getMailboxSnapshots()) {
+        ws.send(JSON.stringify({ type: "mailbox_update", ...mb } satisfies ServerMsg));
+      }
+      // Send platform connection states so client knows which platforms are connected
+      ws.send(JSON.stringify({ type: "platform_connection", states: roomMgr.getPlatformConnectionStates() } satisfies ServerMsg));
+    } else {
+      const fallbackProfile = getCachedProfile(sess.user.id);
+      ws.send(JSON.stringify({ type: "snapshot", agents: [], logs: {}, board: [], schedules: [], player: sess.player, settings: sess.manager.settings, world: null, aspirationProfile: fallbackProfile ? { warrior: fallbackProfile.warrior, builder: fallbackProfile.builder, explorer: fallbackProfile.explorer, puzzle_solver: fallbackProfile.puzzle_solver, creator: fallbackProfile.creator, strategist: fallbackProfile.strategist, dominant: fallbackProfile.dominant } : undefined, aspirationUnlocks: getUnlocks(sess.user.id) } satisfies ServerMsg));
+    }
+  } else {
+    // HQ2 or no room — empty snapshot
+    const hqProfile = getCachedProfile(sess.user.id);
+    ws.send(JSON.stringify({
+      type: "snapshot",
+      agents: [],
+      logs: {},
+      board: [],
+      schedules: [],
+      player: sess.player,
+      settings: sess.manager.settings,
+      world: null,
+      aspirationProfile: hqProfile ? { warrior: hqProfile.warrior, builder: hqProfile.builder, explorer: hqProfile.explorer, puzzle_solver: hqProfile.puzzle_solver, creator: hqProfile.creator, strategist: hqProfile.strategist, dominant: hqProfile.dominant } : undefined,
+      aspirationUnlocks: getUnlocks(sess.user.id),
+    } satisfies ServerMsg));
+    // Still send mailbox + platform states from the user's personal manager
+    for (const mb of sess.manager.getMailboxSnapshots()) {
+      ws.send(JSON.stringify({ type: "mailbox_update", ...mb } satisfies ServerMsg));
+    }
+    ws.send(JSON.stringify({ type: "platform_connection", states: sess.manager.getPlatformConnectionStates() } satisfies ServerMsg));
+  }
+
+  // Tell the client whether they have an API key set
+  ws.send(JSON.stringify({ type: "api_key_status", hasKey: sess.apiKey != null } satisfies ServerMsg));
+
+  // Send current seasonal event
+  const seasonalEvent = getCurrentSeasonalEvent();
+  ws.send(JSON.stringify({
+    type: "seasonal_event",
+    eventName: seasonalEvent.eventName,
+    theme: seasonalEvent.theme,
+    icon: seasonalEvent.icon,
+    description: seasonalEvent.description,
+    decorations: seasonalEvent.decorations,
+  } satisfies ServerMsg));
+
+  // ── Send rooms_list before slow DB queries ───────────────────────────
+  // rooms_list is needed for the social panel but no longer gates office
+  // scene start (initialDataReady is now set on snapshot arrival).
+  const sendRoomsList = () => {
+    const rooms = tenants.getRoomsForUser(sess.user.id).map(r => ({ roomId: r.id, name: r.name, isPrivate: r.isPrivate, roomType: r.roomType, orgId: r.orgId }));
+    ws.send(JSON.stringify({ type: "rooms_list", rooms } satisfies ServerMsg));
+  };
+  sendRoomsList();
+
+  // Send saved outfits
+  void sendOutfits(ws, sess);
+
+  // ── Non-blocking post-connect DB queries ────────────────────────────
+  // These run in the background after rooms_list is sent so the client can
+  // start rendering the office scene while achievements/payment data loads.
+  if (isSupabaseConfigured) {
+    void (async () => {
+      const [achResult, payResult, delResult] = await Promise.all([
+        // Achievements
+        Promise.resolve(
+          supabaseAdmin
+            .from("heights_cloud_achievements")
+            .select("unlocked, stats, sets")
+            .eq("user_id", user.id)
+            .maybeSingle()
+        ).catch(() => ({ data: null, error: null })),
+        // Payment status (only if Stripe is configured)
+        isStripeConfigured
+          ? getUserPaymentStatus(user.id, user.email).catch(() => null)
+          : Promise.resolve(null as null),
+        // Deletion status
+        getDeletionStatus(user.id).catch(() => ({ scheduledDeletionAt: null })),
+      ]);
+
+      if (ws.readyState !== ws.OPEN) return;
+
+      // Send achievements
+      const achRow = achResult.data;
+      ws.send(JSON.stringify({
+        type: "achievements_sync",
+        unlocked: achRow?.unlocked ?? [],
+        stats: achRow?.stats ?? {},
+        sets: achRow?.sets ?? {},
+      } satisfies ServerMsg));
+
+      // Send payment status
+      if (payResult) {
+        sess.manager.subscriptionTier = payResult.subscriptionTier;
+        sess.manager.agentLimit = payResult.agentLimit + getMaxAgents(sess.user.id) - 3;
+        sess.manager.entrancePaid = payResult.entrancePaid;
+        sess.manager.entryMethod = payResult.entryMethod;
+        // Send payment status immediately, fetch monthlySpend in background
+        ws.send(JSON.stringify({
+          type: "payment_status",
+          entrancePaid: payResult.entrancePaid,
+          subscriptionActive: payResult.subscriptionActive,
+          subscriptionStatus: payResult.subscriptionStatus,
+          subscriptionTier: payResult.subscriptionTier,
+          agentLimit: payResult.agentLimit,
+          usageCap: payResult.usageCap,
+          currentPeriodEnd: payResult.currentPeriodEnd,
+          monthlySpend: 0,
+        } satisfies ServerMsg));
+        // Fetch actual monthly spend and send as usage_update
+        if (sess.user.id) {
+          void getMonthlySpend(sess.user.id).then((monthlySpend) => {
+            if (ws.readyState !== ws.OPEN) return;
+            ws.send(JSON.stringify({
+              type: "usage_update",
+              monthlySpend,
+              usageCap: payResult.usageCap,
+            } satisfies ServerMsg));
+          }).catch(() => {});
+        }
+      }
+
+      // Send deletion status
+      if (delResult?.scheduledDeletionAt) {
+        ws.send(JSON.stringify({ type: "deletion_scheduled", scheduledDeletionAt: delResult.scheduledDeletionAt } satisfies ServerMsg));
+      }
+    })();
+  }
+
+  // Send initial friends list
+  if (sess.user.id !== "dev") {
+    void (async () => {
+      const onlineIds = tenants.getOnlineUserIds();
+      const roomInfo = tenants.getOnlineUserInfo();
+      const { friends, pending } = await getFriendsList(sess.user.id, onlineIds, roomInfo);
+      ws.send(JSON.stringify({ type: "friends_list", friends, pending } satisfies ServerMsg));
+    })().catch(() => {});
+  }
+
+  // Send initial room occupancy
+  const occupancy = tenants.getRoomOccupancyForUser(sess.user.id);
+  if (occupancy.length > 0) {
+    ws.send(JSON.stringify({ type: "room_occupancy", rooms: occupancy } satisfies ServerMsg));
+  }
+
+  // Sync any active IDE bridge sessions
+  ideBridge.syncSessions(sess.user.id, sess.broadcast);
+  // Sync org-level sessions (from org members)
+  ideBridge.syncOrgSessions(sess.user.id);
+  // Send current privacy setting
+  sess.broadcast({ type: "ide_bridge_privacy", visibility: ideBridge.getVisibility(sess.user.id) });
+
+  // ── Token refresh timer ──────────────────────────────────────────────
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let expiryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function scheduleTokenRefresh(token: string): void {
+    if (refreshTimer) clearTimeout(refreshTimer);
+    if (expiryTimer) clearTimeout(expiryTimer);
+    if (!isSupabaseConfigured) return;
+
+    const exp = getTokenExpiry(token);
+    if (!exp) return;
+
+    const now = Math.floor(Date.now() / 1000);
+    const ttl = exp - now; // seconds until expiry
+
+    // Send refresh_token 5 min before expiry (or immediately if < 5 min left)
+    const refreshIn = Math.max((ttl - 300) * 1000, 0);
+
+    refreshTimer = setTimeout(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "refresh_token" } satisfies ServerMsg));
+        // Close connection if not renewed within 60s
+        expiryTimer = setTimeout(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.close(4003, "Token expired — not renewed");
+          }
+        }, 60_000);
+      }
+    }, refreshIn);
+  }
+
+  if (isSupabaseConfigured) {
+    const initialToken = url.searchParams.get("token");
+    if (initialToken) scheduleTokenRefresh(initialToken);
+  }
+
+  ws.on("message", async (raw) => {
+    let msg: ClientMsg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    try {
+      const { manager, session: sessLog, save } = sess;
+
+      // Track user activity for retention system
+      manager.lastActiveAt = Date.now();
+
+      // Track concierge engagement signals
+      trackActivity(sess.user.id, {
+        agentCount: manager.snapshot().agents.filter((a) => a.id !== "office-manager" && a.id !== "hermes" && a.id !== "wizard").length,
+        taskCount: manager.snapshot().board.length,
+        chatted: msg.type === "chat",
+        connectedPlatform: manager.getPlatformConnectionStates().some((p) => p.connected),
+      });
+
+      // Unified permission system: check access level for the current room
+      const accessLevel = tenants.getRoomAccessLevel(sess.user.id);
+
+      // Fast path: high-frequency messages use sync in-memory rate limiting
+      const allowed = FAST_PATH_TYPES.has(msg.type)
+        ? rateLimit(sess.user.id, msg.type)
+        : await rateLimitAsync(sess.user.id, msg.type);
+      if (!allowed) {
+        console.warn(`[rate-limit] BLOCKED user=${sess.user.id} type=${msg.type}`);
+        // Throttle the "too many requests" toast itself — only one per 5s
+        const rlKey = `rltoast:${sess.user.id}`;
+        const now = Date.now();
+        if (!rateLimitToastMap.has(rlKey) || now - rateLimitToastMap.get(rlKey)! > 5000) {
+          rateLimitToastMap.set(rlKey, now);
+          const data = JSON.stringify({ type: "toast", text: "Too many requests — slow down." });
+          if (ws.readyState === WebSocket.OPEN) ws.send(data);
+        }
+        return;
+      }
+
+      // Post-rate-limit check: if this is a chat message to a busy agent, reject.
+      // Sent directly via ws.send() so it doesn't get forwarded to room peers.
+      if (msg.type === "chat" && accessLevel !== "no_access") {
+        const roomMgr = tenants.getRoomManager(sess.roomId!);
+        const mgr0 = roomMgr ?? manager;
+        const agent0 = mgr0.getAgentInfo(msg.agentId);
+        if (agent0 && (agent0.status === "thinking" || agent0.status === "working")) {
+          const data = JSON.stringify({ type: "toast", text: `${agent0.name} is heads-down right now.` });
+          if (ws.readyState === WebSocket.OPEN) ws.send(data);
+          return;
+        }
+      }
+
+      // Account-level actions — bypass room permission checks
+      if (msg.type === "delete_account") {
+        const result = await scheduleDeletion(sess.user.id);
+        if (result.error) {
+          sess.broadcast({ type: "toast", text: `Failed to schedule deletion: ${result.error}` });
+        } else if (result.scheduledDeletionAt) {
+          // Stop all running agents — data preserved during grace period
+          manager.stopAll();
+          sess.broadcast({ type: "deletion_scheduled", scheduledDeletionAt: result.scheduledDeletionAt });
+          sess.broadcast({ type: "toast", text: `Account scheduled for deletion in ${GRACE_PERIOD_DAYS} days. Sign in anytime to cancel.` });
+        }
+        return;
+      }
+      if (msg.type === "cancel_deletion") {
+        const result = await cancelDeletion(sess.user.id);
+        if (result.error) {
+          sess.broadcast({ type: "toast", text: `Failed to cancel deletion: ${result.error}` });
+        } else {
+          sess.broadcast({ type: "deletion_cancelled" });
+          sess.broadcast({ type: "toast", text: "Account deletion cancelled — welcome back!" });
+        }
+        return;
+      }
+
+      // Permission tiers: manage > talk > tour > no_access
+      const MANAGE_ONLY = new Set(["hire", "assign", "assign_new", "assign_all", "stop", "stop_all", "resume_agents", "fire", "vacation", "restore", "recruit", "create_card", "assign_card", "move_card", "delete_card", "create_schedule", "update_schedule", "delete_schedule", "set_settings", "set_api_key", "set_mcp_key", "check_mcp_keys", "start_mcp_oauth", "submit_mcp_oauth_code", "get_cdp_wallet", "get_cdp_policy", "set_cdp_policy", "get_cdp_tx_history", "create_cdp_onramp", "clear", "clear_all", "rename", "set_agent_acl", "set_mailbox_platform", "steer_agent", "pause_agent", "resume_agent", "gate_tool", "halt_agent"]);
+      const TALK_OR_ABOVE = new Set(["chat", "agent_view_start", "agent_view_stop", "agent_broadcast_start", "agent_broadcast_stop", "agent_broadcast_html", "agent_fs_list", "agent_fs_read", "agent_fs_write", "agent_fs_delete", "agent_fs_upload", "agent_log_subscribe", "agent_log_unsubscribe", "agent_inject_task", "agent_memory_request"]);
+
+      // IDE bridge messages — account-level, bypass room permission checks
+      if (msg.type === "external_connect" || msg.type === "external_activity" || msg.type === "external_disconnect") {
+        // Fall through to the switch below — just skip permission gates
+      } else if (MANAGE_ONLY.has(msg.type) && accessLevel !== "manage") {
+        const data = JSON.stringify({ type: "toast", text: accessLevel === "tour" ? "Tour mode — you can look around but not manage agents. Ask an admin for talk access." : "Only room managers can do that." });
+        if (ws.readyState === WebSocket.OPEN) ws.send(data);
+        return;
+      }
+
+      if (TALK_OR_ABOVE.has(msg.type) && accessLevel !== "talk" && accessLevel !== "manage") {
+        const data = JSON.stringify({ type: "toast", text: accessLevel === "tour" ? "Tour mode — you can see agents but not interact. Ask an admin for talk access." : "No agents here — visit an office to chat." });
+        if (ws.readyState === WebSocket.OPEN) ws.send(data);
+        return;
+      }
+
+      // Use the room's agent manager (shared for org rooms, owner's for private rooms)
+      const roomMgr = sess.roomId ? tenants.getRoomManager(sess.roomId) : null;
+      const activeManager = roomMgr ?? manager;
+
+      switch (msg.type) {
+        case "setup": {
+          const name = String(msg.player?.name ?? "").trim().slice(0, 24);
+          const workspace = String(msg.player?.workspace ?? "").trim().slice(0, 32);
+          if (!name || !workspace) break;
+          const appearance = msg.player?.appearance ?? null;
+          const changed =
+            !sess.player || sess.player.name !== name || sess.player.workspace !== workspace;
+          const appearanceChanged = appearance && (!sess.player || !sess.player.appearance || JSON.stringify(sess.player.appearance) !== JSON.stringify(appearance));
+          if (changed) {
+            sess.player = { name, workspace, appearance };
+            manager.bossName = name;
+            sessLog.setPlayer(sess.player);
+            save.setPlayer(sess.player);
+            sess.broadcast({ type: "player", player: sess.player });
+          } else if (appearance && sess.player && !sess.player.appearance) {
+            sess.player = { name: sess.player.name, workspace: sess.player.workspace, appearance };
+            save.setPlayer(sess.player);
+            sess.broadcast({ type: "player", player: sess.player });
+          }
+          // Broadcast appearance change to room peers
+          if (appearanceChanged && sess.roomId) {
+            const room = tenants.getRoom(sess.roomId);
+            if (room) {
+              const rp = room.players.get(sess.user.id);
+              if (rp) rp.appearance = appearance;
+              for (const [pid] of room.players) {
+                if (pid === sess.user.id) continue;
+                const otherSess = tenants.get(pid);
+                if (otherSess) {
+                  otherSess.broadcast({
+                    type: "player_appearance",
+                    roomId: sess.roomId,
+                    userId: sess.user.id,
+                    appearance,
+                  });
+                }
+              }
+            }
+          }
+          break;
+        }
+        case "set_settings":
+          activeManager.setSettings(msg.settings);
+          void recordSignalByKey(sess.user.id, "office_theme_changed");
+          if (msg.settings.railway?.enabled) {
+            checkRailwayStatus().then((status) => {
+              sess.broadcast({ type: "railway_status", ok: status.ok, message: status.message });
+            });
+          }
+          break;
+        case "hire":
+          await activeManager.hire(msg.name, msg.provider, msg.model, msg.systemPrompt ?? "", msg.role ?? "worker", msg.sprite, msg.appearance, msg.mcpServers, msg.personality, msg.cdpSolana, msg.crossmintWallet, msg.isPremium, msg.circleServices, msg.skills, msg.acl, msg.monidEnabled);
+          void ProfileManager.ingestHire(sess.user.id, msg.name).catch(() => {});
+          void recordSignalByKey(sess.user.id, "strategic_hire");
+          const xpResult = addXp(sess.user.id, 50);
+          if (xpResult.leveledUp) {
+            const progress = getProgress(sess.user.id);
+            ws.send(JSON.stringify({ type: "office_progress", progress } satisfies ServerMsg));
+            ws.send(JSON.stringify({ type: "toast", text: `Office reached Level ${progress.level}!` } satisfies ServerMsg));
+          }
+          if (msg.mcpServers && msg.mcpServers.length > 0) void recordSignalByKey(sess.user.id, "mcp_server_installed");
+          // Agent count grew — check if this is a net increase (not replacing a fired agent)
+          {
+            const snap = activeManager.snapshot();
+            const hireable = snap.agents.filter((a) => a.id !== "office-manager" && a.id !== "hermes" && a.id !== "wizard");
+            if (hireable.length >= 2) void recordSignalByKey(sess.user.id, "agent_count_grew");
+          }
+          // Log to experiment journal
+          {
+            const snap = activeManager.snapshot();
+            const hiredAgent = snap.agents.find((a) => a.name === msg.name);
+            if (hiredAgent) {
+              const entry = logAgentHire(sess.user.id, hiredAgent);
+              ws.send(JSON.stringify({ type: "experiment_entry", entry } satisfies ServerMsg));
+            }
+          }
+          // Check if this is the user's first hire — prompt aspiration quiz
+          {
+            const profile = getCachedProfile(sess.user.id);
+            if (profile && profile.signalCount === 0) {
+              ws.send(JSON.stringify({ type: "aspiration_quiz" } satisfies ServerMsg));
+            }
+          }
+          break;
+        case "update_agent": {
+          if (msg.systemPrompt !== undefined) {
+            activeManager.updateSystemPrompt(msg.agentId, msg.systemPrompt);
+          }
+          // Detect config changes for experiment log
+          {
+            const agentInfo = activeManager.getAgentInfo(msg.agentId);
+            if (agentInfo) {
+              const entry = detectConfigChange(sess.user.id, agentInfo);
+              if (entry) {
+                ws.send(JSON.stringify({ type: "experiment_entry", entry } satisfies ServerMsg));
+                if (entry.type === "model_swap") {
+                  void recordSignalByKey(sess.user.id, "new_agent_model_tried");
+                }
+              }
+            }
+          }
+          break;
+        }
+        case "update_appearance": {
+          if (!sess.player) break;
+          sess.player = { ...sess.player, appearance: msg.appearance };
+          save.setPlayer(sess.player);
+          void recordSignalByKey(sess.user.id, "character_customized");
+          sess.broadcast({ type: "player", player: sess.player });
+          // Update RoomPlayer appearance and notify others in the room
+          if (sess.roomId) {
+            const room = tenants.getRoom(sess.roomId);
+            if (room) {
+              const rp = room.players.get(sess.user.id);
+              if (rp) rp.appearance = msg.appearance;
+              for (const [pid] of room.players) {
+                if (pid === sess.user.id) continue;
+                const otherSess = tenants.get(pid);
+                if (otherSess) {
+                  otherSess.broadcast({
+                    type: "player_appearance",
+                    roomId: sess.roomId,
+                    userId: sess.user.id,
+                    appearance: msg.appearance,
+                  });
+                }
+              }
+            }
+          }
+          break;
+        }
+        case "assign": {
+          activeManager.assign(msg.agentId, msg.task, msg.handoffTo);
+          void recordSignalByKey(sess.user.id, "manual_agent_assignment");
+          if (msg.handoffTo) void recordSignalByKey(sess.user.id, "handoff_created");
+          break;
+        }
+        case "assign_new": {
+          activeManager.assignNew(msg.agentId, msg.task, msg.handoffTo);
+          if (msg.handoffTo) void recordSignalByKey(sess.user.id, "handoff_created");
+          void recordSignalByKey(sess.user.id, "manual_agent_assignment");
+          break;
+        }
+        case "chat": {
+          // Per-agent ACL check
+          const agentInfo = activeManager.getAgentInfo(msg.agentId);
+          if (agentInfo?.acl) {
+            const acl = agentInfo.acl;
+            // Manage level bypasses all ACL checks
+            if (accessLevel !== "manage") {
+              const hasUserIds = acl.allowedUserIds !== undefined;
+              const hasRoles = acl.allowedRoles !== undefined;
+              // If neither is specified, acl is "open" — no restriction
+              if (hasUserIds || hasRoles) {
+                let allowed = false;
+                if (hasUserIds && acl.allowedUserIds!.includes(sess.user.id)) {
+                  allowed = true;
+                }
+                if (!allowed && hasRoles && sess.roomId) {
+                  const room = tenants.getRoom(sess.roomId);
+                  if (room?.orgId) {
+                    const org = tenants.getOrg(room.orgId);
+                    const member = org?.members.get(sess.user.id);
+                    if (member && acl.allowedRoles!.includes(member.role)) {
+                      allowed = true;
+                    }
+                  }
+                }
+                if (!allowed) {
+                  const data = JSON.stringify({ type: "toast", text: "You don't have permission to chat with this agent." });
+                  if (ws.readyState === WebSocket.OPEN) ws.send(data);
+                  break;
+                }
+              }
+            }
+          }
+          activeManager.chat(msg.agentId, msg.text);
+          break;
+        }
+        case "assign_all": {
+          activeManager.assignAll(msg.task);
+          break;
+        }
+        case "stop":
+          activeManager.stop(msg.agentId);
+          break;
+        case "stop_all":
+          activeManager.stopAll();
+          break;
+        case "resume_agents":
+          activeManager.resumeFromApiPause();
+          break;
+        case "resolve_gate":
+          activeManager.resolveGate(msg.gateId, msg.resolution);
+          break;
+        case "fire":
+          await activeManager.fire(msg.agentId);
+          screenshots.stopAll(msg.agentId);
+          await closeAgentBrowser(msg.agentId);
+          void recordSignalByKey(sess.user.id, "agent_fired");
+          clearGrowth(msg.agentId);
+          // Log to experiment journal
+          {
+            const agentInfo = activeManager.getAgentInfo(msg.agentId);
+            if (agentInfo) {
+              const entry = logAgentFire(sess.user.id, agentInfo);
+              ws.send(JSON.stringify({ type: "experiment_entry", entry } satisfies ServerMsg));
+            }
+          }
+          break;
+        case "vacation":
+          await activeManager.vacation(msg.agentId);
+          break;
+        case "restore":
+          await activeManager.restore(msg.agentId);
+          break;
+        case "clear":
+          activeManager.clearChat(msg.agentId);
+          break;
+        case "clear_all":
+          activeManager.clearAllChats();
+          break;
+        case "create_card":
+          activeManager.createCard(msg.title, msg.description);
+          break;
+        case "create_goal":
+          activeManager.createGoal(msg.title, msg.description);
+          break;
+        case "score_decomposition": {
+          const score = activeManager.scoreDecomposition(msg.goalCardId);
+          if (score) {
+            ws.send(JSON.stringify({ type: "decomposition_score", goalCardId: msg.goalCardId, score } satisfies ServerMsg));
+            if (score.reworkCount === 0) {
+              void recordSignalByKey(sess.user.id, "task_zero_rework");
+            }
+          }
+          break;
+        }
+        case "request_experiment_log": {
+          const entries = getEntries(sess.user.id);
+          const stats = getExperimentStats(sess.user.id);
+          ws.send(JSON.stringify({ type: "experiment_log", entries } satisfies ServerMsg));
+          ws.send(JSON.stringify({ type: "experiment_stats", stats } satisfies ServerMsg));
+          break;
+        }
+        case "update_experiment_entry": {
+          const updated = updateEntry(sess.user.id, msg.entryId, {
+            hypothesis: msg.hypothesis,
+            verdict: msg.verdict,
+            notes: msg.notes,
+          });
+          if (updated) {
+            ws.send(JSON.stringify({ type: "experiment_entry", entry: updated } satisfies ServerMsg));
+            // Award XP when a verdict is set (not back to pending)
+            if (msg.verdict && msg.verdict !== "pending" && updated.verdict !== "pending") {
+              const xpResult = addXp(sess.user.id, 20);
+              if (xpResult.leveledUp) {
+                const progress = getProgress(sess.user.id);
+                ws.send(JSON.stringify({ type: "office_progress", progress } satisfies ServerMsg));
+              }
+              // Send updated stats
+              const stats = getExperimentStats(sess.user.id);
+              ws.send(JSON.stringify({ type: "experiment_stats", stats } satisfies ServerMsg));
+            }
+          }
+          break;
+        }
+        case "prestige": {
+          const success = doPrestige(sess.user.id);
+          if (success) {
+            const progress = getProgress(sess.user.id);
+            ws.send(JSON.stringify({ type: "office_progress", progress } satisfies ServerMsg));
+            ws.send(JSON.stringify({ type: "toast", text: `Prestige! Office reset to Level 1. ${progress.prestigeCount} prestige badge${progress.prestigeCount === 1 ? "" : "s"}. +${progress.prestigeCount} agent slot${progress.prestigeCount === 1 ? "" : "s"}.` } satisfies ServerMsg));
+          } else {
+            ws.send(JSON.stringify({ type: "toast", text: "Prestige requires Office Level 10." } satisfies ServerMsg));
+          }
+          break;
+        }
+        case "request_decorations": {
+          const decorations = getDecorations(sess.user.id);
+          ws.send(JSON.stringify({ type: "decorations", decorations } satisfies ServerMsg));
+          break;
+        }
+        case "place_decoration": {
+          const placed = placeDecoration(sess.user.id, msg.decoration);
+          if (placed) {
+            const decorations = getDecorations(sess.user.id);
+            ws.send(JSON.stringify({ type: "decorations", decorations } satisfies ServerMsg));
+          }
+          break;
+        }
+        case "remove_decoration": {
+          removeDecoration(sess.user.id, msg.decorationId);
+          const decorations = getDecorations(sess.user.id);
+          ws.send(JSON.stringify({ type: "decorations", decorations } satisfies ServerMsg));
+          break;
+        }
+        case "move_decoration": {
+          moveDecoration(sess.user.id, msg.decorationId, msg.tileX, msg.tileY);
+          const decorations = getDecorations(sess.user.id);
+          ws.send(JSON.stringify({ type: "decorations", decorations } satisfies ServerMsg));
+          break;
+        }
+        case "request_office_social": {
+          const social = getSocialState(msg.officeOwnerId);
+          ws.send(JSON.stringify({ type: "office_social", officeOwnerId: msg.officeOwnerId, social } satisfies ServerMsg));
+          break;
+        }
+        case "leave_sticky_note": {
+          const note = leaveStickyNote(msg.officeOwnerId, sess.user.id, sess.player?.name ?? "Visitor", msg.text, msg.color);
+          if (note) {
+            const social = getSocialState(msg.officeOwnerId);
+            ws.send(JSON.stringify({ type: "office_social", officeOwnerId: msg.officeOwnerId, social } satisfies ServerMsg));
+          }
+          break;
+        }
+        case "like_office": {
+          likeOffice(msg.officeOwnerId, sess.user.id, sess.player?.name ?? "Visitor");
+          const social = getSocialState(msg.officeOwnerId);
+          ws.send(JSON.stringify({ type: "office_social", officeOwnerId: msg.officeOwnerId, social } satisfies ServerMsg));
+          break;
+        }
+        case "unlike_office": {
+          unlikeOffice(msg.officeOwnerId, sess.user.id);
+          const social = getSocialState(msg.officeOwnerId);
+          ws.send(JSON.stringify({ type: "office_social", officeOwnerId: msg.officeOwnerId, social } satisfies ServerMsg));
+          break;
+        }
+        case "request_office_progress": {
+          const progress = getProgress(sess.user.id);
+          ws.send(JSON.stringify({ type: "office_progress", progress } satisfies ServerMsg));
+          break;
+        }
+        case "request_agent_growth": {
+          const growth = getGrowth(msg.agentId);
+          ws.send(JSON.stringify({ type: "agent_growth", agentId: msg.agentId, growth } satisfies ServerMsg));
+          break;
+        }
+        case "assign_card":
+          activeManager.assignCard(msg.cardId, msg.agentId);
+          break;
+        case "move_card":
+          activeManager.moveCard(msg.cardId, msg.status);
+          break;
+        case "delete_card":
+          activeManager.deleteCard(msg.cardId);
+          break;
+        case "set_phase":
+          activeManager.setPhase(msg.cardId, msg.phase);
+          break;
+        case "advance_phase":
+          activeManager.advancePhase(msg.cardId);
+          void recordSignalByKey(sess.user.id, "phase_gate_used");
+          break;
+        case "set_due_date":
+          activeManager.setDueDate(msg.cardId, msg.dueDate);
+          break;
+        case "set_estimate":
+          activeManager.setEstimate(msg.cardId, msg.estimatedMinutes);
+          break;
+        case "toggle_criterion":
+          activeManager.toggleCriterion(msg.cardId, msg.criterionId);
+          break;
+        case "add_criterion":
+          activeManager.addCriterion(msg.cardId, msg.text);
+          break;
+        case "remove_criterion":
+          activeManager.removeCriterion(msg.cardId, msg.criterionId);
+          break;
+        case "link_subtask":
+          activeManager.linkSubtask(msg.parentGoalId, msg.subtaskCardId);
+          break;
+        case "set_card_dependency":
+          activeManager.setCardDependency(msg.cardId, msg.dependsOnCardId);
+          void recordSignalByKey(sess.user.id, "manual_subtask_with_deps");
+          break;
+        case "remove_card_dependency":
+          activeManager.removeCardDependency(msg.cardId, msg.dependsOnCardId);
+          break;
+        case "create_schedule":
+          activeManager.createSchedule(msg.agentId, msg.name, msg.task, msg.cronExpression, msg.handoffTo);
+          void recordSignalByKey(sess.user.id, "scheduled_task");
+          if (msg.handoffTo) void recordSignalByKey(sess.user.id, "pipeline_created");
+          const schedXp = addXp(sess.user.id, 15);
+          if (schedXp.leveledUp) {
+            const progress = getProgress(sess.user.id);
+            ws.send(JSON.stringify({ type: "office_progress", progress } satisfies ServerMsg));
+            ws.send(JSON.stringify({ type: "toast", text: `Office reached Level ${progress.level}!` } satisfies ServerMsg));
+          }
+          break;
+        case "create_schedule_chain": {
+          const chainResult = activeManager.createScheduleChain(msg.chainName, msg.steps);
+          ws.send(JSON.stringify({ type: "toast", text: chainResult } satisfies ServerMsg));
+          void recordSignalByKey(sess.user.id, "pipeline_created");
+          void recordSignalByKey(sess.user.id, "scheduled_task");
+          break;
+        }
+        case "link_schedule_chain": {
+          const linkResult = activeManager.linkScheduleChain(msg.scheduleId, msg.chainTo);
+          ws.send(JSON.stringify({ type: "toast", text: linkResult } satisfies ServerMsg));
+          void recordSignalByKey(sess.user.id, "pipeline_created");
+          break;
+        }
+        case "create_pipeline_from_template": {
+          const template = getTemplateById(msg.templateId);
+          if (!template) {
+            ws.send(JSON.stringify({ type: "toast", text: "Template not found." } satisfies ServerMsg));
+            break;
+          }
+          // Map template roles to actual agent IDs
+          const steps = template.steps.map((step) => {
+            const agentId = msg.agentMappings[step.role];
+            return {
+              agentId: agentId ?? "",
+              name: step.name,
+              task: step.task,
+              cronExpression: step.cronExpression,
+            };
+          });
+          // Validate all agents exist
+          const missingRole = template.roles.find((r) => !msg.agentMappings[r]);
+          if (missingRole) {
+            ws.send(JSON.stringify({ type: "toast", text: `Please assign an agent to the "${missingRole}" role.` } satisfies ServerMsg));
+            break;
+          }
+          const chainResult = activeManager.createScheduleChain(template.name, steps);
+          ws.send(JSON.stringify({ type: "toast", text: chainResult } satisfies ServerMsg));
+          void recordSignalByKey(sess.user.id, "pipeline_created");
+          void recordSignalByKey(sess.user.id, "scheduled_task");
+          break;
+        }
+        case "update_schedule":
+          activeManager.updateSchedule(msg.scheduleId, { enabled: msg.enabled, name: msg.name, task: msg.task, cronExpression: msg.cronExpression });
+          break;
+        case "delete_schedule":
+          activeManager.deleteSchedule(msg.scheduleId);
+          break;
+        case "request_ab_comparison": {
+          const snap = activeManager.snapshot();
+          const agentA = snap.agents.find((a) => a.id === msg.agentAId);
+          const agentB = snap.agents.find((a) => a.id === msg.agentBId);
+          if (!agentA || !agentB) {
+            ws.send(JSON.stringify({ type: "toast", text: "Select two different agents to compare." } satisfies ServerMsg));
+            break;
+          }
+          // Get task history from manager — we need to access the internal runtime
+          // Use the public snapshot + getAgentGrowth for task history
+          const growthA = getGrowth(msg.agentAId);
+          const growthB = getGrowth(msg.agentBId);
+          const result = compareAgents(
+            { info: agentA, taskHistory: growthA.recentHistory.map((h) => ({ task: h.taskType, success: h.success, durationMs: h.durationMin * 60000, ts: h.timestamp })) },
+            { info: agentB, taskHistory: growthB.recentHistory.map((h) => ({ task: h.taskType, success: h.success, durationMs: h.durationMin * 60000, ts: h.timestamp })) },
+          );
+          ws.send(JSON.stringify({
+            type: "ab_comparison",
+            agentA: result.agentA,
+            agentB: result.agentB,
+            verdict: result.verdict,
+          } satisfies ServerMsg));
+          break;
+        }
+        case "request_efficiency_score": {
+          const snap = activeManager.snapshot();
+          const schedules = activeManager.snapshotSchedules();
+          const allAgents = snap.agents.filter((a) => a.id !== "office-manager" && a.id !== "hermes" && a.id !== "wizard");
+          const totalTasks = allAgents.reduce((sum, a) => sum + a.tasksDone, 0);
+          const scheduledTasks = schedules.reduce((sum: number, s) => sum + s.runCount, 0);
+          // Gather recent task history from all agents
+          const allHistory: { success: boolean; durationMs: number; ts: number; taskType: string }[] = [];
+          for (const a of allAgents) {
+            const g = getGrowth(a.id);
+            for (const h of g.recentHistory) {
+              allHistory.push({ success: h.success, durationMs: h.durationMin * 60000, ts: h.timestamp, taskType: h.taskType });
+            }
+          }
+          const result = computeEfficiency(schedules, allHistory, totalTasks, scheduledTasks);
+          ws.send(JSON.stringify({
+            type: "efficiency_score",
+            throughput: result.throughput,
+            successRate: result.successRate,
+            autonomyRate: result.autonomyRate,
+            chainCount: result.chainCount,
+            badge: result.badge,
+            badgeColor: result.badgeColor,
+            suggestions: result.suggestions,
+          } satisfies ServerMsg));
+          break;
+        }
+        case "allocate_resources": {
+          const snap = activeManager.snapshot();
+          const error = validateAllocations(snap.agents, msg.allocations);
+          if (error) {
+            ws.send(JSON.stringify({ type: "toast", text: error } satisfies ServerMsg));
+            break;
+          }
+          // Store allocations (in-memory for now)
+          const allocMap = new Map<string, number>();
+          for (const a of msg.allocations) allocMap.set(a.agentId, a.budget);
+          const utilMap = new Map<string, number>();
+          for (const a of snap.agents) {
+            if (a.id !== "office-manager" && a.id !== "hermes" && a.id !== "wizard") {
+              utilMap.set(a.id, a.tasksDone > 0 ? Math.min(1, a.tasksDone / 50) : 0);
+            }
+          }
+          const result = getAllocation(snap.agents, allocMap, utilMap);
+          ws.send(JSON.stringify({
+            type: "resource_allocation",
+            totalBudget: result.totalBudget,
+            allocations: result.allocations,
+          } satisfies ServerMsg));
+          void recordSignalByKey(sess.user.id, "agent_count_grew");
+          break;
+        }
+        case "recruit":
+          await activeManager.recruit(msg.firedAgentId);
+          void recordSignalByKey(sess.user.id, "agent_rehired_different_config");
+          // Log to experiment journal + detect config changes
+          {
+            const snap = activeManager.snapshot();
+            const hiredAgent = snap.agents.find((a) => a.id === msg.firedAgentId);
+            if (hiredAgent) {
+              const entry = logAgentRecruit(sess.user.id, hiredAgent);
+              ws.send(JSON.stringify({ type: "experiment_entry", entry } satisfies ServerMsg));
+              const configEntry = detectConfigChange(sess.user.id, hiredAgent);
+              if (configEntry) {
+                ws.send(JSON.stringify({ type: "experiment_entry", entry: configEntry } satisfies ServerMsg));
+              }
+            }
+          }
+          break;
+        case "fuse":
+          await activeManager.fuseAgents(msg.agentA, msg.agentB, msg.name, msg.systemPrompt, msg.appearance, msg.personality);
+          break;
+        case "rename":
+          activeManager.rename(msg.agentId, msg.name);
+          break;
+        case "set_agent_acl":
+          activeManager.setAgentACL(msg.agentId, msg.acl);
+          break;
+        case "steer_agent":
+          activeManager.steerAgent(msg.agentId, msg.text);
+          break;
+        case "pause_agent":
+          activeManager.pauseAgent(msg.agentId);
+          break;
+        case "resume_agent":
+          activeManager.resumeAgent(msg.agentId);
+          break;
+        case "gate_tool":
+          activeManager.gateTool(msg.agentId, msg.tool, msg.on);
+          break;
+        case "halt_agent":
+          activeManager.haltAgent(msg.agentId);
+          break;
+        case "request_token_gate_nonce": {
+          const nonce = generateNonce();
+          const message = buildSignMessage(nonce);
+          sess.broadcast({ type: "token_gate_nonce", nonce, message });
+          break;
+        }
+        case "verify_token_gate": {
+          const result = await verifyTokenGate(
+            sess.user.id,
+            msg.walletAddress,
+            msg.signature,
+            msg.message,
+            activeManager,
+          );
+          if (result.success) {
+            tenants.grantTokenAccess(sess.user.id, result.method!);
+            sess.broadcast({ type: "token_gate_result", success: true, roomId: GATE_ROOM_ID, method: result.method });
+          } else {
+            sess.broadcast({ type: "token_gate_result", success: false, roomId: GATE_ROOM_ID, error: result.error });
+          }
+          break;
+        }
+        case "railway_query":
+          queryRailway().then((result) => {
+            sess.broadcast({ type: "railway_data", data: result.data, error: result.error });
+          }).catch((err) => {
+            console.error("[server] railway_query failed:", err);
+            sess.broadcast({ type: "railway_data", data: null, error: err instanceof Error ? err.message : String(err) });
+          });
+          break;
+        case "github_query": {
+          const mcpKeys = await getUserMcpKeys(sess.user.id);
+          const token = getGithubToken(sess.user.id, mcpKeys);
+          if (!token) {
+            sess.broadcast({ type: "github_status", connected: false, login: null, error: "No GitHub token found. Add a GitHub MCP key in Settings." });
+            break;
+          }
+          try {
+            const user = await getAuthenticatedUser(token);
+            if (!user) {
+              sess.broadcast({ type: "github_status", connected: false, login: null, error: "Invalid GitHub token." });
+              break;
+            }
+            sess.broadcast({ type: "github_status", connected: true, login: user.login, error: null });
+            // Also try to list branches from the user's fork
+            try {
+              const branches = await listBranches(token, user.login, "agent-heights");
+              sess.broadcast({ type: "github_data", branches: branches.map(b => ({ name: b.name, sha: b.sha })), fork: { owner: user.login, name: "agent-heights", fullName: `${user.login}/agent-heights`, cloneUrl: `https://github.com/${user.login}/agent-heights.git`, branch: branches[0]?.name ?? "main" }, error: null });
+            } catch {
+              // Fork might not exist yet — that's OK
+              sess.broadcast({ type: "github_data", branches: [], fork: null, error: null });
+            }
+          } catch (err) {
+            sess.broadcast({ type: "github_status", connected: false, login: null, error: err instanceof Error ? err.message : String(err) });
+          }
+          break;
+        }
+        case "github_fork": {
+          const mcpKeys = await getUserMcpKeys(sess.user.id);
+          const token = getGithubToken(sess.user.id, mcpKeys);
+          if (!token) {
+            sess.broadcast({ type: "github_error", error: "No GitHub token found. Add a GitHub MCP key in Settings." });
+            break;
+          }
+          try {
+            const user = await getAuthenticatedUser(token);
+            if (!user) {
+              sess.broadcast({ type: "github_error", error: "Invalid GitHub token." });
+              break;
+            }
+            // Fork the repo if it doesn't exist yet
+            let forkOwner = user.login;
+            let forkName = "agent-heights";
+            try {
+              await listBranches(token, forkOwner, forkName);
+            } catch {
+              // Fork doesn't exist — create it
+              const fork = await forkSourceRepo(token);
+              forkOwner = fork.owner;
+              forkName = fork.name;
+            }
+            // Create the new branch
+            const branch = await createBranch(token, forkOwner, forkName, msg.branchName);
+
+            // Commit a minimal world-theme.json with assetTier: "procedural"
+            // so the deployed world starts with procedural graphics.
+            // The $19.99 upgrade changes this to "ai" and regenerates all assets.
+            const themeJson = JSON.stringify({
+              id: msg.branchName,
+              name: msg.branchName,
+              description: "A procedurally generated world.",
+              workMetaphor: "office",
+              arrivalMetaphor: "helicopter",
+              office: {
+                tilemapPath: "assets/tilemaps/office.json",
+                tilesetPath: "assets/tilesets/office.png",
+                floorTile: 0,
+                wallTile: 1,
+                doorTile: 2,
+              },
+              furniture: {},
+              worldgen: {
+                seed: Math.floor(Math.random() * 2147483647),
+                biomeScale: 0.003,
+                hostilityScale: 0.004,
+              },
+              interactables: {},
+              assets: {
+                tilesetPath: "assets/tilesets/world.png",
+                assetTier: "procedural",
+              },
+            }, null, 2);
+            try {
+              await createRepoFile(
+                token,
+                forkOwner,
+                forkName,
+                msg.branchName,
+                "client/public/assets/world-theme.json",
+                themeJson,
+                "Initialize world-theme.json (procedural tier)",
+              );
+            } catch (themeErr) {
+              console.warn("[github_fork] Failed to commit world-theme.json:", themeErr);
+            }
+
+            sess.broadcast({
+              type: "github_fork_created",
+              fork: { owner: forkOwner, name: forkName, fullName: `${forkOwner}/${forkName}`, cloneUrl: `https://github.com/${forkOwner}/${forkName}.git`, branch: branch.name },
+              branchName: msg.branchName,
+            });
+          } catch (err) {
+            sess.broadcast({ type: "github_error", error: err instanceof Error ? err.message : String(err) });
+          }
+          break;
+        }
+        case "github_list_branches": {
+          const mcpKeys = await getUserMcpKeys(sess.user.id);
+          const token = getGithubToken(sess.user.id, mcpKeys);
+          if (!token) {
+            sess.broadcast({ type: "github_error", error: "No GitHub token found." });
+            break;
+          }
+          try {
+            const user = await getAuthenticatedUser(token);
+            if (!user) {
+              sess.broadcast({ type: "github_error", error: "Invalid GitHub token." });
+              break;
+            }
+            const branches = await listBranches(token, user.login, "agent-heights");
+            sess.broadcast({ type: "github_data", branches: branches.map(b => ({ name: b.name, sha: b.sha })), fork: { owner: user.login, name: "agent-heights", fullName: `${user.login}/agent-heights`, cloneUrl: `https://github.com/${user.login}/agent-heights.git`, branch: branches[0]?.name ?? "main" }, error: null });
+          } catch (err) {
+            sess.broadcast({ type: "github_error", error: err instanceof Error ? err.message : String(err) });
+          }
+          break;
+        }
+        case "github_delete_branch": {
+          const mcpKeys = await getUserMcpKeys(sess.user.id);
+          const token = getGithubToken(sess.user.id, mcpKeys);
+          if (!token) {
+            sess.broadcast({ type: "github_error", error: "No GitHub token found." });
+            break;
+          }
+          try {
+            const user = await getAuthenticatedUser(token);
+            if (!user) {
+              sess.broadcast({ type: "github_error", error: "Invalid GitHub token." });
+              break;
+            }
+            await deleteBranch(token, user.login, "agent-heights", msg.branchName);
+            // Refresh branch list
+            const branches = await listBranches(token, user.login, "agent-heights");
+            sess.broadcast({ type: "github_data", branches: branches.map(b => ({ name: b.name, sha: b.sha })), fork: { owner: user.login, name: "agent-heights", fullName: `${user.login}/agent-heights`, cloneUrl: `https://github.com/${user.login}/agent-heights.git`, branch: branches[0]?.name ?? "main" }, error: null });
+          } catch (err) {
+            sess.broadcast({ type: "github_error", error: err instanceof Error ? err.message : String(err) });
+          }
+          break;
+        }
+        case "railway_deploy": {
+          sess.broadcast({ type: "railway_deploy_started", branchName: msg.branchName, message: `Deploying ${msg.branchName} to Railway...` });
+          const result = await deployWorldToRailway(msg.branchName, msg.repoFullName);
+          if (result.error || !result.deployment) {
+            sess.broadcast({ type: "railway_deploy_result", deployment: { branchName: msg.branchName, repoFullName: msg.repoFullName, railwayProjectId: "", railwayServiceId: "", railwayServiceUrl: null, status: "failed", createdAt: Date.now() }, error: result.error ?? "Unknown error" });
+          } else {
+            sess.broadcast({ type: "railway_deploy_result", deployment: result.deployment, error: null });
+          }
+          break;
+        }
+        case "railway_list_deployments": {
+          const result = await listWorldDeployments();
+          sess.broadcast({ type: "railway_deployments", deployments: result.deployments, error: result.error });
+          break;
+        }
+        case "list_world_templates": {
+          const result = await listWorldTemplates();
+          sess.broadcast({ type: "world_templates", templates: result.templates, error: null } as any);
+          if (result.error) {
+            console.warn("[world-templates] Failed to list templates:", result.error);
+          }
+          break;
+        }
+        case "generate_world": {
+          const mcpKeys = await getUserMcpKeys(sess.user.id);
+          const token = getGithubToken(sess.user.id, mcpKeys);
+          if (!token) {
+            sess.broadcast({ type: "world_gen_error", error: "No GitHub token found. Add a GitHub MCP key in Settings." } as any);
+            break;
+          }
+          try {
+            const worldName = msg.worldName;
+            sess.broadcast({ type: "world_generating", worldName: worldName ?? "world", stage: "forking", message: "Forking repo and creating branch…" } as any);
+
+            const result = await generateWorld(msg.templateId, token, worldName);
+
+            if (result.error || !result.deployment) {
+              sess.broadcast({ type: "world_gen_error", error: result.error ?? "Unknown error" } as any);
+            } else {
+              sess.broadcast({ type: "world_generated", deployment: result.deployment, conceptPrompt: result.conceptPrompt } as any);
+              void recordSignalByKey(sess.user.id, "world_generated");
+              const worldXp = addXp(sess.user.id, 200);
+              if (worldXp.leveledUp) {
+                const progress = getProgress(sess.user.id);
+                ws.send(JSON.stringify({ type: "office_progress", progress } satisfies ServerMsg));
+              }
+              // Refresh deployments list
+              const deps = await listWorldDeployments();
+              sess.broadcast({ type: "railway_deployments", deployments: deps.deployments, error: deps.error });
+            }
+          } catch (err) {
+            sess.broadcast({ type: "world_gen_error", error: err instanceof Error ? err.message : String(err) } as any);
+          }
+          break;
+        }
+        case "railway_stop_deployment": {
+          const result = await stopWorldDeployment(msg.branchName, false);
+          if (result.error) {
+            sess.broadcast({ type: "railway_deployments", deployments: [], error: result.error });
+          } else {
+            // Refresh list after stopping
+            const listResult = await listWorldDeployments();
+            sess.broadcast({ type: "railway_deployments", deployments: listResult.deployments, error: null });
+          }
+          break;
+        }
+        case "railway_delete_deployment": {
+          const result = await stopWorldDeployment(msg.branchName, true);
+          if (result.error) {
+            sess.broadcast({ type: "railway_deployments", deployments: [], error: result.error });
+          } else {
+            const listResult = await listWorldDeployments();
+            sess.broadcast({ type: "railway_deployments", deployments: listResult.deployments, error: null });
+          }
+          break;
+        }
+        case "upgrade_assets": {
+          // Verify the user has paid for this upgrade
+          const { data: upgradeRow } = await supabaseAdmin
+            .from("heights_cloud_asset_upgrades")
+            .select("status, branch_name, repo_full_name")
+            .eq("deployment_id", msg.deploymentId)
+            .eq("user_id", sess.user.id)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (!upgradeRow) {
+            sess.broadcast({ type: "asset_upgrade_failed", deploymentId: msg.deploymentId, error: "No payment found for this deployment. Please complete the $19.99 upgrade first." });
+            break;
+          }
+
+          // Fetch world-theme.json from the branch to get theme config
+          let worldTheme: import("../shared/types.js").WorldTheme | null = null;
+          try {
+            const mcpKeys = await getUserMcpKeys(sess.user.id);
+            const token = getGithubToken(sess.user.id, mcpKeys);
+            if (token) {
+              const user = await getAuthenticatedUser(token);
+              if (user) {
+                const fileResult = await readRepoFile(token, user.login, "agent-heights", upgradeRow.branch_name, "client/public/assets/world-theme.json");
+                if (fileResult?.content) {
+                  worldTheme = JSON.parse(fileResult.content);
+                }
+              }
+            }
+          } catch (err) {
+            console.warn("[asset-upgrade] failed to fetch world-theme.json:", err);
+          }
+
+          sess.broadcast({ type: "asset_upgrade_started", deploymentId: msg.deploymentId });
+
+          // Run the generation job asynchronously
+          void runAssetGenerationJob(
+            msg.deploymentId,
+            upgradeRow.branch_name,
+            upgradeRow.repo_full_name,
+            worldTheme,
+            (stage, percent, label) => {
+              sess.broadcast({ type: "asset_upgrade_progress", deploymentId: msg.deploymentId, stage, percent, label });
+            },
+          ).then((result) => {
+            if (result.success) {
+              sess.broadcast({ type: "asset_upgrade_ready", deploymentId: msg.deploymentId });
+            } else {
+              sess.broadcast({ type: "asset_upgrade_failed", deploymentId: msg.deploymentId, error: result.error ?? "Unknown error" });
+            }
+          });
+
+          break;
+        }
+        case "github_list_dir": {
+          const mcpKeys = await getUserMcpKeys(sess.user.id);
+          const token = getGithubToken(sess.user.id, mcpKeys);
+          if (!token) { sess.broadcast({ type: "github_error", error: "No GitHub token found." }); break; }
+          try {
+            const user = await getAuthenticatedUser(token);
+            if (!user) { sess.broadcast({ type: "github_error", error: "Invalid GitHub token." }); break; }
+            const entries = await listRepoDir(token, user.login, "agent-heights", msg.branchName, msg.path);
+            sess.broadcast({ type: "github_dir", branchName: msg.branchName, path: msg.path, entries, error: null });
+          } catch (err) {
+            sess.broadcast({ type: "github_dir", branchName: msg.branchName, path: msg.path, entries: [], error: err instanceof Error ? err.message : String(err) });
+          }
+          break;
+        }
+        case "github_read_file": {
+          const mcpKeys = await getUserMcpKeys(sess.user.id);
+          const token = getGithubToken(sess.user.id, mcpKeys);
+          if (!token) { sess.broadcast({ type: "github_error", error: "No GitHub token found." }); break; }
+          try {
+            const user = await getAuthenticatedUser(token);
+            if (!user) { sess.broadcast({ type: "github_error", error: "Invalid GitHub token." }); break; }
+            const file = await readRepoFile(token, user.login, "agent-heights", msg.branchName, msg.path);
+            if (!file) {
+              sess.broadcast({ type: "github_file", branchName: msg.branchName, path: msg.path, content: "", sha: "", error: "File not found" });
+            } else {
+              sess.broadcast({ type: "github_file", branchName: msg.branchName, path: msg.path, content: file.content, sha: file.sha, error: null });
+            }
+          } catch (err) {
+            sess.broadcast({ type: "github_file", branchName: msg.branchName, path: msg.path, content: "", sha: "", error: err instanceof Error ? err.message : String(err) });
+          }
+          break;
+        }
+        case "github_write_file": {
+          const mcpKeys = await getUserMcpKeys(sess.user.id);
+          const token = getGithubToken(sess.user.id, mcpKeys);
+          if (!token) { sess.broadcast({ type: "github_error", error: "No GitHub token found." }); break; }
+          try {
+            const user = await getAuthenticatedUser(token);
+            if (!user) { sess.broadcast({ type: "github_error", error: "Invalid GitHub token." }); break; }
+            await writeRepoFile(token, user.login, "agent-heights", msg.branchName, msg.path, msg.content, msg.sha, msg.commitMessage);
+            sess.broadcast({ type: "github_file_saved", branchName: msg.branchName, path: msg.path, message: msg.commitMessage });
+          } catch (err) {
+            sess.broadcast({ type: "github_error", error: err instanceof Error ? err.message : String(err) });
+          }
+          break;
+        }
+        case "github_create_file": {
+          const mcpKeys = await getUserMcpKeys(sess.user.id);
+          const token = getGithubToken(sess.user.id, mcpKeys);
+          if (!token) { sess.broadcast({ type: "github_error", error: "No GitHub token found." }); break; }
+          try {
+            const user = await getAuthenticatedUser(token);
+            if (!user) { sess.broadcast({ type: "github_error", error: "Invalid GitHub token." }); break; }
+            await createRepoFile(token, user.login, "agent-heights", msg.branchName, msg.path, msg.content, msg.commitMessage);
+            sess.broadcast({ type: "github_file_saved", branchName: msg.branchName, path: msg.path, message: msg.commitMessage });
+          } catch (err) {
+            sess.broadcast({ type: "github_error", error: err instanceof Error ? err.message : String(err) });
+          }
+          break;
+        }
+        case "github_delete_file": {
+          const mcpKeys = await getUserMcpKeys(sess.user.id);
+          const token = getGithubToken(sess.user.id, mcpKeys);
+          if (!token) { sess.broadcast({ type: "github_error", error: "No GitHub token found." }); break; }
+          try {
+            const user = await getAuthenticatedUser(token);
+            if (!user) { sess.broadcast({ type: "github_error", error: "Invalid GitHub token." }); break; }
+            await deleteRepoFile(token, user.login, "agent-heights", msg.branchName, msg.path, msg.sha, msg.commitMessage);
+            sess.broadcast({ type: "github_file_deleted", branchName: msg.branchName, path: msg.path });
+          } catch (err) {
+            sess.broadcast({ type: "github_error", error: err instanceof Error ? err.message : String(err) });
+          }
+          break;
+        }
+        case "set_api_key": {
+          const trimmed = msg.apiKey.trim();
+          if (trimmed) {
+            const { error } = await setUserApiKey(sess.user.id, trimmed);
+            if (error) {
+              sess.broadcast({ type: "toast", text: `Failed to save API key: ${error}` });
+            } else {
+              sess.apiKey = trimmed;
+              sess.manager.setApiKey(sess.apiKey);
+              sess.broadcast({ type: "api_key_status", hasKey: true });
+              sess.broadcast({ type: "toast", text: "API key saved — your agents will use it now." });
+            }
+          } else {
+            const { error } = await deleteUserApiKey(sess.user.id);
+            if (error) {
+              sess.broadcast({ type: "toast", text: `Failed to clear API key: ${error}` });
+            } else {
+              sess.apiKey = null;
+              sess.manager.setApiKey(null);
+              sess.broadcast({ type: "api_key_status", hasKey: false });
+              sess.broadcast({ type: "toast", text: "API key cleared — using the server's shared key." });
+            }
+          }
+          break;
+        }
+        case "check_mcp_keys": {
+          const keyUrls = await getUserMcpKeyUrls(sess.user.id);
+          const results = msg.serverUrls.map((u) => ({ serverUrl: u, hasKey: keyUrls.has(u) }));
+          sess.broadcast({ type: "mcp_keys_status", results });
+          break;
+        }
+        case "start_mcp_oauth": {
+          // Build base URL: prefer clientOrigin (browser's window.location.origin),
+          // then PUBLIC_URL env, then origin/forwarded-host headers, then host
+          const publicUrl = process.env.PUBLIC_URL || process.env.VITE_APP_URL;
+          const forwardedHost = (req.headers["x-forwarded-host"] as string) || "";
+          const originHeader = (req.headers["origin"] as string) || "";
+          const proto = (req.headers["x-forwarded-proto"] as string) || "https";
+          const host = (req.headers["host"] as string) || "localhost:8080";
+          const baseUrl = msg.clientOrigin
+            || publicUrl
+            || (originHeader ? originHeader.replace(/\/$/, "") : "")
+            || (forwardedHost ? `${proto}://${forwardedHost}` : "")
+            || `${proto}://${host}`;
+          console.log(`[mcp-oauth] startOAuthFlow baseUrl=${baseUrl} (clientOrigin=${msg.clientOrigin || "none"}, PUBLIC_URL=${publicUrl ?? "unset"}, origin=${originHeader || "none"}, forwardedHost=${forwardedHost || "none"}, host=${host})`);
+          try {
+            const { authUrl, redirectMode } = await startOAuthFlow(msg.serverUrl, sess.user.id, baseUrl);
+            sess.broadcast({ type: "mcp_oauth_code_needed", serverUrl: msg.serverUrl, authUrl, redirectMode });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "mcp_oauth_complete", serverUrl: msg.serverUrl, success: false, error: msg2 });
+          }
+          break;
+        }
+        case "submit_mcp_oauth_code": {
+          const result = await exchangeOAuthCode(msg.callbackUrl);
+          if (result.userId) {
+            const sess2 = tenants.get(result.userId);
+            if (sess2) {
+              if (result.success) {
+                const mcpKeys = await getUserMcpKeys(sess2.user.id);
+                sess2.manager.setMcpKeys(mcpKeys);
+              }
+              sess2.broadcast({
+                type: "mcp_oauth_complete",
+                serverUrl: result.serverUrl ?? msg.serverUrl,
+                success: result.success,
+                error: result.error,
+              });
+            }
+          } else {
+            // No userId means state wasn't found — broadcast error to current session
+            sess.broadcast({
+              type: "mcp_oauth_complete",
+              serverUrl: msg.serverUrl,
+              success: false,
+              error: result.error ?? "OAuth state not found. Please try again.",
+            });
+          }
+          break;
+        }
+        case "set_mcp_key": {
+          const trimmed = msg.apiKey.trim();
+          if (trimmed) {
+            const { error } = await setUserMcpKey(sess.user.id, msg.serverUrl, trimmed);
+            if (error) {
+              sess.broadcast({ type: "toast", text: `Failed to save MCP key: ${error}` });
+            } else {
+              sess.broadcast({ type: "mcp_key_status", serverUrl: msg.serverUrl, hasKey: true });
+              sess.broadcast({ type: "toast", text: "MCP key saved — this server's tools will use it now." });
+            }
+          } else {
+            const { error } = await deleteUserMcpKey(sess.user.id, msg.serverUrl);
+            if (error) {
+              sess.broadcast({ type: "toast", text: `Failed to clear MCP key: ${error}` });
+            } else {
+              sess.broadcast({ type: "mcp_key_status", serverUrl: msg.serverUrl, hasKey: false });
+              sess.broadcast({ type: "toast", text: "MCP key cleared." });
+            }
+          }
+          // Refresh the manager's MCP key cache
+          const mcpKeys = await getUserMcpKeys(sess.user.id);
+          sess.manager.setMcpKeys(mcpKeys);
+          break;
+        }
+        case "get_cdp_wallet": {
+          console.log(`[cdp-debug] get_cdp_wallet for agent=${msg.agentId}`);
+          try {
+            const address = await getAgentWalletAddress(msg.agentId);
+            console.log(`[cdp-debug] get_cdp_wallet address=${address}`);
+            if (!address) {
+              sess.broadcast({ type: "cdp_wallet_status", agentId: msg.agentId, address: null, balances: null, error: "CDP not configured or wallet not found" });
+              break;
+            }
+            const balData = await getAgentBalances(msg.agentId);
+            const balances = balData?.balances ?? [];
+            const totalUsdValue = balData?.totalUsdValue;
+            console.log(`[cdp-debug] broadcasting cdp_wallet_status agentId=${msg.agentId} address=${address} balances=${balances.length} totalUsd=${totalUsdValue ?? "none"}`);
+            sess.broadcast({ type: "cdp_wallet_status", agentId: msg.agentId, address, balances, totalUsdValue });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            console.error(`[cdp-debug] get_cdp_wallet ERROR: ${msg2}`);
+            sess.broadcast({ type: "cdp_wallet_status", agentId: msg.agentId, address: null, balances: null, error: msg2 });
+          }
+          break;
+        }
+        case "get_cdp_policy": {
+          try {
+            const policy = await getAgentPolicy(msg.agentId);
+            if (!policy) {
+              sess.broadcast({ type: "cdp_policy_status", agentId: msg.agentId, policyId: null, maxSolPerTransfer: null, allowedRecipients: null, blockedRecipients: null, allowedTokenMints: null, blockedTokenMints: null, network: "unknown", error: "CDP not configured" });
+              break;
+            }
+            sess.broadcast({ type: "cdp_policy_status", agentId: msg.agentId, policyId: policy.policyId, maxSolPerTransfer: policy.maxSolPerTransfer, allowedRecipients: policy.allowedRecipients, blockedRecipients: policy.blockedRecipients, allowedTokenMints: policy.allowedTokenMints, blockedTokenMints: policy.blockedTokenMints, network: policy.network });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "cdp_policy_status", agentId: msg.agentId, policyId: null, maxSolPerTransfer: null, allowedRecipients: null, blockedRecipients: null, allowedTokenMints: null, blockedTokenMints: null, network: "unknown", error: msg2 });
+          }
+          break;
+        }
+        case "set_cdp_policy": {
+          try {
+            const policy = await updateAgentPolicy(msg.agentId, {
+              maxSolPerTransfer: msg.maxSolPerTransfer,
+              allowedRecipients: msg.allowedRecipients,
+              blockedRecipients: msg.blockedRecipients,
+              allowedTokenMints: msg.allowedTokenMints,
+              blockedTokenMints: msg.blockedTokenMints,
+            });
+            if (!policy) {
+              sess.broadcast({ type: "cdp_policy_status", agentId: msg.agentId, policyId: null, maxSolPerTransfer: null, allowedRecipients: null, blockedRecipients: null, allowedTokenMints: null, blockedTokenMints: null, network: "unknown", error: "CDP not configured" });
+              break;
+            }
+            sess.broadcast({ type: "cdp_policy_status", agentId: msg.agentId, policyId: policy.policyId, maxSolPerTransfer: policy.maxSolPerTransfer, allowedRecipients: policy.allowedRecipients, blockedRecipients: policy.blockedRecipients, allowedTokenMints: policy.allowedTokenMints, blockedTokenMints: policy.blockedTokenMints, network: policy.network });
+            sess.broadcast({ type: "toast", text: "Spending policy updated." });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "cdp_policy_status", agentId: msg.agentId, policyId: null, maxSolPerTransfer: null, allowedRecipients: null, blockedRecipients: null, allowedTokenMints: null, blockedTokenMints: null, network: "unknown", error: msg2 });
+          }
+          break;
+        }
+        case "get_cdp_tx_history": {
+          try {
+            const history = await getAgentTxHistory(msg.agentId);
+            if (!history) {
+              sess.broadcast({ type: "cdp_tx_history", agentId: msg.agentId, transactions: null, error: "CDP not configured" });
+              break;
+            }
+            sess.broadcast({ type: "cdp_tx_history", agentId: msg.agentId, transactions: history });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "cdp_tx_history", agentId: msg.agentId, transactions: null, error: msg2 });
+          }
+          break;
+        }
+        case "create_cdp_onramp": {
+          try {
+            const clientIp = (req.socket.remoteAddress) || undefined;
+            const url = await createOnrampUrl(msg.agentId, clientIp);
+            if (!url) {
+              sess.broadcast({ type: "cdp_onramp_url", agentId: msg.agentId, url: null, error: "CDP not configured" });
+              break;
+            }
+            sess.broadcast({ type: "cdp_onramp_url", agentId: msg.agentId, url });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "cdp_onramp_url", agentId: msg.agentId, url: null, error: msg2 });
+          }
+          break;
+        }
+        case "get_cdp_lp_positions": {
+          try {
+            const positions = await getAgentLpPositions(msg.agentId);
+            sess.broadcast({ type: "cdp_lp_positions", agentId: msg.agentId, positions });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "cdp_lp_positions", agentId: msg.agentId, positions: null, error: msg2 });
+          }
+          break;
+        }
+        case "get_crossmint_wallet":
+        case "get_crossmint_balance": {
+          try {
+            console.log(`[crossmint] get_crossmint_wallet called — API_KEY=${process.env.CROSSMINT_API_KEY ? "set (" + process.env.CROSSMINT_API_KEY.slice(0, 12) + "...)" : "NOT SET"}, SIGNER_SECRET=${process.env.CROSSMINT_SERVER_SIGNER_SECRET ? "set (" + process.env.CROSSMINT_SERVER_SIGNER_SECRET.slice(0, 8) + "...)" : "NOT SET"}, CHAIN=${process.env.CROSSMINT_CHAIN ?? "not set"}`);
+            const balData = await getCrossmintBalances(msg.agentId);
+            if (!balData) {
+              sess.broadcast({ type: "crossmint_wallet_status", agentId: msg.agentId, address: null, chain: null, balances: null, error: "Crossmint not configured" });
+              break;
+            }
+            sess.broadcast({ type: "crossmint_wallet_status", agentId: msg.agentId, address: balData.address, chain: process.env.CROSSMINT_CHAIN ?? "solana", balances: balData.balances });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "crossmint_wallet_status", agentId: msg.agentId, address: null, chain: null, balances: null, error: msg2 });
+          }
+          break;
+        }
+        case "get_crossmint_policy": {
+          try {
+            const policy = await getCrossmintPolicy(msg.agentId);
+            if (!policy) {
+              sess.broadcast({ type: "crossmint_policy_status", agentId: msg.agentId, chain: null, spendingLimitUsd: null, allowedRecipients: null, blockedRecipients: null, description: null, error: "Crossmint not configured" });
+              break;
+            }
+            sess.broadcast({ type: "crossmint_policy_status", agentId: msg.agentId, chain: policy.chain, spendingLimitUsd: policy.spendingLimitUsd, allowedRecipients: policy.allowedRecipients, blockedRecipients: policy.blockedRecipients, description: policy.description });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "crossmint_policy_status", agentId: msg.agentId, chain: null, spendingLimitUsd: null, allowedRecipients: null, blockedRecipients: null, description: null, error: msg2 });
+          }
+          break;
+        }
+        case "get_crossmint_tx_history": {
+          try {
+            const history = await getCrossmintTxHistory(msg.agentId);
+            if (!history) {
+              sess.broadcast({ type: "crossmint_tx_history", agentId: msg.agentId, transactions: null, error: "Crossmint not configured" });
+              break;
+            }
+            sess.broadcast({ type: "crossmint_tx_history", agentId: msg.agentId, transactions: history });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "crossmint_tx_history", agentId: msg.agentId, transactions: null, error: msg2 });
+          }
+          break;
+        }
+        case "fund_crossmint_wallet": {
+          try {
+            const result = await fundAgentWallet(msg.agentId, msg.amount ?? 10);
+            if (!result) {
+              sess.broadcast({ type: "crossmint_fund_result", agentId: msg.agentId, success: false, message: "Crossmint not configured" });
+              break;
+            }
+            sess.broadcast({ type: "crossmint_fund_result", agentId: msg.agentId, success: result.success, message: result.message });
+            // Auto-refresh balances after funding
+            if (result.success) {
+              const balData = await getCrossmintBalances(msg.agentId);
+              if (balData) {
+                sess.broadcast({ type: "crossmint_wallet_status", agentId: msg.agentId, address: balData.address, chain: process.env.CROSSMINT_CHAIN ?? "solana", balances: balData.balances });
+              }
+            }
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "crossmint_fund_result", agentId: msg.agentId, success: false, message: msg2 });
+          }
+          break;
+        }
+        case "create_crossmint_onramp": {
+          try {
+            const url = await createCrossmintOnrampUrl(msg.agentId);
+            sess.broadcast({ type: "crossmint_onramp_url", agentId: msg.agentId, url });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "crossmint_onramp_url", agentId: msg.agentId, url: null, error: msg2 });
+          }
+          break;
+        }
+        case "save_outfit": {
+          if (!isValidAppearance(msg.appearance)) break;
+          const resolved = resolveOutfitScope(sess);
+          if (!resolved || !resolved.editable) {
+            sess.broadcast({ type: "toast", text: "You can't save outfits to this wardrobe." });
+            break;
+          }
+          const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+          const name = msg.name.trim().slice(0, 24) || "Outfit";
+          const createdAt = Date.now();
+          if (isSupabaseConfigured) {
+            try {
+              const row: Record<string, unknown> = { id, user_id: sess.user.id, name, appearance: msg.appearance, created_at: createdAt };
+              if (resolved.scope.type === "org") row.org_id = resolved.scope.orgId;
+              await supabaseAdmin.from("agent_heights_saved_outfits").insert(row);
+            } catch (err) {
+              console.error("[outfits] save failed:", err);
+            }
+          }
+          await sendOutfits(ws, sess);
+          void recordSignalByKey(sess.user.id, "wardrobe_used");
+          break;
+        }
+        case "delete_outfit": {
+          const resolved = resolveOutfitScope(sess);
+          if (!resolved || !resolved.editable) {
+            sess.broadcast({ type: "toast", text: "You can't delete outfits from this wardrobe." });
+            break;
+          }
+          if (isSupabaseConfigured) {
+            try {
+              const del = supabaseAdmin.from("agent_heights_saved_outfits").delete().eq("id", msg.id);
+              if (resolved.scope.type === "org") {
+                del.eq("org_id", resolved.scope.orgId);
+              } else {
+                del.eq("user_id", resolved.scope.userId).is("org_id", null);
+              }
+              await del;
+            } catch (err) {
+              console.error("[outfits] delete failed:", err);
+            }
+          }
+          await sendOutfits(ws, sess);
+          break;
+        }
+        case "renew_token": {
+          const verified = await verifyToken(msg.token);
+          if (!verified) {
+            ws.close(4003, "Invalid renewal token");
+            break;
+          }
+          scheduleTokenRefresh(msg.token);
+          break;
+        }
+        case "create_room": {
+          const roomId = tenants.createRoom(sess.user.id, msg.name, msg.theme, true);
+          // Notify old room that the player left
+          const oldRoomId = sess.roomId;
+          if (oldRoomId) {
+            for (const p of tenants.getRoomPlayers(oldRoomId)) {
+              if (p.userId === sess.user.id) continue;
+              const otherSess = tenants.get(p.userId);
+              if (otherSess) {
+                otherSess.broadcast({ type: "player_left", roomId: oldRoomId, userId: sess.user.id });
+              }
+            }
+          }
+          // Switch the creator into the new room
+          const room = tenants.switchRoom(sess.user.id, roomId);
+          if (room) {
+            sess.broadcast({
+              type: "room_state",
+              roomId,
+              name: room.name,
+              players: tenants.getRoomPlayers(roomId),
+              privateOfficeId: sess.privateOfficeId ?? undefined,
+              projectorChannel: room.projectorChannel,
+              accessLevel: tenants.computeAccessLevel(room, sess.user.id),
+              roomType: room.roomType,
+            });
+            sendRoomsList();
+            void sendOutfits(ws, sess);
+          }
+          break;
+        }
+        case "join_room": {
+          const room = tenants.getRoom(msg.roomId);
+          if (!room) {
+            sess.broadcast({ type: "toast", text: "Room not found." });
+            break;
+          }
+          // Token-gated room: check verification before canJoinRoom
+          if (room.roomType === "token_gated") {
+            // 1. Check in-memory cache
+            if (!tenants.isTokenVerified(sess.user.id)) {
+              // 2. Check DB for valid 24h verification
+              const dbVerification = await getVerificationFromDB(sess.user.id);
+              if (dbVerification) {
+                tenants.grantTokenAccess(sess.user.id, dbVerification.method);
+              } else {
+                // 3. Check agent wallets (CDP + Crossmint)
+                const agentCheck = await checkAgentWalletsForToken(activeManager);
+                if (agentCheck) {
+                  tenants.grantTokenAccess(sess.user.id, "agent_wallet");
+                  // Persist to DB for 24h
+                  const { checkTokenHolding } = await import("./token-gate.js");
+                  try {
+                    const tokenResult = await checkTokenHolding(agentCheck.walletAddress);
+                    await saveVerificationToDB(sess.user.id, agentCheck.walletAddress, "agent_wallet", tokenResult.balance);
+                  } catch { /* non-fatal */ }
+                }
+              }
+            }
+            // If still not verified, send token_gate_required
+            if (!tenants.isTokenVerified(sess.user.id)) {
+              const nonce = generateNonce();
+              const message = buildSignMessage(nonce);
+              sess.broadcast({
+                type: "token_gate_required",
+                roomId: msg.roomId,
+                tokenMint: TOKEN_MINT,
+                nonce,
+                message,
+                minBalance: String(MIN_BALANCE),
+              });
+              break;
+            }
+          }
+          // Check join permission (private rooms need invite, org rooms need membership)
+          if (!tenants.canJoinRoom(msg.roomId, sess.user.id)) {
+            if (room.roomType === "organization") {
+              sess.broadcast({ type: "toast", text: "You need to be a member of this organization to join." });
+            } else {
+              sess.broadcast({ type: "toast", text: "This is a private office. You need an invite." });
+            }
+            break;
+          }
+          // Notify old room that the player left
+          const oldRoomId = sess.roomId;
+          if (oldRoomId && oldRoomId !== msg.roomId) {
+            for (const p of tenants.getRoomPlayers(oldRoomId)) {
+              if (p.userId === sess.user.id) continue;
+              const otherSess = tenants.get(p.userId);
+              if (otherSess) {
+                otherSess.broadcast({ type: "player_left", roomId: oldRoomId, userId: sess.user.id });
+              }
+            }
+          }
+          const joined = tenants.switchRoom(sess.user.id, msg.roomId);
+          if (!joined) {
+            sess.broadcast({ type: "toast", text: "Failed to join room." });
+            break;
+          }
+          // Track visitor for social interactions
+          if (room.ownerId && room.ownerId !== sess.user.id) {
+            recordVisit(room.ownerId, sess.user.id, sess.player?.name ?? "Visitor");
+            void recordSignalByKey(sess.user.id, "office_visited");
+          }
+          const players = tenants.getRoomPlayers(msg.roomId);
+          // Send full room state to the joining player
+          const joinAccessLevel = tenants.computeAccessLevel(room, sess.user.id);
+          sess.broadcast({
+            type: "room_state",
+            roomId: msg.roomId,
+            name: room.name,
+            players,
+            privateOfficeId: sess.privateOfficeId ?? undefined,
+            accessLevel: joinAccessLevel,
+            roomType: room.roomType,
+            ownerId: room.ownerId,
+          });
+          sendRoomsList();
+          // Send mailbox + platform states for the joined room's manager
+          const joinRoomMgr = tenants.getRoomManager(msg.roomId);
+          if (joinRoomMgr) {
+            for (const mb of joinRoomMgr.getMailboxSnapshots()) {
+              sess.broadcast({ type: "mailbox_update", ...mb });
+            }
+            sess.broadcast({ type: "platform_connection", states: joinRoomMgr.getPlatformConnectionStates() });
+          }
+          // Send outfits for the joined room's wardrobe
+          void sendOutfits(ws, sess);
+          // Send current presenters to the joining player
+          sess.broadcast({ type: "presenters_update", roomId: msg.roomId, presenters: tenants.getRoomPresenters(msg.roomId) });
+          // Notify all other players in the room
+          const me = players.find((p) => p.userId === sess.user.id);
+          for (const p of players) {
+            if (p.userId === sess.user.id) continue;
+            const otherSess = tenants.get(p.userId);
+            if (otherSess && me) {
+              otherSess.broadcast({
+                type: "player_joined",
+                roomId: msg.roomId,
+                player: me,
+              });
+            }
+          }
+          break;
+        }
+        case "restore_room": {
+          // Only restore if the room exists and we're not already in it
+          let targetRoom = tenants.getRoom(msg.roomId);
+          let restoreRoomId = msg.roomId;
+          // If the room doesn't exist (e.g. after a redeploy), use the
+          // roomType from the client to find an appropriate fallback room.
+          if (!targetRoom && msg.roomType) {
+            if (msg.roomType === "private") {
+              restoreRoomId = sess.privateOfficeId ?? HQ2_ROOM_ID;
+            } else if (msg.roomType === "token_gated") {
+              restoreRoomId = "holders-lounge";
+            } else {
+              // organization or public → HQ2 (Command Center)
+              restoreRoomId = HQ2_ROOM_ID;
+            }
+            targetRoom = tenants.getRoom(restoreRoomId);
+            console.log(`[restore_room] room ${msg.roomId} not found, falling back to ${restoreRoomId} (roomType=${msg.roomType})`);
+          }
+          console.log(`[restore_room] user=${sess.user.id} msg.roomId=${msg.roomId} targetRoom=${targetRoom?.id ?? "NOT_FOUND"} sess.roomId=${sess.roomId}`);
+          if (!targetRoom || sess.roomId === restoreRoomId) break;
+          // Check join permission
+          if (!tenants.canJoinRoom(restoreRoomId, sess.user.id)) break;
+          // Notify old room that the player left
+          const oldRoomId = sess.roomId;
+          if (oldRoomId) {
+            for (const p of tenants.getRoomPlayers(oldRoomId)) {
+              if (p.userId === sess.user.id) continue;
+              const otherSess = tenants.get(p.userId);
+              if (otherSess) {
+                otherSess.broadcast({ type: "player_left", roomId: oldRoomId, userId: sess.user.id });
+              }
+            }
+          }
+          const room = tenants.switchRoom(sess.user.id, restoreRoomId);
+          if (!room) break;
+          // Send new room state to the restoring player
+          const restoreAccessLevel = tenants.computeAccessLevel(room, sess.user.id);
+          sess.broadcast({
+            type: "room_state",
+            roomId: restoreRoomId,
+            name: room.name,
+            players: tenants.getRoomPlayers(restoreRoomId),
+            privateOfficeId: sess.privateOfficeId ?? undefined,
+            projectorChannel: room.projectorChannel,
+            accessLevel: restoreAccessLevel,
+            roomType: room.roomType,
+          });
+          sendRoomsList();
+          // Send agent snapshot from the room's manager
+          const restoreRoomMgr = tenants.getRoomManager(restoreRoomId);
+          if (restoreRoomMgr) {
+            const snap = restoreRoomMgr.snapshot();
+            const logCount = Object.fromEntries(Object.entries(snap.logs).map(([id, l]) => [id, l.length]));
+            console.log(`[restore_room] sending snapshot: room=${restoreRoomId} agents=${snap.agents.length} logs=${JSON.stringify(logCount)}`);
+            sess.broadcast({
+              type: "snapshot",
+              agents: snap.agents,
+              logs: snap.logs,
+              player: sess.player,
+              settings: restoreRoomMgr.settings,
+              board: snap.board,
+              schedules: restoreRoomMgr.snapshotSchedules(),
+              world: restoreRoomMgr.worldState(),
+            });
+          } else {
+            console.log(`[restore_room] sending EMPTY snapshot: room=${restoreRoomId} (no room manager)`);
+            sess.broadcast({
+              type: "snapshot",
+              agents: [],
+              logs: {},
+              player: sess.player,
+              settings: sess.manager.settings,
+              board: [],
+              schedules: [],
+              world: null,
+            });
+          }
+          // Send mailbox + platform states for the restored room's manager
+          if (restoreRoomMgr) {
+            for (const mb of restoreRoomMgr.getMailboxSnapshots()) {
+              sess.broadcast({ type: "mailbox_update", ...mb });
+            }
+            sess.broadcast({ type: "platform_connection", states: restoreRoomMgr.getPlatformConnectionStates() });
+          }
+          void sendOutfits(ws, sess);
+          // Send current presenters to the restoring player
+          sess.broadcast({ type: "presenters_update", roomId: restoreRoomId, presenters: tenants.getRoomPresenters(restoreRoomId) });
+          // Notify players in the restored room
+          const restorePlayers = tenants.getRoomPlayers(restoreRoomId);
+          const restoreMe = restorePlayers.find((p) => p.userId === sess.user.id);
+          for (const p of restorePlayers) {
+            if (p.userId === sess.user.id) continue;
+            const otherSess = tenants.get(p.userId);
+            if (otherSess && restoreMe) {
+              otherSess.broadcast({
+                type: "player_joined",
+                roomId: restoreRoomId,
+                player: restoreMe,
+              });
+            }
+          }
+          break;
+        }
+        case "switch_room": {
+          // Token-gated room: check verification before switching
+          const targetRoom = tenants.getRoom(msg.roomId);
+          if (targetRoom?.roomType === "token_gated") {
+            if (!tenants.isTokenVerified(sess.user.id)) {
+              const dbVerification = await getVerificationFromDB(sess.user.id);
+              if (dbVerification) {
+                tenants.grantTokenAccess(sess.user.id, dbVerification.method);
+              } else {
+                const agentCheck = await checkAgentWalletsForToken(activeManager);
+                if (agentCheck) {
+                  tenants.grantTokenAccess(sess.user.id, "agent_wallet");
+                  const { checkTokenHolding } = await import("./token-gate.js");
+                  try {
+                    const tokenResult = await checkTokenHolding(agentCheck.walletAddress);
+                    await saveVerificationToDB(sess.user.id, agentCheck.walletAddress, "agent_wallet", tokenResult.balance);
+                  } catch { /* non-fatal */ }
+                }
+              }
+            }
+            if (!tenants.isTokenVerified(sess.user.id)) {
+              const nonce = generateNonce();
+              const message = buildSignMessage(nonce);
+              sess.broadcast({
+                type: "token_gate_required",
+                roomId: msg.roomId,
+                tokenMint: TOKEN_MINT,
+                nonce,
+                message,
+                minBalance: String(MIN_BALANCE),
+              });
+              break;
+            }
+          }
+          // Notify old room that the player left
+          const oldRoomId = sess.roomId;
+          if (oldRoomId && oldRoomId !== msg.roomId) {
+            for (const p of tenants.getRoomPlayers(oldRoomId)) {
+              if (p.userId === sess.user.id) continue;
+              const otherSess = tenants.get(p.userId);
+              if (otherSess) {
+                otherSess.broadcast({ type: "player_left", roomId: oldRoomId, userId: sess.user.id });
+              }
+            }
+          }
+          const room = tenants.switchRoom(sess.user.id, msg.roomId);
+          if (!room) {
+            sess.broadcast({ type: "toast", text: "Room not found." });
+            break;
+          }
+          // Send new room state to the switching player
+          const newAccessLevel = tenants.computeAccessLevel(room, sess.user.id);
+          sess.broadcast({
+            type: "room_state",
+            roomId: msg.roomId,
+            name: room.name,
+            players: tenants.getRoomPlayers(msg.roomId),
+            privateOfficeId: sess.privateOfficeId ?? undefined,
+            projectorChannel: room.projectorChannel,
+            accessLevel: newAccessLevel,
+            roomType: room.roomType,
+          });
+          sendRoomsList();
+          // Send agent snapshot from the room's manager (personal, org shared, or empty)
+          const roomMgr = tenants.getRoomManager(msg.roomId);
+          if (roomMgr) {
+            const snap = roomMgr.snapshot();
+            sess.broadcast({
+              type: "snapshot",
+              agents: snap.agents,
+              logs: snap.logs,
+              player: sess.player,
+              settings: roomMgr.settings,
+              board: snap.board,
+              schedules: roomMgr.snapshotSchedules(),
+              world: roomMgr.worldState(),
+            });
+          } else {
+            // No manager for this room (e.g. HQ2 with no org manager yet) — empty
+            sess.broadcast({
+              type: "snapshot",
+              agents: [],
+              logs: {},
+              player: sess.player,
+              settings: sess.manager.settings,
+              board: [],
+              schedules: [],
+              world: null,
+            });
+          }
+          // Send mailbox + platform states for the new room's manager
+          const switchRoomMgr = tenants.getRoomManager(msg.roomId);
+          if (switchRoomMgr) {
+            for (const mb of switchRoomMgr.getMailboxSnapshots()) {
+              sess.broadcast({ type: "mailbox_update", ...mb });
+            }
+            sess.broadcast({ type: "platform_connection", states: switchRoomMgr.getPlatformConnectionStates() });
+          }
+          // Send outfits for the new room's wardrobe
+          void sendOutfits(ws, sess);
+          // Send current presenters to the switching player
+          sess.broadcast({ type: "presenters_update", roomId: msg.roomId, presenters: tenants.getRoomPresenters(msg.roomId) });
+          // Notify players in the new room
+          const switchedPlayers = tenants.getRoomPlayers(msg.roomId);
+          const switchedMe = switchedPlayers.find((p) => p.userId === sess.user.id);
+          for (const p of switchedPlayers) {
+            if (p.userId === sess.user.id) continue;
+            const otherSess = tenants.get(p.userId);
+            if (otherSess && switchedMe) {
+              otherSess.broadcast({
+                type: "player_joined",
+                roomId: msg.roomId,
+                player: switchedMe,
+              });
+            }
+          }
+          break;
+        }
+        case "leave_room": {
+          const left = tenants.leaveRoom(msg.roomId, sess.user.id);
+          if (left) {
+            // Notify remaining players
+            const remaining = tenants.getRoomPlayers(msg.roomId);
+            for (const p of remaining) {
+              const otherSess = tenants.get(p.userId);
+              if (otherSess) {
+                otherSess.broadcast({
+                  type: "player_left",
+                  roomId: msg.roomId,
+                  userId: sess.user.id,
+                });
+              }
+            }
+          }
+          break;
+        }
+        case "invite_to_room": {
+          const room = tenants.getRoom(msg.roomId);
+          if (!room || room.ownerId !== sess.user.id) {
+            sess.broadcast({ type: "toast", text: "You can only invite to your own rooms." });
+            break;
+          }
+          // Persist the invite with access level (default: talk)
+          const inviteLevel = msg.accessLevel ?? "talk";
+          tenants.inviteUser(msg.roomId, msg.userId, inviteLevel);
+          const invitedSess = tenants.get(msg.userId);
+          if (invitedSess) {
+            invitedSess.broadcast({
+              type: "room_invite",
+              roomId: msg.roomId,
+              roomName: room.name,
+              fromUserId: sess.user.id,
+              fromName: sess.player?.name ?? "Someone",
+              role: msg.role,
+              accessLevel: inviteLevel,
+            });
+          }
+          break;
+        }
+        case "respond_invite": {
+          // Find the room owner to notify
+          const room = tenants.getRoom(msg.roomId);
+          if (room) {
+            const ownerSess = tenants.get(room.ownerId);
+            if (ownerSess) {
+              ownerSess.broadcast({
+                type: "invite_response",
+                roomId: msg.roomId,
+                accepted: msg.accept,
+                byUserId: sess.user.id,
+                byName: sess.player?.name ?? "Someone",
+              });
+            }
+            if (msg.accept) {
+              // Notify old room that the player left
+              const oldRoomId = sess.roomId;
+              if (oldRoomId && oldRoomId !== msg.roomId) {
+                for (const p of tenants.getRoomPlayers(oldRoomId)) {
+                  if (p.userId === sess.user.id) continue;
+                  const otherSess = tenants.get(p.userId);
+                  if (otherSess) {
+                    otherSess.broadcast({ type: "player_left", roomId: oldRoomId, userId: sess.user.id });
+                  }
+                }
+              }
+              // Switch the accepter into the room
+              const joined = tenants.switchRoom(sess.user.id, msg.roomId);
+              if (joined) {
+                const inviteAccessLevel = tenants.computeAccessLevel(room, sess.user.id);
+                sess.broadcast({
+                  type: "room_state",
+                  roomId: msg.roomId,
+                  name: room.name,
+                  players: tenants.getRoomPlayers(msg.roomId),
+                  privateOfficeId: sess.privateOfficeId ?? undefined,
+                  projectorChannel: room.projectorChannel,
+                  accessLevel: inviteAccessLevel,
+                  roomType: room.roomType,
+                });
+                sendRoomsList();
+                // Send the room's agent snapshot
+                const roomMgr = tenants.getRoomManager(msg.roomId);
+                if (roomMgr) {
+                  const snap = roomMgr.snapshot();
+                  sess.broadcast({
+                    type: "snapshot",
+                    agents: snap.agents,
+                    logs: snap.logs,
+                    player: sess.player,
+                    settings: roomMgr.settings,
+                    board: snap.board,
+                    schedules: roomMgr.snapshotSchedules(),
+                    world: roomMgr.worldState(),
+                  });
+                }
+                // Notify others in the room
+                const invitedPlayers = tenants.getRoomPlayers(msg.roomId);
+                const invitedMe = invitedPlayers.find((p) => p.userId === sess.user.id);
+                for (const p of invitedPlayers) {
+                  if (p.userId === sess.user.id) continue;
+                  const otherSess = tenants.get(p.userId);
+                  if (otherSess && invitedMe) {
+                    otherSess.broadcast({
+                      type: "player_joined",
+                      roomId: msg.roomId,
+                      player: invitedMe,
+                    });
+                  }
+                }
+              }
+            }
+          }
+          break;
+        }
+        case "player_move": {
+          const room = tenants.updatePlayerPosition(sess.user.id, msg.x, msg.y, msg.dir);
+          if (room) {
+            // Buffer position update — flushed as batched players_moved message every 100ms
+            tenants.bufferPlayerPosition(sess.user.id, msg.x, msg.y, msg.dir);
+          }
+          break;
+        }
+        case "npc_update": {
+          // Relay NPC position/state to other players — only in private rooms (not HQ2)
+          if (sess.roomId) {
+            const room = tenants.getRoom(sess.roomId);
+            if (room && room.isPrivate) {
+              for (const [pid] of room.players) {
+                if (pid === sess.user.id) continue;
+                const otherSess = tenants.get(pid);
+                if (otherSess) {
+                  otherSess.broadcast({
+                    type: "npc_state",
+                    npcId: msg.npcId,
+                    x: msg.x,
+                    y: msg.y,
+                    dir: msg.dir,
+                    state: msg.state,
+                  });
+                }
+              }
+            }
+          }
+          break;
+        }
+        case "tile_update": {
+          // Persist tile override and broadcast to other players in the room
+          activeManager.applyTileOverride(msg.cx, msg.cy, msg.tileIndex, msg.tile);
+          if (sess.roomId) {
+            const room = tenants.getRoom(sess.roomId);
+            if (room) {
+              for (const [pid] of room.players) {
+                if (pid === sess.user.id) continue;
+                const otherSess = tenants.get(pid);
+                if (otherSess) {
+                  otherSess.broadcast({
+                    type: "tile_updated",
+                    cx: msg.cx,
+                    cy: msg.cy,
+                    tileIndex: msg.tileIndex,
+                    tile: msg.tile,
+                  });
+                }
+              }
+            }
+          }
+          break;
+        }
+        case "voice_start": {
+          sess.voiceActive = true;
+          sess.voiceListening = true;
+          console.log(`[voice] voice_start from ${sess.user.id} in room ${sess.roomId}`);
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          const myName = sess.player?.name ?? "Boss";
+          // Notify all voice-enabled peers (mic on OR listening) in the room
+          let peerCount = 0;
+          for (const [pid] of room.players) {
+            if (pid === sess.user.id) continue;
+            const peerSess = tenants.get(pid);
+            if (peerSess && (peerSess.voiceActive || peerSess.voiceListening)) {
+              peerCount++;
+              console.log(`[voice] notifying peer ${pid} about ${sess.user.id}`);
+              peerSess.broadcast({ type: "voice_peer", userId: sess.user.id, name: myName });
+              // Also tell the joining user about the existing peer
+              sess.broadcast({ type: "voice_peer", userId: pid, name: peerSess.player?.name ?? "Boss" });
+            }
+          }
+          console.log(`[voice] voice_start: found ${peerCount} voice peers`);
+          break;
+        }
+        case "voice_listen": {
+          sess.voiceListening = true;
+          console.log(`[voice] voice_listen from ${sess.user.id} in room ${sess.roomId}`);
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          const myName = sess.player?.name ?? "Boss";
+          // Notify all voice-enabled peers about the new listener
+          let peerCount = 0;
+          for (const [pid] of room.players) {
+            if (pid === sess.user.id) continue;
+            const peerSess = tenants.get(pid);
+            if (peerSess && (peerSess.voiceActive || peerSess.voiceListening)) {
+              peerCount++;
+              peerSess.broadcast({ type: "voice_peer", userId: sess.user.id, name: myName });
+              sess.broadcast({ type: "voice_peer", userId: pid, name: peerSess.player?.name ?? "Boss" });
+            }
+          }
+          console.log(`[voice] voice_listen: found ${peerCount} voice peers`);
+          break;
+        }
+        case "voice_stop": {
+          if (!sess.voiceActive) break;
+          sess.voiceActive = false;
+          sess.voiceListening = false;
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          for (const [pid] of room.players) {
+            if (pid === sess.user.id) continue;
+            const peerSess = tenants.get(pid);
+            if (peerSess && (peerSess.voiceActive || peerSess.voiceListening)) {
+              peerSess.broadcast({ type: "voice_peer_left", userId: sess.user.id });
+            }
+          }
+          break;
+        }
+        case "voice_listen_stop": {
+          if (!sess.voiceListening || sess.voiceActive) break;
+          sess.voiceListening = false;
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          for (const [pid] of room.players) {
+            if (pid === sess.user.id) continue;
+            const peerSess = tenants.get(pid);
+            if (peerSess && (peerSess.voiceActive || peerSess.voiceListening)) {
+              peerSess.broadcast({ type: "voice_peer_left", userId: sess.user.id });
+            }
+          }
+          break;
+        }
+        case "voice_offer":
+        case "voice_answer":
+        case "voice_ice": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          // Verify target is in the same room
+          if (!room.players.has(msg.targetUserId)) {
+            console.warn(`[voice] ${msg.type}: target ${msg.targetUserId} not in room ${sess.roomId}`);
+            break;
+          }
+          const targetSess = tenants.get(msg.targetUserId);
+          if (!targetSess || (!targetSess.voiceActive && !targetSess.voiceListening)) {
+            console.warn(`[voice] ${msg.type}: target ${msg.targetUserId} not found or not voice-enabled`);
+            break;
+          }
+          console.log(`[voice] relaying ${msg.type} from ${sess.user.id} to ${msg.targetUserId}`);
+          if (msg.type === "voice_offer") {
+            targetSess.broadcast({ type: "voice_offer", fromUserId: sess.user.id, sdp: msg.sdp });
+          } else if (msg.type === "voice_answer") {
+            targetSess.broadcast({ type: "voice_answer", fromUserId: sess.user.id, sdp: msg.sdp });
+          } else {
+            targetSess.broadcast({ type: "voice_ice", fromUserId: sess.user.id, candidate: msg.candidate });
+          }
+          break;
+        }
+        case "projector_set_channel": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          const valid = ["off", "brainrot", "chill", "trading", "agent"];
+          if (!valid.includes(msg.channel)) break;
+          room.projectorChannel = msg.channel;
+          // Broadcast to all players in the room
+          for (const [pid] of room.players) {
+            const otherSess = tenants.get(pid);
+            if (otherSess) {
+              otherSess.broadcast({ type: "projector_state", channel: msg.channel });
+              // Clear HTML broadcast state when switching to a non-html channel
+              if (msg.channel !== "html") {
+                otherSess.broadcast({ type: "agent_broadcast_html_state", agentId: null, url: null });
+              }
+            }
+          }
+          break;
+        }
+        case "screen_share_start": {
+          if (!sess.roomId) break;
+          const myName = sess.player?.name ?? "Boss";
+          const presenter: Presenter = { userId: sess.user.id, name: myName, type: "screen", startedAt: Date.now() };
+          if (!tenants.addPresenter(sess.roomId, presenter)) {
+            sess.broadcast({ type: "toast", text: `Presenter grid is full (${MAX_PRESENTERS}/${MAX_PRESENTERS}). Try again when someone stops.` });
+            break;
+          }
+          sess.screenShareActive = true;
+          console.log(`[screen-share] ${sess.user.id} (${myName}) started sharing in room ${sess.roomId}`);
+          broadcastPresenters(sess.roomId);
+          break;
+        }
+        case "screen_share_stop": {
+          if (!sess.screenShareActive) break;
+          sess.screenShareActive = false;
+          if (!sess.roomId) break;
+          tenants.removePresenter(sess.roomId, sess.user.id, "screen");
+          broadcastPresenters(sess.roomId);
+          break;
+        }
+        case "screen_share_offer":
+        case "screen_share_answer":
+        case "screen_share_ice": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          if (!room.players.has(msg.targetUserId)) {
+            console.warn(`[screen-share] ${msg.type}: target ${msg.targetUserId} not in room ${sess.roomId} (players: ${[...room.players.keys()].join(",")})`);
+            break;
+          }
+          const targetSess = tenants.get(msg.targetUserId);
+          if (!targetSess) {
+            console.warn(`[screen-share] ${msg.type}: target session ${msg.targetUserId} not found`);
+            break;
+          }
+          console.log(`[screen-share] relaying ${msg.type} from ${sess.user.id} to ${msg.targetUserId}`);
+          if (msg.type === "screen_share_offer") {
+            targetSess.broadcast({ type: "screen_share_offer", fromUserId: sess.user.id, sdp: msg.sdp });
+          } else if (msg.type === "screen_share_answer") {
+            targetSess.broadcast({ type: "screen_share_answer", fromUserId: sess.user.id, sdp: msg.sdp });
+          } else {
+            targetSess.broadcast({ type: "screen_share_ice", fromUserId: sess.user.id, candidate: msg.candidate });
+          }
+          break;
+        }
+        case "webcam_start": {
+          if (sess.webcamActive) break;
+          if (!sess.roomId) break;
+          const myName = sess.player?.name ?? "Boss";
+          const presenter: Presenter = { userId: sess.user.id, name: myName, type: "webcam", startedAt: Date.now() };
+          if (!tenants.addPresenter(sess.roomId, presenter)) {
+            sess.broadcast({ type: "toast", text: `Presenter grid is full (${MAX_PRESENTERS}/${MAX_PRESENTERS}). Try again when someone stops.` });
+            break;
+          }
+          sess.webcamActive = true;
+          broadcastPresenters(sess.roomId);
+          break;
+        }
+        case "webcam_stop": {
+          if (!sess.webcamActive) break;
+          sess.webcamActive = false;
+          if (!sess.roomId) break;
+          tenants.removePresenter(sess.roomId, sess.user.id, "webcam");
+          broadcastPresenters(sess.roomId);
+          break;
+        }
+        case "presenter_kick": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          // Only room owner or manage access can kick
+          const accessLevel = tenants.getRoomAccessLevel(sess.user.id);
+          if (room.ownerId !== sess.user.id && accessLevel !== "manage") {
+            sess.broadcast({ type: "toast", text: "Only the room owner or managers can kick presenters." });
+            break;
+          }
+          // Notify the kicked user
+          const targetSess = tenants.get(msg.userId);
+          if (targetSess) {
+            targetSess.broadcast({ type: "presenter_kicked", presenterType: msg.presenterType });
+          }
+          // Remove from room presenters and broadcast update
+          tenants.removePresenter(sess.roomId, msg.userId, msg.presenterType);
+          if (msg.presenterType === "screen") {
+            targetSess?.broadcast({ type: "toast", text: "Your screen share was stopped by the room owner." });
+          } else {
+            targetSess?.broadcast({ type: "toast", text: "Your webcam broadcast was stopped by the room owner." });
+          }
+          broadcastPresenters(sess.roomId);
+          break;
+        }
+        case "webcam_offer":
+        case "webcam_answer":
+        case "webcam_ice": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          if (!room.players.has(msg.targetUserId)) break;
+          const targetSess = tenants.get(msg.targetUserId);
+          if (!targetSess) break;
+          if (msg.type === "webcam_offer") {
+            targetSess.broadcast({ type: "webcam_offer", fromUserId: sess.user.id, sdp: msg.sdp });
+          } else if (msg.type === "webcam_answer") {
+            targetSess.broadcast({ type: "webcam_answer", fromUserId: sess.user.id, sdp: msg.sdp });
+          } else {
+            targetSess.broadcast({ type: "webcam_ice", fromUserId: sess.user.id, candidate: msg.candidate });
+          }
+          break;
+        }
+        case "agent_view_start": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          // Find the agent's MCP config
+          const ownerSess = room.isPrivate
+            ? tenants.get(room.ownerId)
+            : sess;
+          if (!ownerSess) break;
+          const agent = [...ownerSess.manager["agents"].values()].find(a => a.info.id === msg.agentId);
+          if (!agent) break;
+          screenshots.startCapture(
+            msg.agentId,
+            agent.info.mcpServers,
+            { id: sess.user.id, broadcast: sess.broadcast },
+          );
+          // Built-in Playwright browser is always available; MCP is optional.
+          // The client shows a placeholder until the agent opens a browser session.
+          break;
+        }
+        case "agent_view_stop": {
+          screenshots.stopViewer(msg.agentId, sess.user.id);
+          break;
+        }
+        case "agent_broadcast_start": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          const ownerSess = room.isPrivate
+            ? tenants.get(room.ownerId)
+            : sess;
+          if (!ownerSess) break;
+          const agent = [...ownerSess.manager["agents"].values()].find(a => a.info.id === msg.agentId);
+          if (!agent) break;
+          // Build a broadcast fn that sends to all players in the room
+          const roomBroadcast = (msg2: ServerMsg) => {
+            for (const [pid] of room.players) {
+              const peerSess = tenants.get(pid);
+              if (peerSess) peerSess.broadcast(msg2);
+            }
+          };
+          const ok = screenshots.startCapture(
+            msg.agentId,
+            agent.info.mcpServers,
+            undefined,
+            roomBroadcast,
+          );
+          if (ok) {
+            // Switch projector to agent channel and notify all players
+            room.projectorChannel = "agent";
+            for (const [pid] of room.players) {
+              const peerSess = tenants.get(pid);
+              if (peerSess) {
+                peerSess.broadcast({ type: "projector_state", channel: "agent" });
+                peerSess.broadcast({ type: "agent_broadcast_state", agentId: msg.agentId });
+                peerSess.broadcast({ type: "agent_broadcast_html_state", agentId: null, url: null });
+              }
+            }
+          } else {
+            sess.broadcast({ type: "toast", text: "This agent doesn't have a browser MCP (Playwright/Chrome DevTools) configured." });
+          }
+          break;
+        }
+        case "agent_broadcast_stop": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          // Find and stop whichever agent is broadcasting
+          const ownerSess = room.isPrivate ? tenants.get(room.ownerId) : sess;
+          if (ownerSess) {
+            for (const agent of ownerSess.manager["agents"].values()) {
+              if (agent.info.status === "thinking" || agent.info.status === "working") {
+                screenshots.stopBroadcast(agent.info.id);
+              }
+            }
+          }
+          room.projectorChannel = "off";
+          for (const [pid] of room.players) {
+            const peerSess = tenants.get(pid);
+            if (peerSess) {
+              peerSess.broadcast({ type: "projector_state", channel: "off" });
+              peerSess.broadcast({ type: "agent_broadcast_state", agentId: null });
+              peerSess.broadcast({ type: "agent_broadcast_html_state", agentId: null, url: null });
+            }
+          }
+          break;
+        }
+        case "agent_broadcast_html": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          const ownerSess = room.isPrivate ? tenants.get(room.ownerId) : sess;
+          if (!ownerSess) break;
+          const agent = [...ownerSess.manager["agents"].values()].find(a => a.info.id === msg.agentId);
+          if (!agent) break;
+
+          // Stop any existing screenshot broadcast for this agent
+          screenshots.stopBroadcast(msg.agentId);
+
+          // Verify the HTML file exists in the agent's workspace
+          const agentWs = ownerSess.manager.getAgentWorkspace(msg.agentId);
+          if (!agentWs) {
+            sess.broadcast({ type: "toast", text: "Agent workspace not found." });
+            break;
+          }
+          const fs = await import("node:fs/promises");
+          const filePath = msg.filePath.replace(/(^|\/)\.\.(\/|$)/g, "");
+          const fullPath = resolve(agentWs, filePath);
+          const rel = relative(agentWs, fullPath);
+          if (rel.startsWith("..")) {
+            sess.broadcast({ type: "toast", text: "Invalid file path." });
+            break;
+          }
+          try {
+            await fs.access(fullPath);
+          } catch {
+            sess.broadcast({ type: "toast", text: `File not found: ${filePath}` });
+            break;
+          }
+
+          // Build the relative URL path for the iframe — client appends its own auth token
+          const htmlPath = `/api/agent-workspace/${msg.agentId}/${filePath}`;
+
+          // Switch projector to html channel and notify all players
+          room.projectorChannel = "html";
+          for (const [pid] of room.players) {
+            const peerSess = tenants.get(pid);
+            if (peerSess) {
+              peerSess.broadcast({ type: "projector_state", channel: "html" });
+              peerSess.broadcast({ type: "agent_broadcast_html_state", agentId: msg.agentId, url: htmlPath });
+              peerSess.broadcast({ type: "agent_broadcast_state", agentId: null });
+            }
+          }
+          break;
+        }
+        // ── Agent file system operations ────────────────────────────────
+        case "agent_fs_list":
+        case "agent_fs_read":
+        case "agent_fs_write":
+        case "agent_fs_delete":
+        case "agent_fs_upload": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          const ownerSess = room.isPrivate ? tenants.get(room.ownerId) : sess;
+          if (!ownerSess) break;
+          const ws_path = (msg as any).path ?? ".";
+          const isShared = ws_path.startsWith("shared/");
+          const agentWs = isShared
+            ? ownerSess.manager.getSharedWorkspace()
+            : ownerSess.manager.getAgentWorkspace(msg.agentId);
+          if (!agentWs) {
+            sess.broadcast({ type: "agent_fs_listing", agentId: msg.agentId, path: ws_path, entries: [] });
+            break;
+          }
+          const relPath = isShared ? ws_path.slice("shared/".length) : ws_path;
+
+          // Filename sanitization — reject dangerous patterns
+          if (/(^|\/)\.\.(\/|$)/.test(relPath) || /[\x00-\x1f]/.test(relPath)) {
+            sess.broadcast({ type: "toast", text: "Invalid file path." });
+            break;
+          }
+
+          const safePath = resolve(agentWs, relPath);
+          const rel = relative(agentWs, safePath);
+          if (rel.startsWith("..")) {
+            sess.broadcast({ type: "toast", text: "Path outside workspace." });
+            break;
+          }
+
+          // Symlink protection — reject if the resolved path or any parent
+          // directory in the workspace is a symlink
+          try {
+            // Check the target itself
+            const linkInfo = await lstat(safePath).catch(() => null);
+            if (linkInfo?.isSymbolicLink()) {
+              sess.broadcast({ type: "toast", text: "Symlinks are not allowed." });
+              break;
+            }
+            // Walk all parent directories from workspace root to target
+            let checkDir = safePath;
+            const wsRoot = resolve(agentWs);
+            while (checkDir !== wsRoot && checkDir !== dirname(checkDir)) {
+              const dirLink = await lstat(checkDir).catch(() => null);
+              if (dirLink?.isSymbolicLink()) {
+                sess.broadcast({ type: "toast", text: "Symlinks are not allowed." });
+                break;
+              }
+              checkDir = dirname(checkDir);
+            }
+            // Check if we broke out of the loop via symlink detection
+            if (checkDir !== wsRoot && checkDir !== dirname(checkDir)) break;
+          } catch { /* file doesn't exist yet — fine for write/upload */ }
+
+          // File size limit for write/upload (10MB)
+          const MAX_FILE_SIZE = 10 * 1024 * 1024;
+          if (msg.type === "agent_fs_write" || msg.type === "agent_fs_upload") {
+            const content = (msg as any).content ?? "";
+            const sizeBytes = (msg as any).encoding === "base64"
+              ? Buffer.from(content, "base64").length
+              : typeof content === "string" ? Buffer.byteLength(content, "utf-8") : 0;
+            if (sizeBytes > MAX_FILE_SIZE) {
+              sess.broadcast({ type: "toast", text: `File too large (max ${MAX_FILE_SIZE / 1024 / 1024}MB).` });
+              break;
+            }
+          }
+
+          if (msg.type === "agent_fs_list") {
+            try {
+              const entries = await readdir(safePath, { withFileTypes: true });
+              const listing = await Promise.all(entries.map(async (e) => {
+                const fullPath = join(safePath, e.name);
+                const s = await stat(fullPath).catch(() => null);
+                return {
+                  name: e.name,
+                  isDir: e.isDirectory(),
+                  size: s?.size ?? 0,
+                  mtime: s?.mtimeMs ?? 0,
+                };
+              }));
+              listing.sort((a, b) => (a.isDir === b.isDir) ? a.name.localeCompare(b.name) : (a.isDir ? -1 : 1));
+              sess.broadcast({ type: "agent_fs_listing", agentId: msg.agentId, path: ws_path, entries: listing });
+            } catch {
+              sess.broadcast({ type: "agent_fs_listing", agentId: msg.agentId, path: ws_path, entries: [] });
+            }
+          } else if (msg.type === "agent_fs_read") {
+            try {
+              const content = await readFile(safePath, "utf-8");
+              sess.broadcast({ type: "agent_fs_content", agentId: msg.agentId, path: ws_path, content });
+            } catch (err) {
+              sess.broadcast({ type: "agent_fs_content", agentId: msg.agentId, path: ws_path, content: "", error: err instanceof Error ? err.message : "Read failed" });
+            }
+          } else if (msg.type === "agent_fs_write") {
+            try {
+              await mkdir(dirname(safePath), { recursive: true });
+              await writeFile(safePath, (msg as any).content, "utf-8");
+              sess.broadcast({ type: "agent_fs_result", agentId: msg.agentId, path: ws_path, action: "write", success: true });
+            } catch (err) {
+              sess.broadcast({ type: "agent_fs_result", agentId: msg.agentId, path: ws_path, action: "write", success: false, error: err instanceof Error ? err.message : "Write failed" });
+            }
+          } else if (msg.type === "agent_fs_delete") {
+            try {
+              await unlink(safePath);
+              sess.broadcast({ type: "agent_fs_result", agentId: msg.agentId, path: ws_path, action: "delete", success: true });
+            } catch (err) {
+              sess.broadcast({ type: "agent_fs_result", agentId: msg.agentId, path: ws_path, action: "delete", success: false, error: err instanceof Error ? err.message : "Delete failed" });
+            }
+          } else if (msg.type === "agent_fs_upload") {
+            try {
+              await mkdir(dirname(safePath), { recursive: true });
+              const content = (msg as any).encoding === "base64"
+                ? Buffer.from((msg as any).content, "base64")
+                : (msg as any).content;
+              await writeFile(safePath, content);
+              sess.broadcast({ type: "agent_fs_result", agentId: msg.agentId, path: ws_path, action: "upload", success: true });
+            } catch (err) {
+              sess.broadcast({ type: "agent_fs_result", agentId: msg.agentId, path: ws_path, action: "upload", success: false, error: err instanceof Error ? err.message : "Upload failed" });
+            }
+          }
+          break;
+        }
+        // ── Agent live log streaming ────────────────────────────────────
+        case "agent_log_subscribe": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          const ownerSess = room.isPrivate ? tenants.get(room.ownerId) : sess;
+          if (!ownerSess) break;
+          // Send log history first
+          const history = ownerSess.manager.getAgentLogs(msg.agentId);
+          sess.broadcast({ type: "agent_log_history", agentId: msg.agentId, entries: history });
+          // Subscribe to live logs
+          const unsub = ownerSess.manager.subscribeAgentLogs(msg.agentId, (entry) => {
+            sess.broadcast({ type: "agent_log", agentId: msg.agentId, entry });
+          });
+          // Store unsubscribe fn for cleanup
+          if (!sess.agentLogSubscriptions) sess.agentLogSubscriptions = new Map();
+          sess.agentLogSubscriptions.set(msg.agentId, unsub);
+          break;
+        }
+        case "agent_log_unsubscribe": {
+          if (sess.agentLogSubscriptions) {
+            const unsub = sess.agentLogSubscriptions.get(msg.agentId);
+            if (unsub) {
+              unsub();
+              sess.agentLogSubscriptions.delete(msg.agentId);
+            }
+          }
+          break;
+        }
+        // ── Agent task injection + task info ──────────────────────────────
+        case "agent_inject_task": {
+          activeManager.assign(msg.agentId, msg.task, msg.handoffTo);
+          // Send back updated task info
+          const info = activeManager.getTaskInfo(msg.agentId);
+          if (info) sess.broadcast({ type: "agent_task_info", agentId: msg.agentId, ...info });
+          break;
+        }
+        // ── Agent memory viewer ───────────────────────────────────────────
+        case "agent_memory_request": {
+          const rawMessages = await activeManager.getAgentMemory(msg.agentId);
+          // Normalize messages to { role, content } format
+          const messages = rawMessages.map((m: any) => {
+            const role = m.role ?? "unknown";
+            let content = "";
+            if (typeof m.content === "string") {
+              content = m.content;
+            } else if (Array.isArray(m.content)) {
+              content = m.content.map((part: any) => {
+                if (part.type === "text" && part.text) return part.text;
+                if (part.type === "tool_use") return `[tool_use: ${part.name}(${JSON.stringify(part.input ?? {}).slice(0, 200)})]`;
+                if (part.type === "tool_result") {
+                  const resultText = typeof part.content === "string" ? part.content : JSON.stringify(part.content ?? "");
+                  return `[tool_result: ${resultText.slice(0, 200)}]`;
+                }
+                return JSON.stringify(part).slice(0, 200);
+              }).join("\n");
+            } else {
+              content = JSON.stringify(m.content ?? "").slice(0, 500);
+            }
+            return { role, content: content.slice(0, 2000) };
+          });
+          sess.broadcast({ type: "agent_memory", agentId: msg.agentId, messages });
+          break;
+        }
+        // ── Platform mailbox ──────────────────────────────────────────────
+        case "check_mailbox": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          const ownerSess = room.isPrivate ? tenants.get(room.ownerId) : sess;
+          if (!ownerSess) break;
+          const events = ownerSess.manager.checkMailbox(msg.platform);
+          sess.broadcast({ type: "mailbox_messages", platform: msg.platform, events });
+          break;
+        }
+        case "reply_mailbox": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          const ownerSess = room.isPrivate ? tenants.get(room.ownerId) : sess;
+          if (!ownerSess) break;
+          const success = await ownerSess.manager.replyToMailbox(msg.platform, msg.target, msg.text);
+          sess.broadcast({ type: "toast", text: success ? `Reply sent via ${msg.platform}.` : `Failed to send reply via ${msg.platform}.` });
+          break;
+        }
+        case "request_mail_digest": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          const ownerSess = room.isPrivate ? tenants.get(room.ownerId) : sess;
+          if (!ownerSess) break;
+          const digest = ownerSess.manager.getMailDigest();
+          sess.broadcast({ type: "mail_digest", ...digest });
+          break;
+        }
+        case "request_automation_stats": {
+          const stats = sess.manager.computeAutomationStats();
+          ws.send(JSON.stringify({ type: "automation_stats", stats } satisfies ServerMsg));
+          break;
+        }
+        case "connect_platform": {
+          // Return current platform connection states so the client can show
+          // the appropriate auth modal. The actual connection happens via
+          // `hermes gateway setup` on the server side — this just triggers
+          // a fresh status poll and sends the result back.
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          const ownerSess = room.isPrivate ? tenants.get(room.ownerId) : sess;
+          if (!ownerSess) break;
+          ownerSess.manager.broadcastPlatformStates();
+          break;
+        }
+        case "configure_platform": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          const ownerSess = room.isPrivate ? tenants.get(room.ownerId) : sess;
+          if (!ownerSess) break;
+          const result = await ownerSess.manager.configurePlatform(msg.platform, msg.credentials);
+          sess.broadcast({ type: "platform_config_result", platform: msg.platform, success: result.success, error: result.error });
+          break;
+        }
+        case "set_mailbox_platform": {
+          if (!sess.roomId) break;
+          const room = tenants.getRoom(sess.roomId);
+          if (!room) break;
+          const ownerSess = room.isPrivate ? tenants.get(room.ownerId) : sess;
+          if (!ownerSess) break;
+          const mgr = ownerSess.manager;
+          const slot = Math.max(0, Math.min(5, msg.slot));
+          const newPlatforms = [...mgr.settings.mailboxPlatforms];
+          while (newPlatforms.length < 6) newPlatforms.push(null);
+          newPlatforms[slot] = msg.platform;
+          mgr.setSettings({ ...mgr.settings, mailboxPlatforms: newPlatforms });
+          break;
+        }
+        case "create_org": {
+          const slug = msg.slug.trim().toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/^-+|-+$/g, "");
+          if (!slug) {
+            sess.broadcast({ type: "org_error", message: "Invalid organization slug." });
+            break;
+          }
+          const org = tenants.createOrg(msg.name.trim(), slug, msg.githubOrg, sess.user.id, sess.user.email);
+          if (!org) {
+            sess.broadcast({ type: "org_error", message: "Organization slug already taken." });
+            break;
+          }
+          sess.broadcast({
+            type: "org_created",
+            org: { id: org.id, name: org.name, slug: org.slug, githubOrg: org.githubOrg, createdAt: org.createdAt },
+          });
+          void recordSignalByKey(sess.user.id, "org_created");
+          break;
+        }
+        case "list_orgs": {
+          const orgs = tenants.getAllOrgs(sess.user.id);
+          sess.broadcast({ type: "orgs_list", orgs });
+          break;
+        }
+        case "list_org_members": {
+          const members = tenants.getOrgMembers(msg.orgId);
+          sess.broadcast({ type: "org_members", orgId: msg.orgId, members });
+          break;
+        }
+        case "add_org_member": {
+          if (!tenants.isOrgAdmin(msg.orgId, sess.user.id)) {
+            sess.broadcast({ type: "org_error", message: "You must be an org admin to add members." });
+            break;
+          }
+          const result = tenants.addOrgMemberByEmail(msg.orgId, msg.userEmail.trim(), msg.role ?? "member", sess.user.id);
+          if (result.ok) {
+            // Broadcast updated member list
+            const members = tenants.getOrgMembers(msg.orgId);
+            sess.broadcast({ type: "org_members", orgId: msg.orgId, members });
+            sess.broadcast({ type: "toast", text: result.message });
+          } else {
+            sess.broadcast({ type: "org_error", message: result.message });
+          }
+          break;
+        }
+        case "remove_org_member": {
+          if (!tenants.isOrgAdmin(msg.orgId, sess.user.id)) {
+            sess.broadcast({ type: "org_error", message: "You must be an org admin to remove members." });
+            break;
+          }
+          const ok = tenants.removeOrgMember(msg.orgId, msg.userId);
+          if (ok) {
+            const members = tenants.getOrgMembers(msg.orgId);
+            sess.broadcast({ type: "org_members", orgId: msg.orgId, members });
+            sess.broadcast({ type: "toast", text: "Member removed." });
+          } else {
+            sess.broadcast({ type: "org_error", message: "Failed to remove member." });
+          }
+          break;
+        }
+        case "join_org_room": {
+          if (!tenants.isOrgMember(msg.orgId, sess.user.id)) {
+            sess.broadcast({ type: "toast", text: "You are not a member of this organization." });
+            break;
+          }
+          // Find or create the org room
+          const org = tenants.getOrg(msg.orgId);
+          if (!org) {
+            sess.broadcast({ type: "toast", text: "Organization not found." });
+            break;
+          }
+          // Look for an existing org room with this name
+          let targetRoomId: string | null = null;
+          for (const room of tenants.getRoomsForUser(sess.user.id)) {
+            if (room.orgId === msg.orgId && room.name === msg.roomName) {
+              targetRoomId = room.id;
+              break;
+            }
+          }
+          // Also check all rooms (the org room may exist but not yet be in the user's list)
+          if (!targetRoomId) {
+            for (const room of tenants.getRoomsForUser(sess.user.id)) {
+              if (room.orgId === msg.orgId) {
+                targetRoomId = room.id;
+                break;
+              }
+            }
+          }
+          if (!targetRoomId) {
+            // Create a new room in the org
+            targetRoomId = tenants.createOrgRoom(msg.orgId, msg.roomName);
+            if (!targetRoomId) {
+              sess.broadcast({ type: "toast", text: "Failed to create org room." });
+              break;
+            }
+          }
+          // Switch to the room
+          const oldRoomId = sess.roomId;
+          if (oldRoomId && oldRoomId !== targetRoomId) {
+            for (const p of tenants.getRoomPlayers(oldRoomId)) {
+              if (p.userId === sess.user.id) continue;
+              const otherSess = tenants.get(p.userId);
+              if (otherSess) {
+                otherSess.broadcast({ type: "player_left", roomId: oldRoomId, userId: sess.user.id });
+              }
+            }
+          }
+          const room = tenants.switchRoom(sess.user.id, targetRoomId);
+          if (!room) {
+            sess.broadcast({ type: "toast", text: "Failed to join org room." });
+            break;
+          }
+          const orgAccessLevel = tenants.computeAccessLevel(room, sess.user.id);
+          sess.broadcast({
+            type: "room_state",
+            roomId: targetRoomId,
+            name: room.name,
+            players: tenants.getRoomPlayers(targetRoomId),
+            privateOfficeId: sess.privateOfficeId ?? undefined,
+            projectorChannel: room.projectorChannel,
+            accessLevel: orgAccessLevel,
+            roomType: room.roomType,
+          });
+          sendRoomsList();
+          // Send outfits for the org room's wardrobe
+          void sendOutfits(ws, sess);
+          // Send the org room's agent snapshot
+          const orgRoomMgr = tenants.getRoomManager(targetRoomId);
+          if (orgRoomMgr) {
+            const snap = orgRoomMgr.snapshot();
+            sess.broadcast({
+              type: "snapshot",
+              agents: snap.agents,
+              logs: snap.logs,
+              player: sess.player,
+              settings: orgRoomMgr.settings,
+              board: snap.board,
+              schedules: orgRoomMgr.snapshotSchedules(),
+              world: orgRoomMgr.worldState(),
+            });
+          }
+          // Notify other players in the room
+          const players = tenants.getRoomPlayers(targetRoomId);
+          const me = players.find((p) => p.userId === sess.user.id);
+          for (const p of players) {
+            if (p.userId === sess.user.id) continue;
+            const otherSess = tenants.get(p.userId);
+            if (otherSess && me) {
+              otherSess.broadcast({ type: "player_joined", roomId: targetRoomId, player: me });
+            }
+          }
+          break;
+        }
+        // ── MCP Forge ────────────────────────────────────────────────────
+        case "list_office_mcp": {
+          const servers = manager.getForgeServers();
+          sess.broadcast({ type: "office_mcp_list", servers });
+          break;
+        }
+        case "unregister_mcp_server": {
+          const ok = await manager.unregisterForgeServer(msg.serverId);
+          if (!ok) {
+            sess.broadcast({ type: "toast", text: "MCP server not found or already removed." });
+          }
+          break;
+        }
+        case "recommend_agents": {
+          const userText = String(msg.text).trim().slice(0, 2000);
+          if (!userText) break;
+
+          // Save onboarding text for CRM insights
+          if (isSupabaseConfigured) {
+            Promise.resolve(supabaseAdmin
+              .from("heights_cloud_user_onboarding")
+              .upsert({
+                user_id: sess.user.id,
+                onboarding_text: userText,
+                updated_at: new Date().toISOString(),
+              }, { onConflict: "user_id" }))
+              .then(() => {})
+              .catch((err: unknown) => console.warn("[onboarding] failed to save text:", err));
+          }
+
+          // Fetch all approved marketplace agents (name, summary, tags, category)
+          let agentCatalog: { id: string; name: string; summary: string; tags: string; category: string[] }[] = [];
+          if (isSupabaseConfigured) {
+            try {
+              const { data, error } = await supabaseAdmin
+                .from("heights_cloud_agents")
+                .select("id, name, summary, tags, category")
+                .eq("status", "approved")
+                .eq("search_type", "agent")
+                .order("created_at", { ascending: false })
+                .limit(500);
+              if (!error && data) {
+                agentCatalog = data.map((r) => ({
+                  id: String(r.id),
+                  name: String(r.name ?? ""),
+                  summary: String(r.summary ?? "").slice(0, 120),
+                  tags: String(r.tags ?? ""),
+                  category: Array.isArray(r.category) ? r.category.map(String) : [],
+                }));
+              }
+            } catch (err) {
+              console.warn("[onboarding] failed to fetch marketplace agents:", err);
+            }
+          }
+
+          if (agentCatalog.length === 0) {
+            ws.send(JSON.stringify({ type: "agent_recommendations", recommendations: [] } satisfies ServerMsg));
+            break;
+          }
+
+          // Build the LLM prompt
+          const providerConfig = getProviderConfig();
+          if (!providerConfig.apiKey) {
+            ws.send(JSON.stringify({ type: "agent_recommendations", recommendations: [] } satisfies ServerMsg));
+            break;
+          }
+
+          const systemPrompt = `You are an onboarding concierge for Agent Heights, a platform where users hire AI agents into a virtual office. Given a user's description of their work and tools, and a list of available marketplace agents, recommend the 3-5 most relevant agents. Be generous — even for vague descriptions like "student" or "I like computers", find agents that could plausibly help (e.g. note-taking, scheduling, research, writing, organization tools). Only return an empty array if there is truly zero relevance. Return ONLY a JSON array, no markdown, no explanation. Each element: {"agentId": "<id>", "reason": "<one sentence why this agent fits>"}. Only recommend agents from the list.`;
+
+          const userPrompt = `User description: "${userText}"\n\nAvailable agents:\n${JSON.stringify(agentCatalog.slice(0, 200))}`;
+
+          try {
+            const llmRes = await fetch(`${providerConfig.baseUrl}/chat/completions`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                ...providerConfig.headers,
+              },
+              body: JSON.stringify({
+                model: resolveModel("glm-5.3-flash", providerConfig.name),
+                messages: [
+                  { role: "system", content: systemPrompt },
+                  { role: "user", content: userPrompt },
+                ],
+                max_tokens: 1024,
+                temperature: 0.3,
+              }),
+              signal: AbortSignal.timeout(15_000),
+            });
+
+            if (!llmRes.ok) {
+              const errBody = await llmRes.text().catch(() => "");
+              console.warn(`[onboarding] LLM API error: ${llmRes.status}`, errBody.slice(0, 300));
+              ws.send(JSON.stringify({ type: "agent_recommendations", recommendations: [] } satisfies ServerMsg));
+              break;
+            }
+
+            const llmData = await llmRes.json() as any;
+            const content = String(llmData.choices?.[0]?.message?.content ?? "").trim();
+
+            if (!content) {
+              console.warn("[onboarding] LLM returned empty content");
+              ws.send(JSON.stringify({ type: "agent_recommendations", recommendations: [] } satisfies ServerMsg));
+              break;
+            }
+
+            // Parse the JSON array from the response — robustly extract JSON
+            // even if the LLM wraps it in markdown fences or preamble text
+            let parsed: { agentId: string; reason: string }[] = [];
+            try {
+              // Try direct parse first (ideal case)
+              parsed = JSON.parse(content);
+            } catch {
+              try {
+                // Strip markdown code fences if present
+                const fenced = content.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+                parsed = JSON.parse(fenced);
+              } catch {
+                try {
+                  // Extract JSON array from anywhere in the response
+                  const match = content.match(/\[[\s\S]*\]/);
+                  if (match) {
+                    parsed = JSON.parse(match[0]);
+                  } else {
+                    throw new Error("no JSON array found");
+                  }
+                } catch (parseErr) {
+                  console.warn("[onboarding] failed to parse LLM response:", content.slice(0, 300), parseErr);
+                  ws.send(JSON.stringify({ type: "agent_recommendations", recommendations: [] } satisfies ServerMsg));
+                  break;
+                }
+              }
+            }
+
+            console.log(`[onboarding] LLM returned ${parsed.length} recommendations`);
+
+            // Build recommendation objects with full agent details
+            const agentMap = new Map(agentCatalog.map((a) => [a.id, a]));
+            const recommendations = parsed
+              .filter((r) => agentMap.has(r.agentId))
+              .slice(0, 5)
+              .map((r) => {
+                const agent = agentMap.get(r.agentId)!;
+                return {
+                  agentId: r.agentId,
+                  name: agent.name,
+                  summary: agent.summary,
+                  reason: r.reason,
+                  image_url: null as string | null,
+                };
+              });
+
+            // Fetch image_url for recommended agents
+            if (isSupabaseConfigured && recommendations.length > 0) {
+              const ids = recommendations.map((r) => r.agentId);
+              const { data: imgData } = await supabaseAdmin
+                .from("heights_cloud_agents")
+                .select("id, image_url")
+                .in("id", ids);
+              if (imgData) {
+                const imgMap = new Map(imgData.map((r) => [String(r.id), r.image_url ? String(r.image_url) : null]));
+                for (const rec of recommendations) {
+                  rec.image_url = imgMap.get(rec.agentId) ?? null;
+                }
+              }
+            }
+
+            ws.send(JSON.stringify({ type: "agent_recommendations", recommendations } satisfies ServerMsg));
+          } catch (err) {
+            console.warn("[onboarding] LLM call failed:", err);
+            ws.send(JSON.stringify({ type: "agent_recommendations", recommendations: [] } satisfies ServerMsg));
+          }
+          break;
+        }
+        case "achievement_update": {
+          if (!isSupabaseConfigured) break;
+          try {
+            await supabaseAdmin
+              .from("heights_cloud_achievements")
+              .upsert({
+                user_id: sess.user.id,
+                unlocked: msg.unlocked,
+                stats: msg.stats,
+                sets: msg.sets,
+                updated_at: new Date().toISOString(),
+              }, { onConflict: "user_id" });
+            ws.send(JSON.stringify({ type: "achievements_saved" } satisfies ServerMsg));
+
+            // Wire warrior aspiration signals from stats
+            const stats = msg.stats as Record<string, number> | null;
+            if (stats) {
+              if (stats.creaturesKilled && stats.creaturesKilled > 0) void recordSignalByKey(sess.user.id, "creature_killed");
+              if (stats.bossRating && stats.bossRating > 0) void recordSignalByKey(sess.user.id, "boss_slain");
+              if (stats.speedrunTimeMs && stats.speedrunTimeMs > 0) void recordSignalByKey(sess.user.id, "speedrun_recorded");
+              if (stats.maxDepth && stats.maxDepth > 0) void recordSignalByKey(sess.user.id, "world_explored");
+            }
+            // Wire weapon_collected and crown_placed from sets/unlocked
+            const sets = msg.sets as Record<string, string[]> | null;
+            if (sets?.weapons && sets.weapons.length > 0) void recordSignalByKey(sess.user.id, "weapon_collected");
+            if (msg.unlocked.includes("from_cubicle_to_conqueror")) void recordSignalByKey(sess.user.id, "crown_placed");
+            // Award XP for each new achievement
+            const newCount = msg.unlocked.length;
+            if (newCount > 0) {
+              const xpResult = addXp(sess.user.id, 100 * newCount);
+              if (xpResult.leveledUp) {
+                const progress = getProgress(sess.user.id);
+                ws.send(JSON.stringify({ type: "office_progress", progress } satisfies ServerMsg));
+                ws.send(JSON.stringify({ type: "toast", text: `Office reached Level ${progress.level}!` } satisfies ServerMsg));
+              }
+            }
+          } catch (err) {
+            console.error("[achievements] failed to save to DB:", err);
+          }
+          break;
+        }
+        case "set_stated_intent": {
+          const intent = String(msg.intent).trim().slice(0, 500);
+          if (!intent) break;
+          void ProfileManager.setStatedIntent(sess.user.id, intent).catch((err: unknown) =>
+            console.warn("[profile] setStatedIntent error:", err),
+          );
+          break;
+        }
+        case "get_leaderboard": {
+          void (async () => {
+            const entries = await getLeaderboard(msg.category, msg.period);
+            ws.send(JSON.stringify({
+              type: "leaderboard",
+              entries,
+              period: msg.period,
+              category: msg.category,
+            } satisfies ServerMsg));
+          })().catch((err) => console.warn("[leaderboard] error:", err));
+          break;
+        }
+        case "get_trophy_profile": {
+          void (async () => {
+            const profile = await getTrophyProfile(msg.username);
+            ws.send(JSON.stringify({
+              type: "trophy_profile",
+              profile,
+            } satisfies ServerMsg));
+            // Trophy room viewed — Creator signal (user is looking at achievements)
+            void recordSignalByKey(sess.user.id, "trophy_room_shared");
+          })().catch((err) => console.warn("[trophy] error:", err));
+          break;
+        }
+        case "dismiss_concierge": {
+          dismissNudge(sess.user.id, msg.nudgeId);
+          break;
+        }
+        case "seed_aspirations": {
+          void seedAspirations(sess.user.id, msg.aspirations).catch(() => {});
+          break;
+        }
+        case "request_aspiration_dashboard": {
+          const profile = getCachedProfile(sess.user.id);
+          if (!profile) {
+            ws.send(JSON.stringify({
+              type: "aspiration_dashboard",
+              scores: {},
+              dominant: null,
+              signalCount: 0,
+              history: [],
+              unlocks: [],
+            } satisfies ServerMsg));
+            break;
+          }
+          const history = getSignalHistory(sess.user.id);
+          const unlocks = Object.entries(UNLOCK_THRESHOLDS_EXPORT).map(([key, config]) => ({
+            key,
+            track: config.track,
+            threshold: config.threshold,
+            label: config.label,
+            icon: config.icon,
+            unlocked: profile[config.track] >= config.threshold,
+            currentScore: profile[config.track],
+          }));
+          ws.send(JSON.stringify({
+            type: "aspiration_dashboard",
+            scores: {
+              warrior: profile.warrior,
+              builder: profile.builder,
+              explorer: profile.explorer,
+              puzzle_solver: profile.puzzle_solver,
+              creator: profile.creator,
+              strategist: profile.strategist,
+            },
+            dominant: profile.dominant,
+            signalCount: profile.signalCount,
+            history: history.map((h) => ({
+              key: h.key,
+              aspiration: h.aspiration,
+              weight: h.weight,
+              timestamp: h.timestamp,
+            })),
+            unlocks,
+          } satisfies ServerMsg));
+          break;
+        }
+        case "request_fulfillment": {
+          const snap = activeManager.snapshot();
+          const schedules = activeManager.snapshotSchedules();
+          const totalTasksDone = snap.agents.reduce((sum, a) => sum + (a.tasksDone ?? 0), 0);
+          const stats = computeFulfillment(sess.user.id, snap.agents, schedules, totalTasksDone);
+          ws.send(JSON.stringify({ type: "fulfillment_stats", stats } satisfies ServerMsg));
+          break;
+        }
+        case "friend_request": {
+          const result = await sendFriendRequest(sess.user.id, msg.email);
+          sess.broadcast({ type: "toast", text: result.message });
+          if (result.ok) {
+            const onlineIds = tenants.getOnlineUserIds();
+            const roomInfo = tenants.getOnlineUserInfo();
+            const { friends, pending } = await getFriendsList(sess.user.id, onlineIds, roomInfo);
+            sess.broadcast({ type: "friends_list", friends, pending });
+            // Send email notification to the target user
+            const fromName = tenants.getPlayerName(sess.user.id);
+            void tenants.sendFriendRequestEmail(msg.email, fromName);
+          }
+          break;
+        }
+        case "friend_accept": {
+          const result = await acceptFriendRequest(sess.user.id, msg.userId);
+          sess.broadcast({ type: "toast", text: result.message });
+          if (result.ok) {
+            const onlineIds = tenants.getOnlineUserIds();
+            const roomInfo = tenants.getOnlineUserInfo();
+            const { friends, pending } = await getFriendsList(sess.user.id, onlineIds, roomInfo);
+            sess.broadcast({ type: "friends_list", friends, pending });
+            const friendName = tenants.getPlayerName(sess.user.id);
+            const friendBroadcast = tenants.getSessionBroadcast(msg.userId);
+            if (friendBroadcast) {
+              friendBroadcast({ type: "friend_accepted", byUserId: sess.user.id, byName: friendName });
+              const { friends: fFriends, pending: fPending } = await getFriendsList(msg.userId, onlineIds, roomInfo);
+              friendBroadcast({ type: "friends_list", friends: fFriends, pending: fPending });
+            }
+          }
+          break;
+        }
+        case "friend_decline": {
+          const result = await declineFriendRequest(sess.user.id, msg.userId);
+          sess.broadcast({ type: "toast", text: result.message });
+          if (result.ok) {
+            const onlineIds = tenants.getOnlineUserIds();
+            const roomInfo = tenants.getOnlineUserInfo();
+            const { friends, pending } = await getFriendsList(sess.user.id, onlineIds, roomInfo);
+            sess.broadcast({ type: "friends_list", friends, pending });
+          }
+          break;
+        }
+        case "friend_remove": {
+          const result = await removeFriend(sess.user.id, msg.userId);
+          sess.broadcast({ type: "toast", text: result.message });
+          const onlineIds = tenants.getOnlineUserIds();
+          const roomInfo = tenants.getOnlineUserInfo();
+          const { friends, pending } = await getFriendsList(sess.user.id, onlineIds, roomInfo);
+          sess.broadcast({ type: "friends_list", friends, pending });
+          break;
+        }
+        case "list_friends": {
+          const onlineIds = tenants.getOnlineUserIds();
+          const roomInfo = tenants.getOnlineUserInfo();
+          const { friends, pending } = await getFriendsList(sess.user.id, onlineIds, roomInfo);
+          sess.broadcast({ type: "friends_list", friends, pending });
+          break;
+        }
+        case "list_online_players": {
+          const players = tenants.getOnlineUsers();
+          sess.broadcast({ type: "online_players", players });
+          break;
+        }
+        case "invite_friend": {
+          if (!sess.privateOfficeId) {
+            sess.broadcast({ type: "toast", text: "No office found to invite to." });
+            break;
+          }
+          const result = await createInvite(sess.user.id, sess.user.email ?? "", msg.email, sess.privateOfficeId);
+          sess.broadcast({ type: "toast", text: result.message });
+          if (result.ok) {
+            const invites = await getPendingInvites(sess.user.id);
+            sess.broadcast({ type: "office_invites", invites: invites.map(mapInviteEntry) });
+          }
+          break;
+        }
+        case "claim_invite": {
+          const result = await claimInvite(sess.user.id, sess.user.email ?? "", msg.token);
+          if (!result.ok) {
+            console.log(`[office-invites] claim failed for ${sess.user.id}: ${result.message}`);
+            break;
+          }
+          // Auto-friend: add both directions as accepted
+          if (result.inviterId) {
+            const now = new Date().toISOString();
+            await supabaseAdmin.from("heights_cloud_friends").upsert({
+              user_id: sess.user.id, friend_id: result.inviterId, status: "accepted", accepted_at: now,
+            }, { onConflict: "user_id,friend_id" });
+            await supabaseAdmin.from("heights_cloud_friends").upsert({
+              user_id: result.inviterId, friend_id: sess.user.id, status: "accepted", accepted_at: now,
+            }, { onConflict: "user_id,friend_id" });
+            invalidateFriendsListCache(sess.user.id, result.inviterId);
+          }
+          // Auto-invite to the inviter's room with talk access
+          if (result.inviterId && result.roomId) {
+            tenants.inviteUser(result.roomId, sess.user.id, "talk");
+            // Notify inviter if online
+            const inviterSess = tenants.get(result.inviterId);
+            if (inviterSess) {
+              const inviteeName = tenants.getPlayerName(sess.user.id);
+              inviterSess.broadcast({ type: "invite_friend_joined", inviteeEmail: sess.user.email ?? "", inviteeName });
+              inviterSess.broadcast({ type: "toast", text: `${inviteeName} just accepted your invite and is ready to visit!` });
+            }
+          }
+          // Tell the invitee which room to join
+          if (result.inviterId && result.roomId) {
+            const inviterName = tenants.getPlayerName(result.inviterId);
+            sess.broadcast({ type: "invite_claimed", inviterId: result.inviterId, inviterName, roomId: result.roomId });
+          }
+          break;
+        }
+        case "list_pending_invites": {
+          const invites = await getPendingInvites(sess.user.id);
+          sess.broadcast({ type: "office_invites", invites: invites.map(mapInviteEntry) });
+          break;
+        }
+        case "revoke_invite": {
+          const result = await revokeInvite(sess.user.id, msg.inviteId);
+          sess.broadcast({ type: "toast", text: result.message });
+          if (result.ok) {
+            const invites = await getPendingInvites(sess.user.id);
+            sess.broadcast({ type: "office_invites", invites: invites.map(mapInviteEntry) });
+          }
+          break;
+        }
+        case "external_connect": {
+          const result = await ideBridge.handleConnect(
+            { tool: msg.tool, sessionId: msg.sessionId, token: msg.token, currentFile: msg.currentFile, language: msg.language, gitBranch: msg.gitBranch },
+            (uid) => tenants.getSessionBroadcast(uid),
+          );
+          if (!result.ok) {
+            ws.send(JSON.stringify({ type: "toast", text: `IDE Bridge: ${result.error}` } satisfies ServerMsg));
+          }
+          break;
+        }
+        case "external_activity": {
+          ideBridge.handleActivity(
+            { sessionId: msg.sessionId, state: msg.state, currentFile: msg.currentFile, language: msg.language, gitBranch: msg.gitBranch, filesChanged: msg.filesChanged, linesAdded: msg.linesAdded, linesRemoved: msg.linesRemoved, events: msg.events },
+            sess.user.id,
+            (uid) => tenants.getSessionBroadcast(uid),
+          );
+          break;
+        }
+        case "external_disconnect": {
+          ideBridge.handleDisconnect(
+            { sessionId: msg.sessionId },
+            sess.user.id,
+            (uid) => tenants.getSessionBroadcast(uid),
+          );
+          break;
+        }
+        case "set_ide_bridge_privacy": {
+          ideBridge.setVisibility(sess.user.id, msg.visibility);
+          sess.broadcast({ type: "ide_bridge_privacy", visibility: msg.visibility });
+          sess.broadcast({ type: "toast", text: `IDE Bridge visibility set to: ${msg.visibility}` });
+          break;
+        }
+        case "request_velocity_report": {
+          const days = msg.days ?? 14;
+          void getVelocityTrends(sess.user.id, days).then((trends) => {
+            sess.broadcast({ type: "velocity_report", trends });
+          });
+          break;
+        }
+        case "request_standup": {
+          const orgs = tenants.getOrgsForUser(sess.user.id);
+          const memberIds = new Set<string>();
+          for (const org of orgs) {
+            for (const m of tenants.getOrgMembers(org.id)) {
+              if (!m.userId.startsWith("pending:")) memberIds.add(m.userId);
+            }
+          }
+          const memberNames = new Map<string, string>();
+          for (const memberId of memberIds) {
+            memberNames.set(memberId, tenants.getPlayerName(memberId));
+          }
+          void getStandupSummary(sess.user.id, [...memberIds], memberNames).then((summary) => {
+            sess.broadcast({ type: "standup_summary", summary });
+          });
+          break;
+        }
+        case "request_anomalies": {
+          const orgs = tenants.getOrgsForUser(sess.user.id);
+          const memberIds = new Set<string>();
+          for (const org of orgs) {
+            for (const m of tenants.getOrgMembers(org.id)) {
+              if (!m.userId.startsWith("pending:")) memberIds.add(m.userId);
+            }
+          }
+          const memberNames = new Map<string, string>();
+          for (const memberId of memberIds) {
+            memberNames.set(memberId, tenants.getPlayerName(memberId));
+          }
+          void detectAnomalies(sess.user.id, [...memberIds], memberNames).then((alerts) => {
+            sess.broadcast({ type: "anomaly_alerts", alerts });
+          });
+          break;
+        }
+      }
+    } catch (err) {
+      console.error("[server] error handling message:", err);
+      const data = JSON.stringify({ type: "toast", text: "Server error — check the server logs." });
+      if (ws.readyState === WebSocket.OPEN) ws.send(data);
+    }
+  });
+
+  ws.on("close", () => {
+    sess.clients.delete(ws);
+    if (refreshTimer) clearTimeout(refreshTimer);
+    if (expiryTimer) clearTimeout(expiryTimer);
+    // Clean up agent log subscriptions
+    if (sess.agentLogSubscriptions) {
+      for (const unsub of sess.agentLogSubscriptions.values()) unsub();
+      sess.agentLogSubscriptions.clear();
+    }
+    // Clean up voice state when the last client disconnects
+    if (sess.clients.size === 0 && (sess.voiceActive || sess.voiceListening)) {
+      sess.voiceActive = false;
+      sess.voiceListening = false;
+      if (sess.roomId) {
+        const room = tenants.getRoom(sess.roomId);
+        if (room) {
+          for (const [pid] of room.players) {
+            if (pid === sess.user.id) continue;
+            const peerSess = tenants.get(pid);
+            if (peerSess && (peerSess.voiceActive || peerSess.voiceListening)) {
+              peerSess.broadcast({ type: "voice_peer_left", userId: sess.user.id });
+            }
+          }
+        }
+      }
+    }
+    // Clean up presenter state when the last client disconnects
+    if (sess.clients.size === 0 && (sess.screenShareActive || sess.webcamActive)) {
+      const wasPresenting = sess.screenShareActive || sess.webcamActive;
+      sess.screenShareActive = false;
+      sess.webcamActive = false;
+      if (sess.roomId && wasPresenting) {
+        tenants.removeAllPresenters(sess.roomId, sess.user.id);
+        broadcastPresenters(sess.roomId);
+      }
+    }
+    tenants.handleClientDisconnect(sess.user.id);
+
+    // Clean up IDE bridge sessions when the last client disconnects
+    if (sess.clients.size === 0) {
+      ideBridge.cleanupUser(sess.user.id);
+    }
+
+    // Persist activity timestamps for retention system
+    const activity = sess.manager.getActivityStatus();
+    void persistUserActivity(sess.user.id, activity.lastActiveAt, activity.lastPlatformEngagementAt).catch((err: unknown) =>
+      console.warn(`[retention] failed to persist activity for ${sess.user.id}:`, err),
+    );
+  });
+  ws.on("error", () => {
+    sess.clients.delete(ws);
+    if (refreshTimer) clearTimeout(refreshTimer);
+    if (expiryTimer) clearTimeout(expiryTimer);
+    tenants.handleClientDisconnect(sess.user.id);
+  });
+});
+
+// ── start ─────────────────────────────────────────────────────────────────
+
+// Production safety: refuse to start without auth in production
+if (process.env.NODE_ENV === "production" && !isSupabaseConfigured) {
+  console.error("[agent-heights] FATAL: NODE_ENV=production but SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are not set.");
+  console.error("[agent-heights] Refusing to start in dev mode in production. Set the required env vars and restart.");
+  process.exit(1);
+}
+
+const logMaintenanceInterval = startLogMaintenance();
+
+// Periodically clean up idle agent browser contexts (every 5 minutes)
+const browserCleanupInterval = setInterval(() => { void cleanupIdleBrowsers(); }, 5 * 60 * 1000);
+
+// Periodically process expired account deletion requests (every 1 hour)
+const deletionCleanupInterval = setInterval(() => { void processExpiredDeletions(); }, 60 * 60 * 1000);
+// Also run once on startup
+void processExpiredDeletions();
+
+// Velocity tracking: snapshot IDE bridge sessions to DB every 5 minutes
+const velocitySnapshotInterval = setInterval(() => {
+  const snapshots = ideBridge.getSnapshotsForVelocity();
+  if (snapshots.length > 0) void snapshotVelocity(snapshots);
+}, 5 * 60 * 1000);
+
+// Daily standup generation: run at 9am server time, check every hour
+const standupInterval = setInterval(() => {
+  const now = new Date();
+  if (now.getHours() !== 9) return;
+  // Generate standups for all orgs with active sessions
+  for (const userId of tenants.getOnlineUserIds()) {
+    const orgs = tenants.getOrgsForUser(userId);
+    if (orgs.length === 0) continue;
+    const memberIds = new Set<string>();
+    for (const org of orgs) {
+      for (const m of tenants.getOrgMembers(org.id)) {
+        if (!m.userId.startsWith("pending:")) memberIds.add(m.userId);
+      }
+    }
+    if (memberIds.size === 0) continue;
+    const memberNames = new Map<string, string>();
+    for (const memberId of memberIds) {
+      memberNames.set(memberId, tenants.getPlayerName(memberId));
+    }
+    void (async () => {
+      try {
+        const summary = await getStandupSummary(userId, [...memberIds], memberNames);
+        if (summary.entries.length === 0) return;
+        const text = formatStandupText(summary);
+        const broadcast = tenants.getSessionBroadcast(userId);
+        if (broadcast) {
+          broadcast({ type: "standup_summary", summary });
+          broadcast({ type: "toast", text: "📋 Daily standup generated — check the IDE Bridge panel." });
+        }
+        // Post standup in office chat via Office Manager
+        const sess = tenants.get(userId);
+        if (sess?.manager) {
+          sess.manager.chat(OFFICE_MANAGER_ID, `Generate a daily standup summary based on this data and post it conversationally:\n\n${text}`);
+        }
+      } catch (err) {
+        console.error("[velocity] standup generation failed:", err);
+      }
+    })();
+  }
+}, 60 * 60 * 1000);
+
+server.listen(SERVER_PORT, () => {
+  console.log(`[agent-heights] server listening on :${SERVER_PORT} (HTTP + WebSocket)`);
+  if (isSupabaseConfigured) {
+    console.log(`[agent-heights] Supabase auth enabled`);
+  } else {
+    console.log(`[agent-heights] Supabase not configured — running in dev mode (no auth)`);
+    console.log(`[agent-heights]   Set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY to enable auth`);
+  }
+  console.log(`[agent-heights] game data in ${join(rootDir, "ag")} (users/<id>/, logs/, workspace/)`);
+  if (isRedisConfigured) {
+    console.log(`[agent-heights] Redis enabled — pub/sub + presence (server ${serverId})`);
+  } else {
+    console.log(`[agent-heights] Redis not configured — single-server mode`);
+    console.log(`[agent-heights]   Set REDIS_URL to enable pub/sub + presence`);
+  }
+  console.log(`[agent-heights] global multiplayer room: ${HQ2_ROOM_ID}`);
+
+  // Start Circle Gateway balance monitor if configured
+  if (isCircleGatewayConfigured()) {
+    startCircleBalanceMonitor();
+    console.log(`[agent-heights] Circle Gateway premium payments enabled`);
+    void ensureGatewayBalance().catch(err => console.error(`[agent-heights] Gateway auto-deposit failed:`, err));
+  }
+
+  // Restore organizations from DB before user sessions so memberships are
+  // available when processOrgMemberships runs.
+  void tenants.restoreOrgsAtBoot();
+
+  // Restore user sessions at boot so agents resume immediately after a
+  // server restart, without waiting for each user to reconnect.
+  void tenants.restoreSessionsAtBoot();
+
+  // Presence: Supabase Realtime subscription on heights_cloud_friends.
+  // When friend relationships change, immediately invalidate cache and push
+  // updated friends_list to affected online users. A 5-minute fallback
+  // interval handles online/room status refresh using cached friend data
+  // (no DB queries).
+  function pushFriendsListToUser(userId: string): void {
+    const sess = tenants.get(userId);
+    if (!sess || sess.clients.size === 0) return;
+    const onlineIds = tenants.getOnlineUserIds();
+    const roomInfo = tenants.getOnlineUserInfo();
+    void getFriendsList(userId, onlineIds, roomInfo).then(({ friends, pending }) => {
+      sess.broadcast({ type: "friends_list", friends, pending });
+    });
+  }
+
+  // Realtime: listen for changes on heights_cloud_friends
+  if (isSupabaseConfigured) {
+    supabaseAdmin
+      .channel("friends-presence")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "heights_cloud_friends" },
+        (payload: any) => {
+          const row = payload.new ?? payload.old;
+          if (!row) return;
+          const userId = row.user_id as string;
+          const friendId = row.friend_id as string;
+          // Invalidate cache for both parties
+          invalidateFriendsListCache(userId, friendId);
+          // Push updated lists to both users if online
+          pushFriendsListToUser(userId);
+          pushFriendsListToUser(friendId);
+        },
+      )
+      .subscribe((status: string) => {
+        if (status === "SUBSCRIBED") {
+          console.log("[agent-heights] Realtime subscription on heights_cloud_friends active");
+        } else if (status === "CHANNEL_ERROR") {
+          console.error("[agent-heights] Realtime subscription error — falling back to polling");
+        }
+      });
+  }
+
+  // Fallback: every 5 minutes, push updated friends_list to all online users.
+  // Uses cached friend data (no DB queries) — only refreshes online/room status.
+  setInterval(() => {
+    const onlineIds = tenants.getOnlineUserIds();
+    if (onlineIds.size <= 1) return;
+    const roomInfo = tenants.getOnlineUserInfo();
+    for (const sess of tenants.values()) {
+      if (sess.clients.size === 0) continue;
+      if (sess.user.id === "dev") continue;
+      void getFriendsList(sess.user.id, onlineIds, roomInfo).then(({ friends, pending }) => {
+        sess.broadcast({ type: "friends_list", friends, pending });
+      });
+    }
+  }, 5 * 60_000).unref?.();
+
+  // Start agent-originated retention email loop (runs hourly)
+  startRetentionLoop((): RetentionManagerEntry[] => {
+    return Array.from(tenants.values()).map((sess) => ({
+      manager: sess.manager,
+      userId: sess.user.id,
+    }));
+  });
+  console.log(`[agent-heights] retention email loop started`);
+});
+
+async function shutdown(): Promise<void> {
+  console.log("[agent-heights] graceful shutdown initiated — notifying clients & saving agent tasks");
+
+  // 0. Kill Hermes gateway IMMEDIATELY with SIGKILL — before any async work.
+  // Railway sends SIGTERM to the process group, and Hermes catches it to send
+  // "Gateway shutting down" notifications to Telegram users. By killing it
+  // instantly first, we prevent the notification.
+  try {
+    const hermesProc = HermesProcessManager.getInstance();
+    hermesProc.stop();
+  } catch { /* best effort */ }
+
+  // 1. Broadcast "server_restarting" to all connected clients so they show
+  //    a friendly overlay instead of a scary disconnect.
+  for (const sess of tenants.values()) {
+    sess.broadcast({ type: "server_restarting", estimatedSeconds: 5 });
+  }
+
+  // 2. Prepare each agent manager for shutdown — saves active + queued tasks
+  //    so agents can resume exactly where they left off after restart.
+  const shutdownPrep: Promise<void>[] = [];
+  for (const sess of tenants.values()) {
+    shutdownPrep.push(sess.manager.prepareForShutdown());
+  }
+  await Promise.all(shutdownPrep);
+
+  // 3. Flush buffered usage records and aspiration profiles to DB so no data is lost
+  await Promise.all([
+    flushUsageBuffer().catch(() => {}),
+    flushProfileBuffer().catch(() => {}),
+  ]);
+
+  // 4. Flush all saves to disk/DB (pending tasks are included) — do this
+  //    BEFORE browser cleanup so critical task data is persisted even if
+  //    destroyAllBrowsers() is slow and Railway's grace period expires.
+  const flushes: Promise<void>[] = [];
+  for (const sess of tenants.values()) {
+    const f = sess.save.flushNow();
+    if (f && typeof (f as any).then === "function") flushes.push((f as Promise<void>).catch(() => {}));
+  }
+  await Promise.all(flushes);
+
+  // 4. Stop background services and clean up browsers
+  stopRailwayMCP();
+  stopRedis();
+  clearInterval(logMaintenanceInterval);
+  clearInterval(browserCleanupInterval);
+  clearInterval(deletionCleanupInterval);
+  screenshots.destroy();
+  await destroyAllBrowsers();
+
+  console.log("[agent-heights] graceful shutdown complete — exiting");
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

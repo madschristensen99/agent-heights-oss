@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-dashboard/
+
+# Environment variables
+.env
+.env.local
+.scratch
+node_modules
+.env.*.local
+
+# Runtime state (game saves, logs, agent workspaces)
+ag/
+workspace/
+logs/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Capacitor / iOS
+ios/
+android/
+*.xcworkspace
+*.xcodeproj
+DerivedData/
+

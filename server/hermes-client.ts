@@ -1,0 +1,722 @@
+/**
+ * Hermes Agent Gateway Client
+ *
+ * Connects to a running `hermes serve` instance (default port 9119) via its REST API.
+ * Uses fs.watch on gateway_state.json for real-time platform state updates and
+ * a fast poll loop (5s) for new session/message detection.
+ *
+ * The Hermes Agent is a real AI agent by Nous Research that has a messaging gateway
+ * supporting Telegram, Discord, Slack, WhatsApp, Signal, Email, and more.
+ * See: https://github.com/nousresearch/hermes-agent
+ */
+
+import type { PlatformConnectionState, PlatformEvent } from "../shared/types.js";
+import { getPlatformEntry } from "../shared/types.js";
+import { existsSync, readFileSync, watch } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
+const HERMES_BASE_URL = process.env.HERMES_BASE_URL ?? "http://127.0.0.1:9119";
+const SESSION_POLL_MS = 5_000; // 5 seconds — fast session polling for new messages
+const STATE_POLL_FALLBACK_MS = 30_000; // 30 seconds — fallback if fs.watch fails
+
+/**
+ * Mapping from our platform credential field keys to Hermes env var names.
+ * Hermes stores credentials in ~/.hermes/.env and reads them at gateway startup.
+ *
+ * Shared across hermes-process.ts (env file sync) and manager.ts (credential
+ * configuration) so there is one authoritative source for the mapping.
+ */
+export const PLATFORM_ENV_VAR_MAP: Record<string, Record<string, string>> = {
+  telegram: { bot_token: "TELEGRAM_BOT_TOKEN" },
+  discord: { bot_token: "DISCORD_BOT_TOKEN" },
+  slack: { bot_token: "SLACK_BOT_TOKEN", signing_secret: "SLACK_APP_TOKEN", allowed_users: "SLACK_ALLOWED_USERS" }, // signing_secret field actually receives the app-level token (xapp-)
+  whatsapp: { account_sid: "TWILIO_ACCOUNT_SID", auth_token: "TWILIO_AUTH_TOKEN", phone_number: "TWILIO_PHONE_NUMBER" },
+  signal: { phone_number: "SIGNAL_ACCOUNT" },
+  email: {
+    imap_host: "EMAIL_IMAP_HOST", imap_port: "EMAIL_IMAP_PORT",
+    smtp_host: "EMAIL_SMTP_HOST", smtp_port: "EMAIL_SMTP_PORT",
+    email: "EMAIL_ADDRESS", password: "EMAIL_PASSWORD",
+  },
+  sms: { account_sid: "TWILIO_ACCOUNT_SID", auth_token: "TWILIO_AUTH_TOKEN", phone_number: "TWILIO_PHONE_NUMBER" },
+  "microsoft teams": { app_id: "TEAMS_APP_ID", tenant_id: "TEAMS_TENANT_ID", bot_password: "TEAMS_BOT_PASSWORD" },
+  "google chat": { project_id: "GOOGLE_CHAT_PROJECT_ID", service_account: "GOOGLE_CHAT_SERVICE_ACCOUNT_JSON" },
+  matrix: { homeserver_url: "MATRIX_HOMESERVER", access_token: "MATRIX_ACCESS_TOKEN", user_id: "MATRIX_USER_ID" },
+  mattermost: { server_url: "MATTERMOST_URL", bot_token: "MATTERMOST_TOKEN" },
+  line: { channel_access_token: "LINE_CHANNEL_ACCESS_TOKEN", channel_secret: "LINE_CHANNEL_SECRET" },
+  irc: { server: "IRC_SERVER", port: "IRC_PORT", nickname: "IRC_NICKNAME", channels: "IRC_CHANNEL" },
+  bluebubbles: { server_url: "BLUEBUBBLES_SERVER_URL", password: "BLUEBUBBLES_PASSWORD" },
+  ntfy: { server_url: "NTFY_SERVER_URL", topic: "NTFY_TOPIC" },
+};
+
+/** Convert our platform name to the Hermes platform ID (lowercase). */
+function hermesPlatformId(platform: string): string {
+  return platform.toLowerCase().replace(/\s+/g, "_");
+}
+
+/** Map our credential keys to Hermes env var names for a given platform. */
+function credentialsToEnvVars(platform: string, credentials: Record<string, string>): Record<string, string> {
+  const map = PLATFORM_ENV_VAR_MAP[platform.toLowerCase()] ?? {};
+  const envVars: Record<string, string> = {};
+  for (const [key, value] of Object.entries(credentials)) {
+    const envName = map[key] ?? key.toUpperCase();
+    envVars[envName] = value;
+  }
+  return envVars;
+}
+
+export interface HermesStatus {
+  gateway_running: boolean;
+  platforms: Record<string, Record<string, any>>;
+}
+
+export class HermesClient {
+  private baseUrl: string;
+  private sessionToken: string | null;
+  private polling = false;
+  private sessionPollTimer: ReturnType<typeof setInterval> | null = null;
+  private statePollTimer: ReturnType<typeof setInterval> | null = null;
+  private stateWatcher: ReturnType<typeof watch> | null = null;
+  private stateWatchDebounce: ReturnType<typeof setTimeout> | null = null;
+  private lastSessionIds: Set<string> = new Set();
+  private static readonly MAX_SESSION_IDS = 200;
+  private onPlatformUpdate: ((states: PlatformConnectionState[]) => void) | null = null;
+  private onPlatformEvent: ((event: PlatformEvent) => void) | null = null;
+  mailboxPlatforms: (string | null)[] = [null, null, null, null, null, null];
+  private lastStatusJson: string | null = null;
+
+  /** Maps platform name (lowercase) → userId who configured it.
+   *  Used to route inbound events to the correct AgentManager. */
+  private platformOwners = new Map<string, string>();
+
+  private static _instance: HermesClient | null = null;
+
+  /** Get the singleton instance. Only one polling client should exist per process. */
+  static getInstance(baseUrl?: string, sessionToken?: string | null): HermesClient {
+    if (!HermesClient._instance) {
+      HermesClient._instance = new HermesClient(baseUrl, sessionToken);
+    }
+    return HermesClient._instance;
+  }
+
+  constructor(baseUrl?: string, sessionToken?: string | null) {
+    this.baseUrl = baseUrl ?? HERMES_BASE_URL;
+    this.sessionToken = sessionToken ?? null;
+  }
+
+  /** Auth headers for protected Hermes dashboard endpoints. */
+  private authHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.sessionToken) {
+      headers["X-Hermes-Session-Token"] = this.sessionToken;
+    }
+    return headers;
+  }
+
+  /** Register which user owns a platform's credentials.
+   *  Called when a user configures or auto-reconfigures a platform.
+   *  This ensures inbound messages are routed to the correct AgentManager. */
+  registerPlatformOwner(platform: string, userId: string): void {
+    this.platformOwners.set(platform.toLowerCase(), userId);
+    console.log(`[hermes-client] Platform ownership: ${platform} → user ${userId}`);
+  }
+
+  /** Get the userId who owns a platform, or null if unregistered. */
+  getPlatformOwner(platform: string): string | null {
+    return this.platformOwners.get(platform.toLowerCase()) ?? null;
+  }
+
+  /** Update which platforms to poll for connection status. */
+  setMailboxPlatforms(platforms: (string | null)[]): void {
+    this.mailboxPlatforms = platforms;
+  }
+
+  /** Start watching gateway_state.json + polling for new messages.
+   *  Platform states are pushed via fs.watch (real-time, no polling).
+   *  Sessions are polled at SESSION_POLL_MS (5s) since Hermes has no SSE endpoint.
+   *  Falls back to state polling if fs.watch fails (Docker inotify issues). */
+  start(
+    onPlatformUpdate: (states: PlatformConnectionState[]) => void,
+    onPlatformEvent: (event: PlatformEvent) => void,
+  ): void {
+    // Guard against multiple start() calls — only one polling loop should run
+    if (this.polling) {
+      console.log(`[hermes-client] Already polling — skipping duplicate start()`);
+      return;
+    }
+    this.onPlatformUpdate = onPlatformUpdate;
+    this.onPlatformEvent = onPlatformEvent;
+    this.polling = true;
+
+    // 1. Start fs.watch on gateway_state.json for real-time platform state updates
+    this.startStateWatcher();
+
+    // 2. Fast poll for new messages (Hermes has no SSE/streaming endpoint)
+    this.pollSessions();
+    this.sessionPollTimer = setInterval(() => this.pollSessions(), SESSION_POLL_MS);
+
+    // 3. Initial state fetch
+    this.pollStates();
+
+    console.log(`[hermes-client] Started: fs.watch on gateway_state.json + ${SESSION_POLL_MS / 1000}s session poll on ${this.baseUrl}`);
+  }
+
+  /** Watch gateway_state.json for real-time platform state changes. */
+  private startStateWatcher(): void {
+    try {
+      const hermesHome = process.env.HERMES_HOME ?? join(homedir(), ".hermes");
+      const statePath = join(hermesHome, "gateway_state.json");
+      if (!existsSync(statePath)) {
+        console.log(`[hermes-client] gateway_state.json not found at ${statePath} — falling back to state polling`);
+        this.startStatePollFallback();
+        return;
+      }
+      this.stateWatcher = watch(statePath, { persistent: false }, (eventType) => {
+        if (eventType !== "change") return;
+        if (!this.polling) return;
+        // Debounce: coalesce rapid writes into a single state fetch
+        if (this.stateWatchDebounce) clearTimeout(this.stateWatchDebounce);
+        this.stateWatchDebounce = setTimeout(() => {
+          this.stateWatchDebounce = null;
+          this.pollStates();
+        }, 500);
+      });
+      this.stateWatcher.on("error", (err) => {
+        console.warn(`[hermes-client] fs.watch error on gateway_state.json: ${err} — falling back to state polling`);
+        this.stateWatcher = null;
+        this.startStatePollFallback();
+      });
+      console.log(`[hermes-client] Watching ${statePath} for real-time platform state changes`);
+    } catch (err) {
+      console.warn(`[hermes-client] Failed to start fs.watch: ${err} — falling back to state polling`);
+      this.startStatePollFallback();
+    }
+  }
+
+  /** Fallback: poll platform states every 30s (used when fs.watch fails). */
+  private startStatePollFallback(): void {
+    if (this.statePollTimer) return; // already running
+    this.statePollTimer = setInterval(() => this.pollStates(), STATE_POLL_FALLBACK_MS);
+    console.log(`[hermes-client] State polling fallback started (${STATE_POLL_FALLBACK_MS / 1000}s interval)`);
+  }
+
+  stop(): void {
+    this.polling = false;
+    HermesClient._instance = null;
+    if (this.sessionPollTimer) {
+      clearInterval(this.sessionPollTimer);
+      this.sessionPollTimer = null;
+    }
+    if (this.statePollTimer) {
+      clearInterval(this.statePollTimer);
+      this.statePollTimer = null;
+    }
+    if (this.stateWatcher) {
+      this.stateWatcher.close();
+      this.stateWatcher = null;
+    }
+    if (this.stateWatchDebounce) {
+      clearTimeout(this.stateWatchDebounce);
+      this.stateWatchDebounce = null;
+    }
+  }
+
+  /** Check if the Hermes serve backend is reachable. */
+  async isReachable(): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/status`, {
+        signal: AbortSignal.timeout(3000),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Fetch the current gateway + platform status.
+   *  Hermes /api/status may report gateway_running=false in Docker (known bug #26181)
+   *  because PID/lock files aren't reliable in containers. We fall back to reading
+   *  gateway_state.json directly to check if the gateway is actually running. */
+  async getStatus(): Promise<HermesStatus | null> {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/status`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) {
+        console.warn(`[hermes-client] /api/status returned HTTP ${res.status}`);
+        return null;
+      }
+      const data = await res.json() as any;
+
+      // Hermes uses gateway_platforms (not platforms) and state field (not connected boolean)
+      let platforms = data.platforms ?? data.gateway_platforms ?? data.platform_states ?? {};
+      let gatewayRunning = data.gateway_running ?? data.gatewayRunning ?? false;
+
+      // Docker fallback: if /api/status says gateway not running, check gateway_state.json
+      if (!gatewayRunning) {
+        const stateFile = this.readGatewayStateFile();
+        if (stateFile?.gateway_state === "running") {
+          gatewayRunning = true;
+          console.log(`[hermes-client] /api/status said not running but gateway_state.json says running — using fallback`);
+        }
+      }
+
+      // Always merge platform states from gateway_state.json (more reliable than /api/status in Docker)
+      const stateFile = this.readGatewayStateFile();
+      if (stateFile?.platforms) {
+        platforms = { ...platforms, ...stateFile.platforms };
+      }
+
+      const statusJson = JSON.stringify({ gateway_running: gatewayRunning, platforms });
+      if (statusJson !== this.lastStatusJson) {
+        console.log(`[hermes-client] /api/status: gateway_running=${gatewayRunning}, platforms=${JSON.stringify(platforms)}`);
+        this.lastStatusJson = statusJson;
+      }
+      return { gateway_running: gatewayRunning, platforms };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Read ~/.hermes/gateway_state.json as a fallback for Docker PID/lock file bug. */
+  private readGatewayStateFile(): { gateway_state: string; platforms?: Record<string, any> } | null {
+    try {
+      const hermesHome = process.env.HERMES_HOME ?? join(homedir(), ".hermes");
+      const statePath = join(hermesHome, "gateway_state.json");
+      if (!existsSync(statePath)) return null;
+      const raw = readFileSync(statePath, "utf-8");
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Fetch recent sessions and detect new inbound messages. */
+  async getNewMessages(): Promise<PlatformEvent[]> {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/sessions?limit=20`, {
+        headers: this.authHeaders(),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) return [];
+      const raw = await res.json();
+      let sessions: any[];
+      if (Array.isArray(raw)) {
+        sessions = raw;
+      } else if (raw && typeof raw === "object") {
+        sessions = raw.sessions ?? raw.data ?? raw.items ?? raw.results ?? [];
+        if (!Array.isArray(sessions)) sessions = [];
+      } else {
+        sessions = [];
+      }
+      const events: PlatformEvent[] = [];
+      const newSids = sessions.filter(s => {
+        const sid = s.session_id ?? s.id;
+        return sid && !this.lastSessionIds.has(sid);
+      });
+      if (newSids.length > 0) {
+        console.log(`[hermes-client] getNewMessages: ${sessions.length} sessions, ${newSids.length} new — platforms: ${sessions.map(s => s.platform ?? s.source ?? "?").join(",")}`);
+      }
+
+      for (const sess of sessions) {
+        const sid = sess.session_id ?? sess.id;
+        if (!sid || this.lastSessionIds.has(sid)) continue;
+        this.lastSessionIds.add(sid);
+        // Evict oldest entries to prevent unbounded growth
+        if (this.lastSessionIds.size > HermesClient.MAX_SESSION_IDS) {
+          const oldest = this.lastSessionIds.values().next().value;
+          if (oldest) this.lastSessionIds.delete(oldest);
+        }
+
+        // Only process sessions from messaging platforms (not CLI)
+        const platform = sess.platform ?? sess.source;
+        if (!platform || platform === "cli" || platform === "local") {
+          console.log(`[hermes-client] Skipping session ${sid}: platform=${platform ?? "undefined"}`);
+          continue;
+        }
+        console.log(`[hermes-client] New platform session ${sid}: platform=${platform}, chatId=${sess.chat_id ?? sess.chatId ?? "none"}, sender=${sess.username ?? sess.user_name ?? "none"}, keys=${Object.keys(sess).join(",")}`);
+
+        // Capture chat_id for reply routing (Telegram needs numeric chat_id)
+        const chatId = sess.chat_id ?? sess.chatId ?? sess.channel_id ?? null;
+        const senderName = sess.username ?? sess.user_name ?? sess.sender ?? null;
+        // Use chat_id as the reply target if available, otherwise fall back to sender name
+        const replyTarget = chatId ?? senderName ?? "unknown";
+
+        // Fetch messages for this session
+        try {
+          const msgRes = await fetch(`${this.baseUrl}/api/sessions/${sid}/messages`, {
+            headers: this.authHeaders(),
+            signal: AbortSignal.timeout(5000),
+          });
+          if (!msgRes.ok) {
+            console.log(`[hermes-client] GET messages for ${sid} failed: HTTP ${msgRes.status}`);
+            continue;
+          }
+          const msgRaw = await msgRes.json();
+          let messages: any[];
+          if (Array.isArray(msgRaw)) {
+            messages = msgRaw;
+          } else if (msgRaw && typeof msgRaw === "object") {
+            messages = msgRaw.messages ?? msgRaw.data ?? msgRaw.items ?? msgRaw.results ?? [];
+            if (!Array.isArray(messages)) messages = [];
+          } else {
+            messages = [];
+          }
+          console.log(`[hermes-client] Session ${sid}: ${messages.length} messages, roles: ${messages.map(m => m.role).join(",")}`);
+          if (messages.length > 0) {
+            const sample = messages[0];
+            console.log(`[hermes-client] Sample message keys: ${Object.keys(sample).join(",")}, meta=${JSON.stringify(sample.metadata ?? sample.meta ?? sample.extra ?? "none").slice(0, 200)}`);
+          }
+          for (const msg of messages) {
+            if (msg.role === "user") {
+              const text = (msg.content ?? msg.text ?? "").slice(0, 500);
+              // Skip system notifications — these are Hermes internal alerts, not user messages
+              if (text.startsWith("⚠️") || text.includes("API Funding Alert") || text.startsWith("System ·")) {
+                continue;
+              }
+              const normalizedPlatform = this.normalizePlatform(platform);
+              const ownerUserId = this.getPlatformOwner(normalizedPlatform) ?? undefined;
+              events.push({
+                platform: normalizedPlatform,
+                direction: "inbound",
+                sender: replyTarget,
+                text,
+                timestamp: msg.timestamp ?? Date.now(),
+                chatId: chatId ?? undefined,
+                ownerUserId,
+              });
+            }
+          }
+        } catch { /* skip session on error */ }
+      }
+
+      return events;
+    } catch {
+      return [];
+    }
+  }
+
+  /** Fetch recent sessions (raw data) for proactive home channel capture. */
+  async getRecentSessions(): Promise<any[]> {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/sessions?limit=20`, {
+        headers: this.authHeaders(),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) return [];
+      const raw = await res.json();
+      if (Array.isArray(raw)) return raw;
+      if (raw && typeof raw === "object") {
+        const arr = raw.sessions ?? raw.data ?? raw.items ?? raw.results ?? [];
+        return Array.isArray(arr) ? arr : [];
+      }
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Send a message to a platform via `hermes send` CLI (no REST endpoint exists for this). */
+  async sendMessage(platform: string, target: string, text: string): Promise<boolean> {
+    try {
+      const { execFile } = await import("node:child_process");
+      const targetStr = target ? `${platform}:${target}` : platform;
+      return await new Promise((resolve) => {
+        execFile("hermes", ["send", "--to", targetStr, text], {
+          timeout: 15000,
+          env: { ...process.env },
+        }, (err) => {
+          if (err) {
+            console.warn(`[hermes-client] hermes send failed: ${err.message}`);
+            resolve(false);
+          } else {
+            resolve(true);
+          }
+        });
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  /** Send a photo to a Telegram chat via the Telegram Bot API directly. */
+  async sendTelegramPhoto(chatId: string, photoPath: string, caption?: string): Promise<boolean> {
+    try {
+      const { readFile } = await import("node:fs/promises");
+      const botToken = process.env.TELEGRAM_BOT_TOKEN;
+      if (!botToken) {
+        // Try reading from Hermes .env
+        const hermesHome = process.env.HERMES_HOME ?? join(homedir(), ".hermes");
+        const envPath = join(hermesHome, ".env");
+        if (existsSync(envPath)) {
+          const envContent = readFileSync(envPath, "utf-8");
+          const match = envContent.match(/^TELEGRAM_BOT_TOKEN=(.+)$/m);
+          if (match) {
+            (process.env.TELEGRAM_BOT_TOKEN as string) = match[1].trim();
+          }
+        }
+      }
+      const token = process.env.TELEGRAM_BOT_TOKEN;
+      if (!token) {
+        console.warn("[hermes-client] sendTelegramPhoto: no TELEGRAM_BOT_TOKEN found");
+        return false;
+      }
+
+      const formData = new FormData();
+      formData.append("chat_id", chatId);
+      const photoBuf = await readFile(photoPath);
+      formData.append("photo", new Blob([photoBuf]), photoPath.split("/").pop() ?? "office.png");
+      if (caption) formData.append("caption", caption);
+
+      const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
+        method: "POST",
+        body: formData,
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) {
+        const data = await res.text();
+        console.warn(`[hermes-client] Telegram sendPhoto failed: HTTP ${res.status} — ${data.slice(0, 200)}`);
+        return false;
+      }
+      console.log(`[hermes-client] Telegram photo sent to ${chatId}`);
+      return true;
+    } catch (err) {
+      console.warn(`[hermes-client] sendTelegramPhoto error: ${err}`);
+      return false;
+    }
+  }
+
+  /** Start the Hermes gateway (if not running). */
+  async startGateway(): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/gateway/start`, {
+        method: "POST",
+        headers: this.authHeaders(),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        console.warn(`[hermes-client] startGateway failed: HTTP ${res.status} — ${body.slice(0, 300)}`);
+      } else {
+        console.log(`[hermes-client] startGateway OK`);
+      }
+      return res.ok;
+    } catch (err) {
+      console.warn(`[hermes-client] startGateway error: ${err}`);
+      return false;
+    }
+  }
+
+  /** Restart the Hermes gateway via REST API.
+   *  This properly kills the old gateway process and starts a new one that
+   *  reads the updated config.yaml. Use this instead of startGateway() when
+   *  the gateway is already running but has stale config. */
+  async restartGateway(): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/gateway/restart`, {
+        method: "POST",
+        headers: this.authHeaders(),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        console.warn(`[hermes-client] restartGateway failed: HTTP ${res.status} — ${body.slice(0, 300)}`);
+      } else {
+        console.log(`[hermes-client] restartGateway OK`);
+      }
+      return res.ok;
+    } catch (err) {
+      console.warn(`[hermes-client] restartGateway error: ${err}`);
+      return false;
+    }
+  }
+
+  /** Set the LLM model provider via Hermes REST API.
+   *  This is the authoritative way to configure which model the gateway agent uses.
+   *  POST /api/model/set with {scope, provider, model}
+   *  Tries both scopes: "main" (serve process) and "auxiliary" (gateway process)
+   *  to cover stale per-session model config in the gateway. */
+  async configureModel(provider: string, model: string): Promise<boolean> {
+    const scopes = ["main", "auxiliary"];
+    let anyOk = false;
+    for (const scope of scopes) {
+      try {
+        const res = await fetch(`${this.baseUrl}/api/model/set`, {
+          method: "POST",
+          headers: this.authHeaders(),
+          body: JSON.stringify({ scope, provider, model }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (res.ok) {
+          console.log(`[hermes-client] Model set to ${provider}/${model} (scope=${scope})`);
+          anyOk = true;
+        } else {
+          const data = await res.json().catch(() => ({}));
+          console.warn(`[hermes-client] /api/model/set scope=${scope} returned HTTP ${res.status}: ${JSON.stringify(data)}`);
+        }
+      } catch (err) {
+        console.warn(`[hermes-client] Failed to set model (scope=${scope}): ${err}`);
+      }
+    }
+    return anyOk;
+  }
+
+  /** Get current model/config info from Hermes. */
+  async getModelInfo(): Promise<Record<string, unknown> | null> {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/model/info`, {
+        headers: this.authHeaders(),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (res.ok) return await res.json() as Record<string, unknown>;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Configure a platform's credentials via the Hermes dashboard API. */
+  async configurePlatform(platform: string, credentials: Record<string, string>): Promise<{ success: boolean; error?: string }> {
+    // Check reachability first so we can give a clear error instead of "fetch failed"
+    const reachable = await this.isReachable();
+    if (!reachable) {
+      return {
+        success: false,
+        error: `Hermes Agent gateway is not running at ${this.baseUrl}. It should auto-start with the server — check server logs for [hermes-process] errors.`,
+      };
+    }
+    const platformId = hermesPlatformId(platform);
+    const envVars = credentialsToEnvVars(platform, credentials);
+    console.log(`[hermes-client] configurePlatform: platform=${platform}, platformId=${platformId}, envKeys=${Object.keys(envVars).join(",")}`);
+    try {
+      // PUT /api/messaging/platforms/{id} — writes credentials to .env and enabled flag to config.yaml
+      const res = await fetch(`${this.baseUrl}/api/messaging/platforms/${encodeURIComponent(platformId)}`, {
+        method: "PUT",
+        headers: this.authHeaders(),
+        body: JSON.stringify({ enabled: true, env: envVars }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        console.warn(`[hermes-client] PUT /api/messaging/platforms/${platformId} returned HTTP ${res.status}: ${JSON.stringify(data)}`);
+        return { success: false, error: data.error ?? data.detail ?? data.message ?? `HTTP ${res.status}` };
+      }
+      console.log(`[hermes-client] PUT /api/messaging/platforms/${platformId} OK — credentials saved`);
+
+      // Check if the platform is already connected — if so, skip gateway restart
+      // to avoid sending "Gateway shutting down" notifications to Telegram users.
+      let platformAlreadyConnected = false;
+      try {
+        const statusRes = await fetch(`${this.baseUrl}/api/status`, {
+          headers: this.authHeaders(),
+          signal: AbortSignal.timeout(5000),
+        });
+        if (statusRes.ok) {
+          const statusData = await statusRes.json() as any;
+          const platState = statusData.gateway_platforms?.[platformId];
+          if (platState?.state === "connected") {
+            platformAlreadyConnected = true;
+          }
+        }
+      } catch { /* best effort */ }
+
+      if (platformAlreadyConnected) {
+        console.log(`[hermes-client] ${platform} already connected — skipping gateway restart (avoids shutdown notification)`);
+      } else {
+        // Try to start the gateway (works if it was stopped). If it's already
+        // running, start will fail — but we do NOT fall back to restart,
+        // because restart sends "Gateway shutting down" notifications.
+        let gatewayRes = await fetch(`${this.baseUrl}/api/gateway/start`, {
+          method: "POST",
+          headers: this.authHeaders(),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!gatewayRes.ok) {
+          console.log(`[hermes-client] Gateway start returned HTTP ${gatewayRes.status} — likely already running, not restarting (avoids notification)`);
+        } else {
+          console.log(`[hermes-client] Gateway start OK after platform config`);
+        }
+      }
+
+      // Wait 3s for gateway to connect to the platform, then dump status for debugging
+      setTimeout(async () => {
+        try {
+          const statusRes = await fetch(`${this.baseUrl}/api/status`, { signal: AbortSignal.timeout(5000) });
+          const statusData = await statusRes.json() as any;
+          console.log(`[hermes-client] Post-config /api/status: ${JSON.stringify(statusData).slice(0, 500)}`);
+        } catch (e) { console.warn(`[hermes-client] Post-config status fetch failed: ${e}`); }
+        const sf = this.readGatewayStateFile();
+        console.log(`[hermes-client] Post-config gateway_state.json: ${JSON.stringify(sf)}`);
+      }, 3000);
+
+      return { success: true };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to reach Hermes gateway";
+      if (msg.includes("fetch failed") || msg.includes("ECONNREFUSED") || msg.includes("connect")) {
+        return {
+          success: false,
+          error: `Hermes Agent gateway is not running at ${this.baseUrl}. It should auto-start with the server — check server logs for [hermes-process] errors.`,
+        };
+      }
+      return { success: false, error: msg };
+    }
+  }
+
+  /** Get platform connection states for the given mailbox platforms. */
+  async getPlatformStates(mailboxPlatforms: (string | null)[]): Promise<PlatformConnectionState[]> {
+    const platforms = mailboxPlatforms.filter((p): p is string => p !== null);
+    const status = await this.getStatus();
+    if (!status) {
+      // Hermes serve not running — all platforms disconnected
+      return platforms.map((p) => ({
+        platform: p,
+        connected: false,
+        status: "Hermes Agent not running",
+        gatewayRunning: false,
+      }));
+    }
+
+    return platforms.map((p) => {
+      const key = p.toLowerCase();
+      const platState = status.platforms[key] ?? status.platforms[p] ?? status.platforms[key.replace(/\s+/g, "_")] ?? {};
+      // Hermes uses "state" field (e.g. "connected", "disconnected") not "connected" boolean
+      const stateStr = platState.state ?? platState.status ?? "";
+      const connected = platState.connected ?? (stateStr === "connected");
+      if (p.toLowerCase() === "telegram") {
+        console.log(`[hermes-client] Telegram state lookup: key=${key}, platState=${JSON.stringify(platState)}, connected=${connected}, allPlatformKeys=${Object.keys(status.platforms).join(",")}`);
+      }
+      return {
+        platform: p,
+        connected,
+        status: stateStr || (connected ? "Connected" : "Not configured"),
+        gatewayRunning: status.gateway_running,
+      };
+    });
+  }
+
+  private normalizePlatform(raw: string): string {
+    const entry = getPlatformEntry(raw);
+    if (entry) return entry.name;
+    // Map common variants
+    const lower = raw.toLowerCase();
+    if (lower === "wa") return "WhatsApp";
+    if (lower === "mail") return "Email";
+    return raw.charAt(0).toUpperCase() + raw.slice(1);
+  }
+
+  /** Poll for new sessions/messages only. */
+  private async pollSessions(): Promise<void> {
+    if (!this.polling) return;
+    const newEvents = await this.getNewMessages();
+    for (const ev of newEvents) {
+      this.onPlatformEvent?.(ev);
+    }
+  }
+
+  /** Poll platform connection states and notify the listener. */
+  private async pollStates(): Promise<void> {
+    if (!this.polling || !this.onPlatformUpdate) return;
+    const states = await this.getPlatformStates(this.mailboxPlatforms);
+    this.onPlatformUpdate(states);
+  }
+}

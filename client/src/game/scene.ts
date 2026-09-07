@@ -1,0 +1,11528 @@
+import Phaser from "phaser";
+import type { Store, HelicopterDelivery } from "../store";
+import { AgentNPC, OfficeManagerNPC, HermesNPC, WizardNPC, feetOf, tileOf, TILE_PX, getThemeStatusColors, agentTextureKey, wizardAppearance, wizardTextureKey, createHintTag, type HintTag, type Dir } from "./agent";
+import { OFFICE_MANAGER_ID, HERMES_ID, WIZARD_ID, type CharAppearance, type AgentInfo, type AgentStatus, type LogEntry, type PlatformEvent, getPlatformEntry, type WorldTheme, DEFAULT_APPEARANCE, type Presenter, MAX_PRESENTERS, DECORATION_CATALOG } from "../../../shared/types";
+import { Grid, findPath, type Tile } from "./path";
+import { WorldLayer } from "./world";
+import { BloomPipeline, ColorGradePipeline, DOFPipeline } from "./shaders";
+import { generateAlleyTileset, generateAlleyWorldTiles } from "./alley-tiles";
+import { generateHawaiiTileset, generateHawaiiWorldTiles } from "./hawaii-tiles";
+import { generateSouthTileset, generateSouthWorldTiles } from "./south-tiles";
+import { generateAllTextures } from "./textures";
+import { BootScene } from "./boot";
+import { generateCharTexture, generateCharPreviewDataURL, CHAR_FRAMES_PER_ROW } from "./chargen";
+import { getServerByUrl } from "../../../shared/mcp-catalog";
+import { upgradeFurniture, CHAIR_TEX_DOWN, CHAIR_TEX_UP, CHAIR_TEX_LEFT, CHAIR_TEX_RIGHT, MONITOR_TEX, MONITOR_SIDE_TEX, resolveChairTex, clearThemeFurniture, clearThemeFurnitureTextures } from "./furniture";
+import { registerAlleyFurniture } from "./furniture-alley";
+import { registerHawaiiFurniture } from "./furniture-hawaii";
+import { registerOldSouthFurniture } from "./furniture-south";
+import { upgradeWorkshop } from "./workshop";
+import { MailboxConversation } from "./mailbox-conversation";
+import { AI_OFFICE_TEXTURES } from "./ai-tiles";
+import { achievements, ACHIEVEMENTS } from "./achievements";
+import { touchInput, isTouchDevice } from "../touch";
+import { md } from "../ui/md";
+import { getToken } from "../auth";
+import {
+  showPlatformConnectModal as wizardConnect,
+  showPlatformPickerModal as wizardPicker,
+  showMailboxActionModal as wizardAction,
+} from "../ui/platform-wizard";
+import { VoiceManager } from "../voice";
+import { ScreenShareManager } from "../screen-share";
+import { WebcamManager } from "../webcam";
+import { PresenterPanel } from "../ui/presenter-panel";
+import { ExpandedView, type PresenterTab } from "../ui/expanded-view";
+import * as loadingOverlay from "./loading-overlay";
+
+const PLAYER_SPEED = 340;
+/** Per-second acceleration rate for exponential smoothing.
+ *  Higher = snappier start/stop. 20 ≈ reaches 95% speed in ~150ms. */
+const ACCEL_RATE = 20;
+
+function hintLabel(text: string): string {
+  return isTouchDevice() ? text.replace(/^E:\s*/, "TAP ") : text;
+}
+
+interface PlatformMailbox {
+  platform: string | null;
+  color: number;
+  colorLight: number;
+  colorDark: number;
+  tile: Tile;
+  flagUp: boolean;
+  pendingCount: number;
+  lastMessage: string;
+  slotIndex: number;
+}
+
+/** Tile positions for the 6 mailbox slots along the north wall of the mail room. */
+const MAILBOX_TILES: Tile[] = [
+  { x: 2, y: 13 },
+  { x: 3, y: 13 },
+  { x: 5, y: 13 },
+  { x: 6, y: 13 },
+  { x: 8, y: 13 },
+  { x: 9, y: 13 },
+];
+
+/** Dark navy color for unassigned mailboxes. */
+const UNASSIGNED_COLOR = 0x1a2a4a;
+
+export class OfficeScene extends Phaser.Scene {
+  private store!: Store;
+  private grid!: Grid;
+  private npcs = new Map<string, AgentNPC>();
+  private officeManager: OfficeManagerNPC | null = null;
+  private hermes: HermesNPC | null = null;
+  private wizard: WizardNPC | null = null;
+  /** Active NPC speech bubble text objects, keyed by npcId. */
+  private npcSpeechBubbles = new Map<string, Phaser.GameObjects.Text>();
+  /** When each NPC's speech bubble should expire, keyed by npcId. */
+  private npcSpeechExpiry = new Map<string, number>();
+  /** Cooldown for proximity-triggered speech per NPC, keyed by npcId. */
+  private npcProximityCooldown = new Map<string, number>();
+  private decorationSprites: Phaser.GameObjects.Container[] = [];
+  private decorationMode = false;
+  private selectedDecorationType: string | null = null;
+  private decorationGhost: Phaser.GameObjects.Container | null = null;
+  private officeManagerSeat: Tile | null = null;
+  private officeManagerOfficeZone: Phaser.GameObjects.Zone | null = null;
+  private seats: Tile[] = [];
+  private extraSpots: Tile[] = [];
+  private monitors: Phaser.GameObjects.Sprite[] = [];
+  private chairs: Phaser.GameObjects.Sprite[] = [];
+  private officeManagerMonitor: Phaser.GameObjects.Sprite | null = null;
+  private hermesSeat: Tile | null = null;
+  private hermesMonitor: Phaser.GameObjects.Sprite | null = null;
+  private wizardSeat: Tile | null = null;
+  private spawnTile: Tile = { x: 14, y: 16 };
+  private doorTile: Tile = { x: 14, y: 17 };
+  private boardTile: Tile = { x: 14, y: 0 };
+  private boardHint!: HintTag;
+  private ganttTile: Tile = { x: 20, y: 0 };
+  private ganttHint!: HintTag;
+  private coffeeTile: Tile = { x: 26, y: 2 };
+  private coffeeUntil = 0;
+  private coffeeHint!: HintTag;
+
+  // --- projector screen (top-left wall) ---
+  private projectorTile: Tile = { x: 6, y: 0 };
+  private projectorHint!: HintTag;
+  private projectorGfx!: Phaser.GameObjects.Graphics;
+  private projectorIframe: HTMLIFrameElement | null = null;
+  private projectorVideoId: string | null = null;
+  private projectorEmbedUrl: string | null = null;
+  /** Separate iframe for agent HTML broadcasts (interactive, unlike YouTube iframe). */
+  private projectorHtmlIframe: HTMLIFrameElement | null = null;
+  /** Agent whose HTML file is currently broadcasting (null = none). */
+  private agentBroadcastHtmlAgentId: string | null = null;
+  private static readonly PROJECTOR_CHANNELS: { id: string; label: string; videoId?: string; embedUrl?: string }[] = [
+    { id: "brainrot", label: "BRAINROT", videoId: "vTfD20dbxho" },
+    { id: "chill",    label: "CHILL",    videoId: "hnsmzzQABBo" },
+    { id: "trading",  label: "TRADING",  embedUrl: "https://s.tradingview.com/widgetembed/?frameElementId=tv-projector&symbol=XMRUSD&interval=60&hidesidetoolbar=1&hidetoptoolbar=1&symboledit=0&saveimage=0&toolbarbg=f1f3f6&studies=[]&hideideas=1&theme=dark&style=1&timezone=Etc/UTC" },
+  ];
+
+  // --- new office interactables ---
+  private fridgeTile: Tile = { x: 24, y: 2 };
+  private coolerTile: Tile = { x: 22, y: 2 };
+  private clockTile: Tile = { x: 1, y: 3 };
+  private vendingTile: Tile | null = null;
+
+  // --- projector control panel + speaker (where clock used to be) ---
+  private projectorControlTile: Tile = { x: 6, y: 1 };
+  private projectorSpeakerTile: Tile = { x: 7, y: 1 };
+  private projectorControlHint!: HintTag;
+  private projectorSpeakerHint!: HintTag;
+  private projectorControlGfx!: Phaser.GameObjects.Graphics;
+  private projectorSpeakerGfx!: Phaser.GameObjects.Graphics;
+  private projectorMuted = true;
+  private screenShareTile: Tile = { x: 5, y: 1 };
+  private screenShareHint!: HintTag;
+  private screenShareGfx!: Phaser.GameObjects.Graphics;
+
+  // --- phone booth (webcam broadcast) ---
+  private phoneBoothTile: Tile = { x: 3, y: 2 };
+  private phoneBoothHint!: HintTag;
+  private phoneBoothGfx!: Phaser.GameObjects.Graphics;
+  private phoneBoothLight!: Phaser.GameObjects.Graphics;
+  private webcam: WebcamManager | null = null;
+  private presenterVideoEls = new Map<string, { video: HTMLVideoElement; wrap: HTMLDivElement }>();
+  private cachedCanvasRect: DOMRect | null = null;
+  private presenters: Presenter[] = [];
+  private focusedPresenterKey: string | null = null;
+  private mutedPresenterKeys = new Set<string>();
+  private presenterPanel: PresenterPanel | null = null;
+  private webcamPresenterId: string | null = null;
+  private webcamPresenterName: string | null = null;
+  /** Expanded view modal for presenter videos and projector iframe content. */
+  private expandedView: ExpandedView | null = null;
+  /** Expand button overlay on the projector iframe. */
+  private projectorExpandBtn: HTMLButtonElement | null = null;
+  /** Expand button overlay on presenter video streams. */
+  private presenterExpandBtn: HTMLButtonElement | null = null;
+  /** The presenter key that the presenterExpandBtn is currently targeting. */
+  private presenterExpandBtnKey: string | null = null;
+  private inPhoneBooth = false;
+  private sofaTile: Tile | null = null;
+  private filingTiles: Tile[] = [];
+  private plantTiles: Tile[] = [];
+
+  private fridgeUntil = 0; // cooldown for fridge
+  private coolerUntil = 0; // cooldown for water cooler
+  private clockUntil = 0; // cooldown for clock
+  private filingUntil = 0; // cooldown for filing cabinets
+  private vendingUntil = 0; // cooldown for vending machine
+  private plantUntil = 0; // buff duration for watered plants
+  private plantCooldownUntil = 0; // cooldown for watering
+  private sofaUntil = 0; // cooldown for sofa
+
+  private mailboxGfx!: Phaser.GameObjects.Graphics;
+  private mailboxHint!: HintTag;
+  private mailboxUntil = 0; // cooldown for checking mail
+  private mailboxHasMail = false;
+  private mailboxNextMail = 0; // timestamp when next mail arrives
+  private mailboxPx = { x: 0, y: 0 };
+
+  // --- platform mailboxes (mail room) ---
+  private platformMailboxGfx!: Phaser.GameObjects.Graphics;
+  private platformMailboxHint!: HintTag;
+  private platformMailboxes: PlatformMailbox[] = [];
+  private mailDigestRequested = false;
+
+  private fridgeHint!: HintTag;
+  private coolerHint!: HintTag;
+  private clockHint!: HintTag;
+  private vendingHint!: HintTag;
+  private sofaHint!: HintTag;
+  private filingHint!: HintTag;
+  private plantHint!: HintTag;
+  // mailboxHint declared above with mailbox fields
+
+  // --- wardrobe (break room) ---
+  private wardrobeTile: Tile = { x: 21, y: 18 };
+  private wardrobeHint!: HintTag;
+  private wardrobeGfx!: Phaser.GameObjects.Graphics;
+
+  // --- nemesis terminal (break room) ---
+  private nemesisTerminalTile: Tile = { x: 20, y: 14 };
+  private nemesisTerminalHint!: HintTag;
+  private nemesisTerminalGfx!: Phaser.GameObjects.Graphics;
+
+  private trophyTile: Tile = { x: 1, y: 8 };
+  private trophyHint!: HintTag;
+  private trophyGfx!: Phaser.GameObjects.Graphics;
+  private trophyAchCount = -1;
+  private sceneStart = 0;
+  private wasOutside = false;
+  private outsideSnapshot: { achievements: Set<string>; weapons: string[]; creaturesKilled: number; bossesSlain: number } | null = null;
+  private weaponRackTile: Tile = { x: 4, y: 8 };
+  private weaponRackGfx!: Phaser.GameObjects.Graphics;
+  private weaponRackSig = "";
+
+  private hallOfFameTile: Tile = { x: 1, y: 5 };
+  private hallOfFameHint!: HintTag;
+  private hallOfFameGfx!: Phaser.GameObjects.Graphics;
+  private chimneyGfx!: Phaser.GameObjects.Graphics;
+
+  // --- helicopter / red button ---
+  private redButtonTile: Tile = { x: 25, y: 7 };
+  private redButtonHint!: HintTag;
+  private redButtonUntil = 0;
+  private padCenter = { x: 1200, y: -195 };
+  private padFrontPx = { x: 1158, y: -138 };
+  private heliActive = false;
+  private heliContainer: Phaser.GameObjects.Container | null = null;
+  private heliRotor: Phaser.GameObjects.Graphics | null = null;
+  private heliAgent: Phaser.GameObjects.Container | null = null;
+  private heliElevatorGfx: Phaser.GameObjects.Graphics | null = null;
+  private heliDelivery: HelicopterDelivery | null = null;
+  private heliSound: { stop: () => void } | null = null;
+  private heliSafetyTimer: Phaser.Time.TimerEvent | null = null;
+  private pendingHeliAgents: string[] = [];
+  private pendingHeliDeliveries: HelicopterDelivery[] = [];
+  private initialSyncDone = false;
+
+  private world!: WorldLayer;
+  private theme: "classic" | "agentHeights" | "world" = "classic";
+  /** Active world theme (null = HQ/default). Loaded from registry in create(). */
+  private worldTheme: WorldTheme | null = null;
+  /** Pixel positions of chimney tiles — for smoke when devops agents work. */
+  private chimneyPositions: { x: number; y: number }[] = [];
+  /** Server rack tile positions for E-interaction. */
+  private serverRackTiles: Tile[] = [];
+  private serverRackHint!: HintTag;
+
+  // --- world portal (near server racks) ---
+  private portalContainer: Phaser.GameObjects.Container | null = null;
+  private portalCollider: Phaser.Physics.Arcade.Collider | null = null;
+  private portalZone: Phaser.GameObjects.Arc | null = null;
+  private portalHint!: Phaser.GameObjects.Text;
+
+  // --- MCP Forge (break room) ---
+  // Each tile is the center of the multi-tile piece for proximity checks.
+  private warTableTile: Tile = { x: 26, y: 15 };   // 2×2 at (25,14) — forge station
+  private scrapBinTile: Tile = { x: 28, y: 18 };   // 1×2 at (28,17) — tool rack
+  private radioTile: Tile = { x: 28, y: 14 };      // 1×1 at (28,14) — status monitor
+  private workbenchTile: Tile = { x: 24, y: 18 };  // 2×1 at (23,18) — code terminal
+  private researchTile: Tile = { x: 23, y: 14 };   // 2×1 at (22,14) — blueprint desk
+  private warTableHint!: HintTag;
+  private scrapBinHint!: HintTag;
+  private radioHint!: HintTag;
+  private workbenchHint!: HintTag;
+  private researchHint!: HintTag;
+  private allHints: HintTag[] = [];
+
+  /** Store listeners are registered once; they survive scene restarts. */
+  private wired = false;
+  private ready = false;
+
+  private mapPx = { w: 960, h: 640 };
+  private mapRef!: Phaser.Tilemaps.Tilemap;
+  private player!: Phaser.GameObjects.Sprite;
+  private playerLabel!: Phaser.GameObjects.Text;
+  private playerNameBg!: Phaser.GameObjects.Graphics;
+  private lastPlayerNameBgKey = "";
+  private playerDir: Dir = "down";
+  private playerTexKey = "boss-default";
+  private keys!: Record<"W" | "A" | "S" | "D" | "E" | "Q" | "R" | "T" | "M" | "SPACE", Phaser.Input.Keyboard.Key>;
+  private hotbarEl: HTMLDivElement | null = null;
+  private hotbarVisible = false;
+  private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
+  private selectRing!: Phaser.GameObjects.Ellipse;
+  private lightingOverlay!: Phaser.GameObjects.Graphics;
+  private monitorGlows: Phaser.GameObjects.Arc[] = [];
+  // Smoke puffs for smoking work metaphor — pool of rising circles
+  private smokePuffs: { arc: Phaser.GameObjects.Arc; vy: number; life: number; maxLife: number }[] = [];
+  private smokeEmitTimer = 0;
+  // Fire particles for fire_spinning work metaphor
+  private fireParticles: { arc: Phaser.GameObjects.Arc; vy: number; vx: number; life: number; maxLife: number }[] = [];
+  private fireEmitTimer = 0;
+  // Harvest particles for harvesting work metaphor
+  private harvestParticles: { arc: Phaser.GameObjects.Arc; vy: number; life: number; maxLife: number }[] = [];
+  private harvestEmitTimer = 0;
+  private skyGfx!: Phaser.GameObjects.Graphics;
+  private lastSkyView: { x: number; y: number; w: number; h: number } | null = null;
+  private clouds: { sprite: Phaser.GameObjects.Image; speed: number; baseAlpha: number; phase: number; fadeSpeed: number; yBase: number }[] = [];
+
+  /** Multiplayer: remote player sprites keyed by userId. */
+  private remotePlayers = new Map<string, { sprite: Phaser.GameObjects.Sprite; label: Phaser.GameObjects.Text; nameBg: Phaser.GameObjects.Graphics; intro?: boolean; texKey: string; appearance: CharAppearance | null; appearanceKey: string; labelX: number; labelY: number; lastStoreX: number; lastStoreY: number; storeVx: number; storeVy: number; }>();
+  /** Voice chat manager — WebRTC proximity voice. */
+  private voice: VoiceManager | null = null;
+  /** Screen share manager — WebRTC screen sharing on projector. */
+  private screenShare: ScreenShareManager | null = null;
+  /** Agent currently broadcasting to the projector (null = none). */
+  private agentBroadcastAgentId: string | null = null;
+  /** Agent currently being viewed in the modal (null = modal closed). */
+  private agentViewAgentId: string | null = null;
+  /** Current tab in the agent monitor. */
+  private agentViewTab: "screen" | "files" | "terminal" | "tasks" | "chat" | "memory" | "stats" | "wallet" = "screen";
+  /** Cached last screenshot frame for the viewed agent (prevents placeholder flash on tab switch). */
+  private agentLastFrame: string | null = null;
+  private agentLastFrameUrl: string | null = null;
+  /** Current file browser path within the agent workspace. */
+  private agentFsPath = ".";
+  /** Unsubscribe functions for agent log/FS listeners. */
+  private agentViewCleanup: (() => void)[] = [];
+  /** Active in-world mailbox conversation panel (null = closed). */
+  private mailboxConversation: MailboxConversation | null = null;
+  /** Projector texture key for agent frames. */
+  private projectorAgentTextureKey = "projector-agent-frame";
+  /** Phaser image object for agent frames on projector. */
+  private projectorAgentImage: Phaser.GameObjects.Image | null = null;
+  /** Matrix rain overlays for working monitors — keyed by desk index. */
+  private monitorMatrixOverlays: Map<number, Phaser.GameObjects.Image> = new Map();
+  /** Matrix rain canvas texture. */
+  private monitorMatrixTexKey = "monitor-matrix-rain";
+  /** Matrix rain columns state — array of {y, speed, chars[]} per column. */
+  private matrixColumns: { y: number; speed: number; chars: string[] }[] = [];
+  /** Matrix rain canvas width/height. */
+  private static MATRIX_W = 128;
+  private static MATRIX_H = 80;
+  private matrixRainLastUpdate = 0;
+  private matrixRainWorkingDesks = new Set<number>();
+  /** Speaking indicator icons above remote players. */
+  private speakingIcons = new Map<string, Phaser.GameObjects.Text>();
+  /** Tracks the last roomId the scene rendered — used to detect room changes. */
+  private lastRoomId: string | null = null;
+  private lastPosSent = 0;
+  private lastSentX = 0;
+  private lastSentY = 0;
+  private lastSpeakingCheck = 0;
+  private lastHintUpdate = 0;
+
+  // --- IDE Bridge: terminal stations for external CLI tools ---
+  private terminalStations: { container: Phaser.GameObjects.Container; monitor: Phaser.GameObjects.Sprite; glow: Phaser.GameObjects.Arc; toolLabel: Phaser.GameObjects.Text; fileLabel: Phaser.GameObjects.Text; }[] = [];
+  // --- IDE Bridge: wall dashboard for team monitoring ---
+  private wallDashboard: { container: Phaser.GameObjects.Container; titleText: Phaser.GameObjects.Text; bodyText: Phaser.GameObjects.Text; } | null = null;
+  private terminalStationTiles: { x: number; y: number }[] = [
+    { x: 22, y: 14 },
+    { x: 24, y: 14 },
+    { x: 26, y: 14 },
+    { x: 28, y: 14 },
+  ];
+
+  // ── Tap-to-walk + tap-to-interact ──
+  private playerPath: Tile[] = [];
+  private playerTargetPx: { x: number; y: number } | null = null;
+  private pendingInteract: boolean = false;
+  private pendingAgentId: string | null = null;
+  private pathMarker: Phaser.GameObjects.Arc | null = null;
+  private playerVx = 0;
+  private playerVy = 0;
+  private playerPathOutdoor = false;
+  private pendingOutdoorTargetPx: { x: number; y: number } | null = null;
+
+  // ── Camera controls (pinch-zoom, pan, recenter) ──
+  private cameraMode: "follow" | "free" = "follow";
+  private userZoom: number | null = null;
+  private pinchPointers: Map<number, Phaser.Input.Pointer> = new Map();
+  private pinchStartDist = 0;
+  private pinchStartZoom = 1;
+  private panPointer: Phaser.Input.Pointer | null = null;
+  private panStartScrollX = 0;
+  private panStartScrollY = 0;
+  private tapStartX = 0;
+  private tapStartY = 0;
+  private tapMoved = false;
+
+  constructor() {
+    super("office");
+  }
+
+  create(): void {
+    this.userZoom = null;
+    this.store = this.game.registry.get("store") as Store;
+    this.net = this.game.registry.get("net") as import("../net").Net;
+    this._myUserId = (this.game.registry.get("userId") as string) ?? null;
+
+    // ── Voice chat: create VoiceManager and wire store listeners ──────────
+    if (this._myUserId && this.net) {
+      this.store.clearVoiceListeners();
+      this.voice = new VoiceManager(this._myUserId, (msg) => this.net!.send(msg));
+      this.store.onVoicePeer((userId, name) => this.voice?.onPeer(userId, name));
+      this.store.onVoiceOffer((fromUserId, sdp) => { void this.voice?.onOffer(fromUserId, sdp); });
+      this.store.onVoiceAnswer((fromUserId, sdp) => { void this.voice?.onAnswer(fromUserId, sdp); });
+      this.store.onVoiceIce((fromUserId, candidate) => { void this.voice?.onIce(fromUserId, candidate); });
+      this.store.onVoicePeerLeft((userId) => this.voice?.onPeerLeft(userId));
+      this.events.once("shutdown", () => { this.voice?.stop(); this.voice?.stopListenOnly(); this.voice = null; this.store.sceneRef = null; });
+      this.store.sceneRef = this as any;
+      // Auto-start listen-only mode so player hears nearby speakers without enabling mic.
+      // This only sends the voice_listen signal — AudioContext is created on first user gesture.
+      this.voice.startListenOnly().catch((err) => console.warn("[voice] auto listen-only failed:", err));
+    }
+    // Clean up projector iframe on scene shutdown/restart
+    this.events.once("shutdown", () => this.destroyProjectorVideo());
+
+    // Stop helicopter sound on scene shutdown — tweens/delayedCalls are killed
+    // during shutdown so endHelicopter() may never fire, leaving audio looping.
+    this.events.once("shutdown", () => {
+      this.heliSafetyTimer?.remove();
+      this.heliSafetyTimer = null;
+      this.heliSound?.stop();
+      this.destroyHotbar();
+      this.heliSound = null;
+      this.heliActive = false;
+      this.pendingHeliDeliveries = [];
+    });
+
+    // Projector video overlay: position during prerender for accurate camera placement
+    this.events.on("prerender", () => {
+      this.updateProjectorVideo();
+      this.updateProjectorVideoOverlays();
+    });
+
+    // Invalidate cached canvas rect on resize/scroll so worldRectToScreen stays accurate
+    const invalidateCanvasRect = () => { this.cachedCanvasRect = null; };
+    window.addEventListener("resize", invalidateCanvasRect);
+    window.addEventListener("scroll", invalidateCanvasRect, true);
+    this.events.once("shutdown", () => {
+      window.removeEventListener("resize", invalidateCanvasRect);
+      window.removeEventListener("scroll", invalidateCanvasRect, true);
+    });
+
+    // ── Screen share + webcam: create managers and wire store listeners ──
+    if (this._myUserId && this.net) {
+      this.screenShare = new ScreenShareManager(this._myUserId, (msg) => this.net!.send(msg));
+      this.screenShare.onRemoteStream = (stream, userId) => {
+        this.attachPresenterStream(userId, "screen", stream);
+      };
+      this.screenShare.onStreamEnded = () => {
+        if (this._myUserId) this.detachPresenterStream(this._myUserId, "screen");
+      };
+      this.store.onScreenShareOffer((fromUserId, sdp) => { void this.screenShare?.onOffer(fromUserId, sdp); });
+      this.store.onScreenShareAnswer((fromUserId, sdp) => { void this.screenShare?.onAnswer(fromUserId, sdp); });
+      this.store.onScreenShareIce((fromUserId, candidate) => { void this.screenShare?.onIce(fromUserId, candidate); });
+
+      this.webcam = new WebcamManager(this._myUserId, (msg) => this.net!.send(msg));
+      this.webcam.onRemoteStream = (stream, userId) => {
+        this.attachPresenterStream(userId, "webcam", stream);
+      };
+      this.webcam.onStreamEnded = () => {
+        if (this._myUserId) this.detachPresenterStream(this._myUserId, "webcam");
+      };
+      this.webcam.onStateChange = (broadcasting) => {
+        this.updatePhoneBoothVisual(broadcasting);
+      };
+      this.store.onWebcamOffer((fromUserId, sdp) => { void this.webcam?.onOffer(fromUserId, sdp); });
+      this.store.onWebcamAnswer((fromUserId, sdp) => { void this.webcam?.onAnswer(fromUserId, sdp); });
+      this.store.onWebcamIce((fromUserId, candidate) => { void this.webcam?.onIce(fromUserId, candidate); });
+
+      // Unified presenter updates — replaces individual screen_share_peer / webcam_state / etc.
+      this.store.onPresentersUpdate((presenters) => {
+        this.onPresentersUpdate(presenters);
+        if (this.presenterPanel) {
+          this.presenterPanel.setPresenters(presenters);
+          this.presenterPanel.setSharing(!!this.screenShare?.sharing);
+          this.presenterPanel.setBroadcasting(!!this.webcam?.broadcasting);
+        }
+      });
+      this.store.onPresenterKicked((presenterType) => {
+        if (presenterType === "screen") {
+          this.screenShare?.stopSharing();
+          if (this._myUserId) this.detachPresenterStream(this._myUserId, "screen");
+        } else {
+          this.webcam?.stopBroadcasting();
+          this.inPhoneBooth = false;
+          if (this.player) this.player.setVisible(true);
+          if (this._myUserId) this.detachPresenterStream(this._myUserId, "webcam");
+        }
+      });
+
+      // Presenter management panel
+      this.expandedView = new ExpandedView();
+      this.expandedView.onClose = () => {
+        this.updateProjectorVideoOverlays();
+        this.updateProjectorVideo();
+      };
+      this.presenterPanel = new PresenterPanel({
+        onExpand: (uid, type) => {
+          this.expandPresenter(uid, type);
+        },
+        onFocus: (uid, type) => {
+          this.focusedPresenterKey = this.focusedPresenterKey === `${uid}:${type}` ? null : `${uid}:${type}`;
+          this.updateProjectorVideoOverlays();
+          this.presenterPanel?.setFocus(this.focusedPresenterKey);
+        },
+        onMute: (uid, type) => {
+          const key = `${uid}:${type}`;
+          if (this.mutedPresenterKeys.has(key)) this.mutedPresenterKeys.delete(key);
+          else this.mutedPresenterKeys.add(key);
+          this.updateProjectorVideoOverlays();
+          this.presenterPanel?.setMuted(this.mutedPresenterKeys);
+        },
+        onKick: (uid, type) => {
+          this.net?.send({ type: "presenter_kick", userId: uid, presenterType: type });
+        },
+        onStartScreenShare: () => {
+          if (this.presenters.length >= MAX_PRESENTERS) {
+            this.store.toast(`Presenter grid is full (${MAX_PRESENTERS}/${MAX_PRESENTERS}).`);
+            return;
+          }
+          this.screenShare?.startSharing().then(() => {
+            const localStream = this.screenShare?.localStream;
+            if (localStream && this._myUserId) {
+              this.attachPresenterStream(this._myUserId, "screen", localStream);
+            }
+            this.store.toast("Sharing your screen to the projector!");
+            this.presenterPanel?.setSharing(true);
+          }).catch(() => {
+            this.store.toast("Screen share permission denied.");
+          });
+        },
+        onStopScreenShare: () => {
+          this.screenShare?.stopSharing();
+          if (this._myUserId) this.detachPresenterStream(this._myUserId, "screen");
+          this.store.toast("Screen share stopped.");
+          this.presenterPanel?.setSharing(false);
+        },
+        onStartWebcam: () => {
+          if (this.webcamPresenterId && this.webcamPresenterId !== this._myUserId) {
+            this.store.toast(`${this.webcamPresenterName ?? "Someone"} is already broadcasting.`);
+            return;
+          }
+          if (this.presenters.length >= MAX_PRESENTERS) {
+            this.store.toast(`Presenter grid is full (${MAX_PRESENTERS}/${MAX_PRESENTERS}).`);
+            return;
+          }
+          this.webcam?.startBroadcasting().then(() => {
+            this.inPhoneBooth = true;
+            if (this.player) this.player.setVisible(false);
+            const localStream = this.webcam?.localStream;
+            if (localStream && this._myUserId) {
+              this.attachPresenterStream(this._myUserId, "webcam", localStream);
+            }
+            this.store.toast("ON AIR — webcam broadcasting to projector!");
+            this.presenterPanel?.setBroadcasting(true);
+          }).catch(() => {
+            this.store.toast("Camera access denied. Check browser permissions.");
+          });
+        },
+        onStopWebcam: () => {
+          this.webcam?.stopBroadcasting();
+          this.inPhoneBooth = false;
+          if (this.player) this.player.setVisible(true);
+          if (this._myUserId) this.detachPresenterStream(this._myUserId, "webcam");
+          this.store.toast("Webcam broadcast stopped.");
+          this.presenterPanel?.setBroadcasting(false);
+        },
+        onClose: () => {
+          this.presenterPanel?.hide();
+        },
+      });
+      this.presenterPanel.setMyUserId(this._myUserId);
+
+      this.events.once("shutdown", () => {
+        this.screenShare?.stopSharing();
+        this.screenShare = null;
+        this.webcam?.destroy();
+        this.webcam = null;
+        this.detachAllPresenterStreams();
+        this.presenterPanel?.destroy();
+        this.presenterPanel = null;
+        this.expandedView?.destroy();
+        this.expandedView = null;
+        if (this.projectorExpandBtn) { this.projectorExpandBtn.remove(); this.projectorExpandBtn = null; }
+        if (this.presenterExpandBtn) { this.presenterExpandBtn.remove(); this.presenterExpandBtn = null; }
+      });
+    }
+
+    // ── Agent screenshot viewing + projector broadcast ────────────────
+    this.store.onAgentFrame((agentId, frame, url) => {
+      // Cache frame for this agent to prevent placeholder flash on tab re-render
+      if (agentId === this.agentViewAgentId) {
+        this.agentLastFrame = frame;
+        if (url) this.agentLastFrameUrl = url;
+      }
+      // If this is the agent being viewed in the modal and on the screen tab, update the modal
+      if (agentId === this.agentViewAgentId && this.agentViewTab === "screen") {
+        const img = document.getElementById("agent-view-screen-img") as HTMLImageElement | null;
+        if (img) {
+          img.src = `data:image/jpeg;base64,${frame}`;
+          img.style.display = "block";
+        }
+        const placeholder = document.getElementById("agent-view-screen-placeholder");
+        if (placeholder) placeholder.style.display = "none";
+        if (url) {
+          const urlEl = document.getElementById("agent-view-url");
+          if (urlEl) urlEl.textContent = url;
+        }
+      }
+      // If this agent is broadcasting, render on projector
+      if (agentId === this.agentBroadcastAgentId) {
+        this.updateProjectorAgentFrame(frame);
+      }
+    });
+    this.store.onAgentBroadcastState((agentId) => {
+      this.agentBroadcastAgentId = agentId;
+      if (!agentId) {
+        this.hideProjectorAgentFrame();
+      }
+      // Update modal broadcast button if open
+      const btn = document.getElementById("agent-view-broadcast");
+      if (btn) {
+        if (agentId && agentId === this.agentViewAgentId) {
+          btn.textContent = "Stop Broadcast";
+          (btn as HTMLButtonElement).style.background = "#6a2a2a";
+        } else {
+          btn.textContent = "Broadcast to Projector";
+          (btn as HTMLButtonElement).style.background = "#2a4a6a";
+        }
+      }
+    });
+    this.store.onAgentBroadcastHtml((agentId, url) => {
+      this.agentBroadcastHtmlAgentId = agentId;
+      if (agentId && url) {
+        this.showProjectorHtmlIframe(url);
+      } else {
+        this.hideProjectorHtmlIframe();
+      }
+      // Update broadcast HTML button in file viewer if open
+      const htmlBtn = document.getElementById("av-fs-broadcast-html");
+      if (htmlBtn) {
+        if (agentId && agentId === this.agentViewAgentId) {
+          (htmlBtn as HTMLButtonElement).textContent = "Stop Broadcast";
+          (htmlBtn as HTMLButtonElement).style.background = "linear-gradient(to bottom, rgba(255,150,150,0.7), rgba(230,100,100,0.5))";
+        } else {
+          (htmlBtn as HTMLButtonElement).textContent = "Broadcast to Screen";
+          (htmlBtn as HTMLButtonElement).style.background = "linear-gradient(to bottom, rgba(140,200,255,0.8), rgba(80,150,230,0.6))";
+        }
+      }
+    });
+    this.events.once("shutdown", () => {
+      this.closeAgentViewModal();
+      if (this.mailboxConversation) {
+        this.mailboxConversation.destroy();
+        this.mailboxConversation = null;
+      }
+      this.hideProjectorAgentFrame();
+      this.hideProjectorHtmlIframe();
+      this.closePortal();
+      for (const overlay of this.monitorMatrixOverlays.values()) overlay.destroy();
+      this.monitorMatrixOverlays.clear();
+      this.matrixColumns = [];
+      // Clean up smoke puffs from smoking work metaphor
+      for (const p of this.smokePuffs) p.arc.destroy();
+      this.smokePuffs = [];
+      for (const p of this.fireParticles) p.arc.destroy();
+      this.fireParticles = [];
+      for (const p of this.harvestParticles) p.arc.destroy();
+      this.harvestParticles = [];
+    });
+    // HQ2 and org rooms use the agentHeights (big open office) theme; private offices use user's chosen theme.
+    // Before room_state arrives, roomId is null — default to HQ2 theme since that's where
+    // players start. This prevents a brief flash of the wrong room layout.
+    // If a world-theme.json was loaded by BootScene, use "world" theme instead.
+    this.worldTheme = this.registry.get("worldTheme") ?? null;
+    if (this.worldTheme) {
+      this.theme = "world";
+    } else {
+      const isHq2 = this.store.roomId === "hq2" || this.store.roomId === null || this.store.isOrgRoom;
+      this.theme = isHq2 ? "agentHeights" : (this.store.settings.game.theme === "agentHeights" ? "agentHeights" : "classic");
+    }
+    this.ready = false;
+    console.log(`[scene] create() start at ${performance.now().toFixed(0)}ms, roomId=${this.store.roomId}, initialDataReady=${this.store.initialDataReady}`);
+
+    // Remove any stale overlay from a previous scene restart
+    loadingOverlay.remove();
+    loadingOverlay.setSegment(0.85, 1.0);
+
+    // register post-processing pipelines (once)
+    try {
+      const renderer = this.game.renderer as Phaser.Renderer.WebGL.WebGLRenderer;
+      const pipelines = renderer?.pipelines as any;
+      if (pipelines) {
+        if (!pipelines.has("BloomFX")) pipelines.addPostPipeline("BloomFX", BloomPipeline);
+        if (!pipelines.has("ColorGrade")) pipelines.addPostPipeline("ColorGrade", ColorGradePipeline);
+        if (!pipelines.has("DOF")) pipelines.addPostPipeline("DOF", DOFPipeline);
+        // apply pipelines to camera (order: Bloom -> ColorGrade -> DOF)
+        this.cameras.main.setPostPipeline("BloomFX");
+        this.cameras.main.setPostPipeline("ColorGrade");
+        this.cameras.main.setPostPipeline("DOF");
+      }
+    } catch (err) {
+      console.warn("[scene] Post-pipeline setup failed — continuing without visual effects:", err);
+    }
+
+    // Sky gradient + drifting clouds (screen-fixed, behind everything)
+    this.createSky();
+
+    // Initialize audio on first user interaction — also unlocks voice AudioContext.
+    // On mobile, Phaser's pointerdown may not fire if the user taps a DOM touch
+    // control (which calls preventDefault), so also listen for document touchstart.
+    const unlockAudio = () => {
+      this.world?.audio.init();
+      this.world?.audio.resume();
+      // Share the AudioSystem's AudioContext with VoiceManager to avoid dual-context issues on iOS
+      if (this.world?.audio.context && this.voice) {
+        this.voice.setExternalContext(this.world.audio.context);
+      }
+      void this.voice?.unlockAudio();
+    };
+    this.input.once("pointerdown", unlockAudio);
+    this.input.keyboard?.once("keydown", unlockAudio);
+    document.addEventListener("touchstart", unlockAudio, { once: true, passive: true });
+
+    // a theme change restarts the scene — drop everything the last run built
+    this.npcs.clear();
+    this.initialSyncDone = false;
+    this.officeManager = null;
+    // Clear any theme-registered furniture from the previous run,
+    // then re-register the correct world's furniture if a theme is active.
+    clearThemeFurniture();
+    const _theme = this.registry.get("worldTheme") as WorldTheme | null;
+    if (_theme?.id === "erics-alley") registerAlleyFurniture();
+    else if (_theme?.id === "hawaii") registerHawaiiFurniture();
+    else if (_theme?.id === "old-south") registerOldSouthFurniture();
+    clearThemeFurnitureTextures(this);
+    this.hermes = null;
+    this.wizard = null;
+    this.officeManagerSeat = null;
+    this.wizardSeat = null;
+    this.seats = [];
+    this.extraSpots = [];
+    this.monitors = [];
+    this.chairs = [];
+    this.officeManagerMonitor = null;
+    this.hermesMonitor = null;
+    this.terminalStations = [];
+    if (this.wallDashboard) {
+      this.wallDashboard.container.destroy();
+      this.wallDashboard = null;
+    }
+    this.coffeeUntil = 0;
+    this.fridgeUntil = 0;
+    this.coolerUntil = 0;
+    this.clockUntil = 0;
+    this.filingUntil = 0;
+    this.vendingUntil = 0;
+    this.plantUntil = 0;
+    this.plantCooldownUntil = 0;
+    this.sofaUntil = 0;
+    this.heliActive = false;
+    this.heliContainer?.destroy();
+    this.heliContainer = null;
+    this.heliRotor = null;
+    this.heliAgent?.destroy();
+    this.heliAgent = null;
+    this.heliElevatorGfx?.destroy();
+    this.heliElevatorGfx = null;
+    this.heliSafetyTimer?.remove();
+    this.heliSafetyTimer = null;
+    this.heliSound?.stop();
+    this.heliSound = null;
+    this.pendingHeliDeliveries = [];
+    this.clouds = [];
+
+    // Variables that cross phase boundaries
+    let map: Phaser.Tilemaps.Tilemap;
+    let walkable: boolean[][];
+
+    const phases: Array<{ name: string; fn: () => void | Promise<void>; skip?: boolean }> = [
+      {
+        name: "textures & animations",
+        fn: () => {
+          // Procedural textures and animations were created by BootScene and persist
+          // in the global TextureManager.  The existence guards make these fast
+          // no-ops on first run; they only do work on scene restart.
+          generateAllTextures(this);
+          this.ensureAllAnimations();
+        },
+      },
+      {
+        name: "tilemap & collision",
+        fn: () => {
+          let walls: Phaser.Tilemaps.TilemapLayer;
+          let furniture: Phaser.Tilemaps.TilemapLayer;
+          if (this.theme === "world" && this.worldTheme) {
+            map = this.make.tilemap({ key: `map-${this.worldTheme.id}` });
+            this.mapRef = map;
+            const tilesetName = this.worldTheme.office.tilesetPath.replace(/\.[^.]+$/, "").split("/").pop() ?? "tiles-theme";
+            const tiles = map.addTilesetImage(tilesetName, "tiles-theme");
+            if (!tiles) throw new Error(`Failed to add tileset "tiles-theme" to map — texture may be missing or broken`);
+            // Theme-specific floor colors
+            const themeFloorColors: Record<string, number> = {
+              "erics-alley": 0x3a3530,  // dirty concrete
+              "hawaii": 0x8a7a4a,       // sandy wood
+              "old-south": 0x5a3e24,    // dark wood planks
+            };
+            const floorColor = themeFloorColors[this.worldTheme.id] ?? 0x2a2a2a;
+            const gridColor = this.worldTheme.id === "hawaii" ? 0x6a5a3a
+              : this.worldTheme.id === "old-south" ? 0x3a2814
+              : 0x2a2520;
+            const bg = this.add.graphics().setDepth(-1);
+            bg.fillStyle(floorColor, 1);
+            bg.fillRect(0, 0, map.widthInPixels, map.heightInPixels);
+            bg.lineStyle(1, gridColor, 0.3);
+            for (let x = 0; x <= map.width; x++) {
+              bg.moveTo(x * TILE_PX, 0);
+              bg.lineTo(x * TILE_PX, map.heightInPixels);
+            }
+            for (let y = 0; y <= map.height; y++) {
+              bg.moveTo(0, y * TILE_PX);
+              bg.lineTo(map.widthInPixels, y * TILE_PX);
+            }
+            bg.strokePath();
+            const groundLayer = map.createLayer("Ground", tiles);
+            if (groundLayer) groundLayer.setDepth(0).setAlpha(0);
+            const wallsLayer = map.createLayer("Walls", tiles);
+            const furnitureLayer = map.createLayer("Furniture", tiles);
+            walls = wallsLayer ?? map.createBlankLayer("Walls", tiles) as Phaser.Tilemaps.TilemapLayer;
+            furniture = furnitureLayer ?? map.createBlankLayer("Furniture", tiles) as Phaser.Tilemaps.TilemapLayer;
+            walls.setDepth(1);
+            furniture.setDepth(2);
+            walls.setCollisionByProperty({ solid: true });
+            furniture.setCollisionByProperty({ solid: true });
+          } else {
+            map = this.make.tilemap({ key: `map-${this.theme}` });
+            this.mapRef = map;
+            const tiles = map.addTilesetImage(
+              this.theme === "agentHeights" ? "agentHeights" : "office",
+              `tiles-${this.theme}`,
+            )!;
+            // draw a floor backdrop so empty map tiles aren't white
+            const floorColor = this.theme === "agentHeights" ? 0x4a6a8a : 0xd4d0c8;
+            const aiFloorKey = this.theme === "agentHeights"
+              ? AI_OFFICE_TEXTURES.floorAgentHeights
+              : AI_OFFICE_TEXTURES.floorClassic;
+            if (this.textures.exists(aiFloorKey)) {
+              const floorSprite = this.add.tileSprite(0, 0, map.widthInPixels, map.heightInPixels, aiFloorKey).setDepth(-1).setOrigin(0, 0);
+              floorSprite.tileScaleX = TILE_PX / 256;
+              floorSprite.tileScaleY = TILE_PX / 256;
+            } else {
+              const bg = this.add.graphics().setDepth(-1);
+              bg.fillStyle(floorColor, 1);
+              bg.fillRect(0, 0, map.widthInPixels, map.heightInPixels);
+              bg.lineStyle(1, floorColor === 0xd4d0c8 ? 0xc8c4bc : 0x3a5a7a, 0.3);
+              for (let x = 0; x <= map.width; x++) {
+                bg.moveTo(x * TILE_PX, 0);
+                bg.lineTo(x * TILE_PX, map.heightInPixels);
+              }
+              for (let y = 0; y <= map.height; y++) {
+                bg.moveTo(0, y * TILE_PX);
+                bg.lineTo(map.widthInPixels, y * TILE_PX);
+              }
+              bg.strokePath();
+            }
+
+            map.createLayer("Ground", tiles)!.setDepth(0).setAlpha(0);
+            walls = map.createLayer("Walls", tiles)!.setDepth(1);
+            furniture = map.createLayer("Furniture", tiles)!.setDepth(2);
+            walls.setCollisionByProperty({ solid: true });
+            furniture.setCollisionByProperty({ solid: true });
+          }
+
+          // Apply AI wall textures + windows — only for non-world themes (HQ/classic).
+          // World themes use their own procedural tilesets with theme-specific walls.
+          if (this.theme !== "world") {
+            const tex = this.textures;
+            const brickKey = "ai-wall_0";       // dark red brick — left wall
+            const stoneKey = "ai-wall_2";       // cobblestone — bottom wall
+            const mesoKey = "ai-wall_4";       // mesoamerican — right wall
+            const lightStoneKey = "ai-wall_1";  // gray concrete — top wall
+            const drywallKey = mesoKey; // mesoamerican — right wall
+            const hasBrick = tex.exists(brickKey);
+            const hasStone = tex.exists(stoneKey);
+            const hasLightStone = tex.exists(lightStoneKey);
+            const hasDrywall = tex.exists(drywallKey);
+            const hasMeso = tex.exists(mesoKey);
+            const hasInteriorWall = tex.exists("interior-wall-0");
+            if (hasBrick || hasStone || hasLightStone || hasDrywall || hasMeso || hasInteriorWall) {
+              for (let y = 0; y < map.height; y++) {
+                for (let x = 0; x < map.width; x++) {
+                  const wt = walls.getTileAt(x, y);
+                  if (!wt) continue;
+                  // Skip door tiles (index 13-14) so they remain visible
+                  if (wt.index === 13 || wt.index === 14) continue;
+                  let wallKey: string | null = null;
+                  let wallAlpha = 1;
+                  if (y === map.height - 1 && hasStone) wallKey = stoneKey; // bottom wall = stone (priority at corners)
+                  else if (x === 0 && hasBrick) wallKey = brickKey;           // left wall = brick
+                  else if (x === map.width - 1 && hasMeso) wallKey = mesoKey; // right wall = mesoamerican
+                  else if (y <= 1 && hasLightStone) wallKey = lightStoneKey; // top wall = light stone
+                  else {
+                    // Interior walls — procedural textured walls with depth/shading
+                    const interiorKeys = ["interior-wall-0", "interior-wall-1", "interior-wall-2"];
+                    const intKey = interiorKeys[(x + y) % interiorKeys.length];
+                    if (tex.exists(intKey)) {
+                      wallKey = intKey;
+                      wallAlpha = 1;
+                    }
+                  }
+                  if (wallKey) {
+                    const isStone = wallKey === stoneKey || wallKey === lightStoneKey || wallKey === mesoKey;
+                    const ws = this.add.image(x * TILE_PX, y * TILE_PX, wallKey)
+                      .setOrigin(0, 0)
+                      .setDepth(1.05)
+                      .setAlpha(isStone ? 1 : wallAlpha);
+                    ws.setDisplaySize(TILE_PX, TILE_PX);
+                  }
+                }
+              }
+            }
+
+            // Draw windows on the top wall — hardcoded positions (excludes tiles under board/gantt/projector)
+            const windowXs = [1, 2, 28];
+            for (const x of windowXs) {
+              const wx = x * TILE_PX;
+              const wy = 1 * TILE_PX;
+              const wg = this.add.graphics().setDepth(1.1);
+              // Window frame
+              wg.fillStyle(0x4a4a50, 1);
+              wg.fillRoundedRect(wx + 5, wy + 6, 54, 40, 4);
+              // Glass
+              wg.fillStyle(0x88bbdd, 0.8);
+              wg.fillRoundedRect(wx + 8, wy + 9, 48, 34, 3);
+              // Reflection highlight
+              wg.fillStyle(0xaaddee, 0.5);
+              wg.fillRoundedRect(wx + 10, wy + 11, 20, 14, 2);
+              // Cross mullions
+              wg.lineStyle(1.5, 0x4a4a50, 0.8);
+              wg.beginPath();
+              wg.moveTo(wx + 32, wy + 9);
+              wg.lineTo(wx + 32, wy + 43);
+              wg.moveTo(wx + 8, wy + 26);
+              wg.lineTo(wx + 56, wy + 26);
+              wg.strokePath();
+              // Windowsill
+              wg.fillStyle(0x5a5a60, 1);
+              wg.fillRoundedRect(wx + 4, wy + 44, 56, 5, 2);
+            }
+          } else {
+            // World theme — draw theme-specific windows
+            this.drawThemeWindows(walls);
+          }
+
+          // Overlay enhanced procedural furniture on top of the tile-based furniture layer
+          upgradeFurniture(this, furniture, this.worldTheme);
+          upgradeWorkshop(this);
+
+          // Remove old clock tile from furniture layer (clock moved to west wall)
+          furniture.removeTileAt(6, 1, false);
+
+          // Remove wall pictures / posters / papers from the board & gantt area (y=0..2, x=9..26)
+          for (let ry = 0; ry <= 2; ry++) {
+            for (let rx = 9; rx <= 26; rx++) {
+              const ft = furniture.getTileAt(rx, ry);
+              if (ft) furniture.removeTileAt(rx, ry, false);
+            }
+          }
+
+          // Scan for server rack tiles (GID 35 = tile ID 34) for E-interaction
+          this.serverRackTiles = [];
+          for (let y = 0; y < map.height; y++) {
+            for (let x = 0; x < map.width; x++) {
+              const t = furniture.getTileAt(x, y);
+              if (t && (t.index === 35 || t.index === 36)) {
+                this.serverRackTiles.push({ x, y });
+              }
+            }
+          }
+
+          // walkability grid for NPC pathfinding
+          walkable = [];
+          for (let y = 0; y < map.height; y++) {
+            walkable[y] = [];
+            for (let x = 0; x < map.width; x++) {
+              const w = walls.getTileAt(x, y);
+              const f = furniture.getTileAt(x, y);
+              walkable[y][x] = !(w?.properties?.solid || f?.properties?.solid);
+            }
+          }
+          this.grid = new Grid(map.width, map.height, walkable);
+        },
+      },
+      {
+        name: "map objects",
+        fn: () => {
+          if (!map) { console.warn("[scene] skipping map objects — tilemap not loaded"); return; }
+          // points authored in the Tiled map
+          for (const obj of map.getObjectLayer("Points")?.objects ?? []) {
+            const tx = Math.floor((obj.x ?? 0) / TILE_PX);
+            const ty = Math.floor((obj.y ?? 0) / TILE_PX);
+            if (obj.name === "spawn") {
+              this.spawnTile = { x: tx, y: ty };
+            } else if (obj.name === "coffee") {
+              this.coffeeTile = { x: tx, y: ty };
+            } else if (obj.name === "office-manager-seat") {
+              this.officeManagerSeat = { x: tx, y: ty };
+            } else if (obj.name === "office-manager-monitor") {
+              // Side-view monitor on the Office Manager's desk — thin profile, screen faces right toward her
+              const mx = (obj.x ?? 0) + TILE_PX * 0.35;
+              const my = (obj.y ?? 0) - TILE_PX * 0.15;
+              const spr = this.add
+                .sprite(mx, my, MONITOR_SIDE_TEX, "0")
+                .setDepth(10 + (obj.y ?? 0) - 10);
+              this.officeManagerMonitor = spr;
+              spr.setInteractive({ hitArea: new Phaser.Geom.Rectangle(-TILE_PX * 0.3, -TILE_PX * 0.3, TILE_PX * 1.6, TILE_PX * 1.6), hitAreaCallback: Phaser.Geom.Rectangle.Contains, useHandCursor: true });
+              spr.on("pointerdown", () => this.openAgentViewModal(OFFICE_MANAGER_ID));
+            } else if (obj.name === "hermes-seat") {
+              this.hermesSeat = { x: tx, y: ty };
+            } else if (obj.name === "hermes-monitor") {
+              // Side-view monitor on Hermes's desk — thin profile, screen faces left toward him
+              const mx = (obj.x ?? 0) - TILE_PX * 0.35;
+              const my = (obj.y ?? 0) - TILE_PX * 0.15;
+              const spr = this.add
+                .sprite(mx, my, MONITOR_SIDE_TEX, "0")
+                .setDepth(10 + (obj.y ?? 0) - 10)
+                .setFlipX(true);
+              this.hermesMonitor = spr;
+              spr.setInteractive({ hitArea: new Phaser.Geom.Rectangle(-TILE_PX * 0.3, -TILE_PX * 0.3, TILE_PX * 1.6, TILE_PX * 1.6), hitAreaCallback: Phaser.Geom.Rectangle.Contains, useHandCursor: true });
+              spr.on("pointerdown", () => this.openAgentViewModal(HERMES_ID));
+            } else if (obj.name === "wizard-seat") {
+              this.wizardSeat = { x: tx, y: ty };
+            } else if (obj.name.startsWith("seat-")) {
+              const idx = Number(obj.name.slice(5));
+              this.seats[idx] = { x: tx, y: ty };
+              // Create chair sprite at seat position, facing down (unassigned default)
+              const cx = tx * TILE_PX + TILE_PX / 2;
+              const cy = ty * TILE_PX + TILE_PX / 2;
+              const chair = this.add
+                .sprite(cx, cy, resolveChairTex(this, CHAIR_TEX_DOWN))
+                .setDepth(5 + ty * TILE_PX + 1);
+              this.chairs[idx] = chair;
+            } else if (obj.name.startsWith("monitor-")) {
+              const idx = Number(obj.name.slice(8));
+              // Procedural monitor standing on top of desk
+              const mx = (obj.x ?? 0) + TILE_PX / 2;
+              const my = (obj.y ?? 0) - TILE_PX * 0.35;
+              const spr = this.add
+                .sprite(mx, my, MONITOR_TEX, "0")
+                .setDepth(10 + (obj.y ?? 0) - 10);
+              if (isTouchDevice()) {
+                spr.setInteractive({ hitArea: new Phaser.Geom.Rectangle(0, 0, TILE_PX, TILE_PX), hitAreaCallback: Phaser.Geom.Rectangle.Contains, useHandCursor: true });
+              } else {
+                spr.setInteractive({ useHandCursor: true });
+              }
+              spr.on("pointerdown", () => {
+                const agent = [...this.store.agents.values()].find(a => a.deskIndex === idx);
+                if (agent) this.openAgentViewModal(agent.id);
+              });
+              this.monitors[idx] = spr;
+            }
+          }
+          this.doorTile = { x: this.spawnTile.x, y: this.spawnTile.y + 2 };
+          this.registry.set("spawnTile", this.spawnTile);
+
+          // If the tilemap & collision phase crashed, walkable may be undefined.
+          // Rebuild it from the map so door carving doesn't crash.
+          if (!walkable) {
+            walkable = [];
+            const wl = this.mapRef?.getLayer("Walls");
+            const fl = this.mapRef?.getLayer("Furniture");
+            for (let y = 0; y < map.height; y++) {
+              walkable[y] = [];
+              for (let x = 0; x < map.width; x++) {
+                const w = wl?.data?.[y]?.[x];
+                const f = fl?.data?.[y]?.[x];
+                walkable[y][x] = !(w?.properties?.solid || f?.properties?.solid);
+              }
+            }
+          }
+
+          // carve a door gap — make the bottom wall tiles walkable at the door columns
+          // so the player can walk straight out into the world.
+          // The door is 2 tiles wide at spawnTile.x and spawnTile.x+1.
+          const doorX = this.spawnTile.x;
+          const wallsLayer = this.mapRef.getLayer("Walls");
+          const furnitureLayer = this.mapRef.getLayer("Furniture");
+          for (let dy = 0; dy <= 3; dy++) {
+            const ty = this.spawnTile.y + dy;
+            if (ty < map.height) {
+              walkable[ty][doorX] = true;
+              if (doorX + 1 < map.width) walkable[ty][doorX + 1] = true;
+              // Remove wall + furniture tiles at the door so the player can see
+              // the grass outside through the doorway
+              if (wallsLayer) {
+                this.mapRef.removeTileAt(doorX, ty, false, true, "Walls");
+                if (doorX + 1 < map.width) this.mapRef.removeTileAt(doorX + 1, ty, false, true, "Walls");
+              }
+              if (furnitureLayer) {
+                this.mapRef.removeTileAt(doorX, ty, false, true, "Furniture");
+                if (doorX + 1 < map.width) this.mapRef.removeTileAt(doorX + 1, ty, false, true, "Furniture");
+              }
+            }
+          }
+          this.grid = new Grid(map.width, map.height, walkable);
+
+          // Draw doormat at the entrance — the Ground layer is hidden (alpha=0)
+          // so the doormat tiles placed in the map data are invisible. Redraw it.
+          {
+            const dmX = this.doorTile.x * TILE_PX;
+            const dmY = this.doorTile.y * TILE_PX + TILE_PX;
+            const dmW = TILE_PX * 2; // 2-tile wide doormat
+            const dmH = TILE_PX;
+            const dmTexKey = AI_OFFICE_TEXTURES.doormat;
+            if (this.textures.exists(dmTexKey)) {
+              this.add.image(dmX, dmY, dmTexKey)
+                .setOrigin(0, 0)
+                .setDepth(0.5)
+                .setDisplaySize(dmW, dmH);
+              // Procedural "Welcome" text overlay
+              this.add.text(dmX + dmW / 2, dmY + dmH / 2, "Welcome", {
+                fontFamily: "Georgia, serif",
+                fontSize: "14px",
+                color: "#3a2a1a",
+                fontStyle: "bold italic",
+              })
+                .setOrigin(0.5)
+                .setDepth(0.55)
+                .setAlpha(0.8);
+            } else {
+              // Fallback: procedural doormat
+              const dmG = this.add.graphics().setDepth(0.5);
+              // base
+              dmG.fillStyle(0x7a6a42, 1);
+              dmG.fillRect(dmX, dmY, dmW, dmH);
+              // beveled border
+              dmG.fillStyle(0x5a4a2a, 1);
+              dmG.fillRect(dmX, dmY, dmW, 3);
+              dmG.fillRect(dmX, dmY + dmH - 3, dmW, 3);
+              dmG.fillRect(dmX, dmY, 3, dmH);
+              dmG.fillRect(dmX + dmW - 3, dmY, 3, dmH);
+              // ridge texture
+              dmG.fillStyle(0x928050, 1);
+              for (let ry = 6; ry < dmH - 6; ry += 5) {
+                dmG.fillRect(dmX + 4, dmY + ry, dmW - 8, 2);
+              }
+            }
+          }
+
+          // Office Manager — the office manager NPC
+          if (this.officeManagerSeat) {
+            // Create the Office Manager's left-facing chair sprite
+            const ycx = this.officeManagerSeat.x * TILE_PX + TILE_PX / 2;
+            const ycy = this.officeManagerSeat.y * TILE_PX + TILE_PX / 2;
+            this.add
+              .sprite(ycx, ycy, resolveChairTex(this, CHAIR_TEX_LEFT))
+              .setDepth(5 + this.officeManagerSeat.y * TILE_PX + 1);
+
+            this.officeManager = new OfficeManagerNPC(this, this.grid, this.officeManagerSeat, (clicked) =>
+              this.walkToAgent(clicked),
+            );
+
+            // clickable zone over the Office Manager's office — clicking anywhere inside opens her chat
+            const zo = { x0: 22, y0: 8, x1: 27, y1: 11 };
+            const zx = (zo.x0 + zo.x1 + 1) / 2 * TILE_PX;
+            const zy = (zo.y0 + zo.y1 + 1) / 2 * TILE_PX;
+            const zw = (zo.x1 - zo.x0 + 1) * TILE_PX;
+            const zh = (zo.y1 - zo.y0 + 1) * TILE_PX;
+            this.officeManagerOfficeZone = this.add.zone(zx, zy, zw, zh);
+            this.officeManagerOfficeZone.setInteractive({ useHandCursor: true });
+            this.officeManagerOfficeZone.on("pointerdown", () => this.walkToAgent(OFFICE_MANAGER_ID));
+          }
+
+          // Hermes — right-facing chair at the mail room desk
+          if (this.hermesSeat) {
+            const hcx = this.hermesSeat.x * TILE_PX + TILE_PX / 2;
+            const hcy = this.hermesSeat.y * TILE_PX + TILE_PX / 2;
+            this.add
+              .sprite(hcx, hcy, resolveChairTex(this, CHAIR_TEX_RIGHT))
+              .setDepth(5 + this.hermesSeat.y * TILE_PX + 1);
+
+            this.hermes = new HermesNPC(this, this.grid, this.hermesSeat, (clicked) =>
+              this.walkToAgent(clicked),
+            );
+          }
+
+          // Wizard — only present inside deployed worlds (premium world-builder NPC)
+          if (this.wizardSeat && this.store.currentWorld) {
+            const wcx = this.wizardSeat.x * TILE_PX + TILE_PX / 2;
+            const wcy = this.wizardSeat.y * TILE_PX + TILE_PX / 2;
+            this.add
+              .sprite(wcx, wcy, resolveChairTex(this, CHAIR_TEX_DOWN))
+              .setDepth(5 + this.wizardSeat.y * TILE_PX + 1);
+
+            // Generate themed wizard texture if a world theme is active
+            const themeId = this.worldTheme?.id;
+            if (themeId) {
+              const wKey = wizardTextureKey(themeId);
+              const wApp = wizardAppearance(themeId);
+              if (wApp && !this.textures.exists(wKey)) {
+                generateCharTexture(this, wKey, wApp);
+                this.ensureCharAnimations(wKey);
+              }
+            }
+
+            this.wizard = new WizardNPC(this, this.grid, this.wizardSeat, (clicked) =>
+              this.walkToAgent(clicked),
+              themeId,
+            );
+          }
+
+          // standing spots for agents hired beyond the 8 desks — stable order so
+          // every client agrees on who stands where
+          for (let y = 3; y < map.height - 2 && this.extraSpots.length < 96; y++) {
+            for (let x = 2; x < map.width - 2; x++) {
+              if (!walkable[y][x] || (x + y) % 3 !== 0) continue;
+              if (this.seats.some((s) => s && s.x === x && s.y === y)) continue;
+              if (this.officeManagerSeat && this.officeManagerSeat.x === x && this.officeManagerSeat.y === y) continue;
+              if (this.hermesSeat && this.hermesSeat.x === x && this.hermesSeat.y === y) continue;
+              if (this.wizardSeat && this.wizardSeat.x === x && this.wizardSeat.y === y) continue;
+              this.extraSpots.push({ x, y });
+            }
+          }
+        },
+      },
+      {
+        name: "player & UI",
+        fn: () => {
+          // Generate boss texture from player appearance (if set)
+          this.refreshBossTexture();
+
+          // the boss (you) — spawn at last known position if available
+          const myPresence = this._myUserId ? this.store.roomPlayers.get(this._myUserId) : null;
+          const spawnX = myPresence?.x ?? feetOf(this.spawnTile).x;
+          const spawnY = myPresence?.y ?? feetOf(this.spawnTile).y;
+          this.player = this.add.sprite(spawnX, spawnY, this.playerTexKey, 0)
+            .setOrigin(0.5, 1)
+            .setScale(1);
+          // no physics body — we do manual movement for smoothness
+
+          this.playerNameBg = this.add.graphics();
+          this.playerLabel = this.add
+            .text(0, 0, "BOSS", {
+              fontFamily: "'M PLUS Rounded 1c', sans-serif",
+              fontSize: "18px",
+              color: "#ffffff",
+              stroke: "#0d1018",
+              strokeThickness: 4,
+            })
+            .setResolution(4)
+            .setOrigin(0.5, 1)
+            .setScale(0.75);
+          this.drawPlayerNameBg(0x3a8cd4);
+
+          this.selectRing = this.add
+            .ellipse(0, 0, 56, 24)
+            .setStrokeStyle(2, 0x3a8cd4)
+            .setFillStyle(0, 0)
+            .setVisible(false)
+            .setDepth(9);
+
+          // --- task board on the front wall ---
+          this.drawBoard();
+          this.drawGanttChart();
+          this.drawProjector();
+          this.drawPhoneBooth();
+          this.drawScreenShareStation();
+          this.drawClock();
+          this.drawTrophyCase();
+          this.drawWeaponRack();
+          this.drawHallOfFameBoard();
+          this.drawExterior();
+          this.drawRedButton();
+          this.drawWardrobe();
+          this.drawNemesisTerminal();
+          this.boardHint = this.makeHint();
+          this.ganttHint = this.makeHint();
+
+          this.coffeeHint = this.makeHint();
+          this.fridgeHint = this.makeHint();
+          this.coolerHint = this.makeHint();
+          this.clockHint = this.makeHint();
+          this.projectorControlHint = this.makeHint();
+          this.projectorSpeakerHint = this.makeHint();
+          this.vendingHint = this.makeHint();
+          this.sofaHint = this.makeHint();
+          this.filingHint = this.makeHint();
+          this.plantHint = this.makeHint();
+          this.trophyHint = this.makeHint();
+          this.hallOfFameHint = this.makeHint();
+          this.serverRackHint = this.makeHint();
+          this.warTableHint = this.makeHint();
+          this.scrapBinHint = this.makeHint();
+          this.radioHint = this.makeHint();
+          this.workbenchHint = this.makeHint();
+          this.researchHint = this.makeHint();
+          this.mailboxHint = this.makeHint();
+          this.platformMailboxHint = this.makeHint();
+          this.redButtonHint = this.makeHint();
+          this.wardrobeHint = this.makeHint();
+          this.nemesisTerminalHint = this.makeHint();
+          this.projectorHint = this.makeHint();
+          this.phoneBoothHint = this.makeHint();
+          this.screenShareHint = this.makeHint();
+          this.allHints = [
+            this.boardHint, this.ganttHint, this.coffeeHint, this.fridgeHint, this.coolerHint,
+            this.clockHint, this.vendingHint, this.sofaHint, this.filingHint,
+            this.plantHint, this.mailboxHint, this.platformMailboxHint,
+            this.redButtonHint, this.wardrobeHint, this.nemesisTerminalHint,
+            this.projectorHint,
+            this.projectorControlHint, this.projectorSpeakerHint,
+            this.phoneBoothHint, this.screenShareHint, this.trophyHint,
+            this.hallOfFameHint, this.serverRackHint, this.warTableHint,
+            this.scrapBinHint, this.radioHint, this.workbenchHint,
+            this.researchHint,
+          ];
+        },
+      },
+      {
+        name: "interactables",
+        fn: () => {
+          // Set interactable tile positions based on theme
+          this.setupInteractables();
+
+          // Initialize platform mailboxes in the mail room from settings
+          this.platformMailboxes = this.buildPlatformMailboxes();
+          this.platformMailboxGfx = this.add.graphics().setDepth(6);
+          this.drawPlatformMailboxes();
+
+          // Sync mailbox state from the store (populated by server on connect)
+          for (const mb of this.platformMailboxes) {
+            if (!mb.platform) continue;
+            const state = this.store.platformMailboxes.get(mb.platform);
+            if (state) {
+              mb.flagUp = state.flagUp;
+              mb.pendingCount = state.pendingCount;
+              mb.lastMessage = state.lastMessage;
+            }
+          }
+          this.drawPlatformMailboxes();
+
+          // Subscribe to platform connection state updates (Hermes Agent gateway)
+          this.store.onPlatformConnection(() => {
+            this.drawPlatformMailboxes();
+          });
+
+          // Subscribe to live mailbox updates from the server
+          this.store.onMailboxUpdate((platform, flagUp, pendingCount, lastMessage, assignedAgentId) => {
+            const mb = this.platformMailboxes.find((m) => m.platform === platform);
+            if (!mb) return;
+            const wasUp = mb.flagUp;
+            mb.flagUp = flagUp;
+            mb.pendingCount = pendingCount;
+            mb.lastMessage = lastMessage;
+            this.drawPlatformMailboxes();
+
+            // When a flag goes up, have Hermes walk to the mailbox to sort
+            if (flagUp && !wasUp && this.hermes) {
+              this.hermes.sortMail(mb.tile);
+
+              // After sorting (~4s), deliver to the assigned agent's desk
+              this.time.delayedCall(4500, () => {
+                if (!this.hermes) return;
+                // Use the assigned agent from the server if available
+                if (assignedAgentId) {
+                  const npc = this.npcs.get(assignedAgentId);
+                  if (npc) {
+                    this.hermes.deliverTo(npc.tile());
+                    return;
+                  }
+                }
+                // Fallback: deliver to a random idle agent's desk
+                const idleAgents: { id: string; tile: import("./path").Tile }[] = [];
+                for (const [id, npc] of this.npcs) {
+                  const info = this.store.agents.get(id);
+                  if (info && info.status === "idle" && info.role !== "manager") {
+                    idleAgents.push({ id, tile: npc.tile() });
+                  }
+                }
+                if (idleAgents.length > 0) {
+                  const target = idleAgents[Math.floor(Math.random() * idleAgents.length)];
+                  this.hermes.deliverTo(target.tile);
+                }
+              });
+            }
+          });
+
+          // NPC speech bubbles from server (e.g. concierge nudges as speech)
+          this.store.npcSpeechListeners.push((npcId, text, durationMs) => {
+            this.showNpcSpeechBubble(npcId, text, durationMs);
+          });
+
+          // Subscribe to mailbox message responses — only open a new panel if
+          // one isn't already open for this platform (live updates are handled
+          // by the MailboxConversation's own internal liveHandler).
+          this.store.onMailboxMessages((platform, events) => {
+            if (this.mailboxConversation) return; // panel already open, let its liveHandler deal with it
+            if (events.length === 0) {
+              this.store.toast(`[${platform}] No messages.`);
+              return;
+            }
+            this.showMailboxConversationModal(platform, events);
+            const mb = this.platformMailboxes.find((m) => m.platform === platform);
+            if (mb) {
+              const mbPx = { x: mb.tile.x * TILE_PX + TILE_PX / 2, y: mb.tile.y * TILE_PX + TILE_PX / 2 };
+              this.world.vfx.sparkBurst(mbPx.x, mbPx.y, mb.color, 8, 50);
+              this.world.audio.uiClick();
+            }
+          });
+
+          // Subscribe to mail digest responses
+          const mailDigestHandler = (digest: { totalUnread: number; byPlatform: { platform: string; unread: number; lastMessage: string }[]; queued: number }) => {
+            if (digest.totalUnread === 0 && digest.queued === 0) {
+              this.store.toast("📬 No new mail across any platform.");
+              return;
+            }
+            const parts: string[] = [];
+            for (const p of digest.byPlatform) {
+              if (p.unread > 0) parts.push(`${p.platform}: ${p.unread}`);
+            }
+            const queuedStr = digest.queued > 0 ? ` + ${digest.queued} queued` : "";
+            this.store.toast(`📬 ${digest.totalUnread} unread (${parts.join(", ")})${queuedStr}`);
+          };
+          this.store.onMailDigest(mailDigestHandler);
+          this.events.once("shutdown", () => this.store.offMailDigest(mailDigestHandler));
+        },
+      },
+      {
+        name: "world layer",
+        fn: async () => {
+          if (!map) { console.warn("[scene] skipping world layer — tilemap not loaded"); return; }
+          this.sceneStart = this.time.now;
+
+          this.mapPx = { w: map.widthInPixels, h: map.heightInPixels };
+          // world layer — infinite procedural world outside the office
+          this.world = new WorldLayer(this, this.store, this.game.registry.get("net"), map.widthInPixels, map.heightInPixels);
+          this.world.setOfficeGrid(this.grid);
+
+          // Request worker generation for all door chunks and preload any cached
+          // canvas textures from IndexedDB. Then wait for the worker to finish
+          // generating all chunks and render them — all during the loading screen
+          // so the game is fully responsive when the loading screen ends.
+          const doorChunks = this.world.getDoorChunkList();
+          this.world.preGenerateChunks(doorChunks);
+          await this.world.preloadCachedCanvases(doorChunks);
+          await this.world.waitForChunksAndRender(doorChunks);
+        },
+      },
+      {
+        name: "world cleanup & lighting",
+        fn: () => {
+          if (!this.world) { console.warn("[scene] skipping world cleanup — world layer not initialized"); return; }
+          // Warm up the particle system so the first biome ambient doesn't cause a
+          // stutter.  The first ParticleEmitter render compiles WebGL shaders and
+          // allocates GPU buffers.  We create the emitter now and let it render for
+          // a few frames (during the loading screen) before destroying it — the
+          // compiled shader stays cached in Phaser's shader manager.
+          this.world.vfx.startAmbient("meadow");
+          this.time.delayedCall(200, () => this.world.vfx.stopAmbient());
+
+          // flower beds flanking the front door
+          const doorPxX = this.spawnTile.x * TILE_PX + TILE_PX / 2;
+          const doorPxY = map.heightInPixels;
+          const flowerG = this.add.graphics().setDepth(3);
+          const flowerColors = [0xe8c84a, 0xe84a8a, 0x8a4ae8, 0xff6a4a, 0x4ae8ca];
+          for (const side of [-1, 1]) {
+            for (let i = 0; i < 6; i++) {
+              const fx = doorPxX + side * (TILE_PX * 1.5 + i * 14);
+              const fy = doorPxY + 10 + Math.sin(i * 1.7) * 8;
+              const color = flowerColors[(i + (side > 0 ? 2 : 0)) % flowerColors.length];
+              flowerG.fillStyle(0x2a6a2a, 1);
+              flowerG.fillCircle(fx, fy + 5, 3);
+              flowerG.fillStyle(color, 1);
+              flowerG.fillCircle(fx, fy, 5);
+              flowerG.fillStyle(0xffdd44, 1);
+              flowerG.fillCircle(fx, fy, 2);
+            }
+          }
+
+          // conspicuous mailbox to the left of the front door
+          this.mailboxPx = { x: doorPxX - TILE_PX * 3, y: doorPxY + 24 };
+          this.mailboxGfx = this.add.graphics().setDepth(3);
+          this.mailboxHasMail = true; // start with mail
+          this.mailboxNextMail = this.time.now + 45000; // next mail arrives in 45s
+          this.drawMailbox();
+
+          const cam = this.cameras.main;
+          // no camera bounds — the world is infinite
+          cam.startFollow(this.player, false, 0.1, 0.1);
+          cam.roundPixels = true;
+          cam.setZoom(this.defaultZoom());
+
+          // --- camera controls: pinch-zoom, wheel-zoom, pan, tap-to-walk ---
+          this.setupCameraControls();
+
+          // --- lighting system ---
+          // vignette: darkened edges fixed to screen
+          this.lightingOverlay = this.add.graphics().setDepth(900).setScrollFactor(0);
+          this.drawVignette();
+
+          // day/night tint and brightness boost are handled by LightingSystem
+          // (lighting.ts) — no duplicate overlays needed here.
+
+          const onResize = () => {
+            if (this.userZoom === null) {
+              cam.setZoom(this.defaultZoom());
+            } else {
+              cam.setZoom(this.clampZoom(this.userZoom));
+            }
+            this.drawVignette();
+          };
+          this.scale.on("resize", onResize);
+          this.events.once("shutdown", () => this.scale.off("resize", onResize));
+
+          // monitor glow pool — one per monitor slot
+          this.monitors.forEach(() => {
+            const glow = this.add.circle(0, 0, 48, 0x4affa8, 0).setDepth(8).setBlendMode(Phaser.BlendModes.ADD);
+            this.monitorGlows.push(glow);
+          });
+
+          // IDE Bridge: create terminal stations for external CLI tools
+          this.createTerminalStations();
+          this.createWallDashboard();
+
+          this.cursors = this.input.keyboard!.createCursorKeys();
+          // createCursorKeys captures SPACE by default — remove that capture so
+          // it can be typed into DOM inputs (chat box, task field, etc.)
+          this.input.keyboard!.removeCapture(Phaser.Input.Keyboard.KeyCodes.SPACE);
+          // addKey with enableCapture=false: Phaser still tracks isDown/JustDown
+          // but does NOT preventDefault() on keydown — so DOM inputs (chat box,
+          // task field, etc.) receive W/A/S/D/E/Q/R/T/M/SPACE keystrokes normally.
+          const kb = this.input.keyboard!;
+          this.keys = {
+            W: kb.addKey("W", false),
+            A: kb.addKey("A", false),
+            S: kb.addKey("S", false),
+            D: kb.addKey("D", false),
+            E: kb.addKey("E", false),
+            Q: kb.addKey("Q", false),
+            R: kb.addKey("R", false),
+            T: kb.addKey("T", false),
+            M: kb.addKey("M", false),
+            SPACE: kb.addKey("SPACE", false),
+          };
+          this.input.keyboard!.on("keydown-ESC", () => {
+            if (this.decorationMode) {
+              this.exitDecorationMode();
+              return;
+            }
+            this.store.select(null);
+            this.store.toggleBoard(false);
+          });
+          // never swallow keystrokes meant for HUD inputs (onboarding, task box, …)
+          this.input.keyboard!.disableGlobalCapture();
+
+          // --- hotbar UI ---
+          this.createHotbar();
+          // number keys 1-6 select hotbar slots
+          for (let i = 1; i <= 6; i++) {
+            this.input.keyboard!.on(`keydown-${i}`, () => {
+              const tag = document.activeElement?.tagName;
+              if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+              this.world.inventory.setActive(i - 1);
+              const wt = this.world.inventory.getActiveWeaponType();
+              if (wt) this.world.equipWeapon(wt);
+            });
+          }
+          // I key toggles hotbar visibility
+          this.input.keyboard!.on("keydown-I", () => {
+            const tag = document.activeElement?.tagName;
+            if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+            this.hotbarVisible = !this.hotbarVisible;
+            this.updateHotbar();
+          });
+
+          if (!this.wired) {
+            this.wired = true;
+            this.lastRoomId = this.store.roomId;
+            this.store.subscribe(() => {
+              if (!this.ready) {
+                return;
+              }
+              // Room changed — restart scene with appropriate theme
+              if (this.store.roomId !== this.lastRoomId) {
+                console.log(`[scene] room changed: ${this.lastRoomId} → ${this.store.roomId}`);
+                this.lastRoomId = this.store.roomId;
+                this.ready = false;
+                this.remotePlayers.clear();
+                this.scene.restart();
+                return;
+              }
+              if (this.store.roomId === null) return; // room_state not yet received — skip theme check
+              const isHq2 = this.store.roomId === "hq2" || this.store.isOrgRoom;
+              const desiredTheme = this.registry.get("worldTheme")
+                ? "world"
+                : isHq2 ? "agentHeights" : (this.store.settings.game.theme === "agentHeights" ? "agentHeights" : "classic");
+              if (desiredTheme !== this.theme) {
+                console.log("[scene] theme changed — restarting scene");
+                if (desiredTheme === "agentHeights") achievements.unlock("agentHeights_mode");
+                this.ready = false;
+                this.remotePlayers.clear();
+                this.scene.restart();
+                return;
+              }
+              // refresh boss texture if player appearance changed
+              const prevKey = this.playerTexKey;
+              const regenerated = this.refreshBossTexture();
+              if ((regenerated || prevKey !== this.playerTexKey) && this.player) {
+                this.player.setTexture(this.playerTexKey, 0).setScale(1);
+              }
+              // Rebuild mailboxes if platform assignments changed
+              const prevPlatforms = this.platformMailboxes.map((m) => m.platform).join(",");
+              const newPlatforms = (this.store.settings.mailboxPlatforms ?? []).join(",");
+              if (prevPlatforms !== newPlatforms) {
+                this.platformMailboxes = this.buildPlatformMailboxes();
+                for (const mb of this.platformMailboxes) {
+                  if (!mb.platform) continue;
+                  const state = this.store.platformMailboxes.get(mb.platform);
+                  if (state) {
+                    mb.flagUp = state.flagUp;
+                    mb.pendingCount = state.pendingCount;
+                    mb.lastMessage = state.lastMessage;
+                  }
+                }
+                this.drawPlatformMailboxes();
+              }
+              if (this.store.agentsDirty) {
+                this.store.agentsDirty = false;
+                this.syncAgents();
+              }
+              this.world.syncGhosts();
+              this.updateChimneySmoke();
+              this.renderDecorations();
+            });
+            this.store.onHuddle((agentIds) => {
+              if (this.ready) this.startHuddle(agentIds);
+            });
+            this.store.onHelicopter((delivery) => {
+              console.log(`[heli-debug] onHelicopter callback: ready=${this.ready}, heliActive=${this.heliActive}, name=${delivery?.name}`);
+              if (!this.ready) return;
+              if (this.heliActive) {
+                this.pendingHeliDeliveries.push(delivery);
+              } else {
+                this.triggerHelicopter(delivery);
+              }
+            });
+            this.store.onPaymentRequired((reason, _message) => {
+              if (this.heliActive && reason === "agent_limit") {
+                console.log("[heli-debug] payment_required received — cancelling helicopter animation");
+                this.heliContainer?.destroy();
+                this.heliContainer = null;
+                this.heliRotor = null;
+                this.heliAgent?.destroy();
+                this.heliAgent = null;
+                this.heliElevatorGfx?.destroy();
+                this.heliElevatorGfx = null;
+                this.heliActive = false;
+                this.heliDelivery = null;
+                this.heliSound?.stop();
+                this.heliSound = null;
+                this.pendingHeliAgents = [];
+                this.pendingHeliDeliveries = [];
+              }
+            });
+            this.store.onAssembly((agentIds) => {
+              if (this.ready) this.startAssembly(agentIds);
+            });
+            this.store.onNpcState((npcId, x, y, dir, state) => {
+              if (!this.ready || this.store.roomId === "hq2") return;
+              if (npcId === OFFICE_MANAGER_ID) this.officeManager?.remoteUpdate(x, y, dir, state);
+              else if (npcId === HERMES_ID) this.hermes?.remoteUpdate(x, y, dir, state);
+              else if (npcId === WIZARD_ID) this.wizard?.remoteUpdate(x, y, dir, state);
+            });
+            this.store.onTileUpdated((cx, cy, tileIndex, tile) => {
+              if (!this.ready) return;
+              this.world.applyRemoteTileUpdate(cx, cy, tileIndex, tile);
+            });
+            this.store.onEmote((agentId, emote) => {
+              if (!this.ready) return;
+              const npc = this.npcs.get(agentId);
+              if (npc) npc.showEmote(emote);
+            });
+            this.store.onAgentChat((fromId, _toId, _fromName, _toName, _text) => {
+              if (!this.ready) return;
+              const npc = this.npcs.get(fromId);
+              if (npc) npc.showEmote("💬", 4000);
+            });
+            this.store.onFuseEffect((agentAId, agentBId, fusedId) => {
+              if (!this.ready) return;
+              const npcA = this.npcs.get(agentAId);
+              const npcB = this.npcs.get(agentBId);
+              if (npcA && npcB) {
+                const ax = npcA.container.x;
+                const ay = npcA.container.y;
+                const bx = npcB.container.x;
+                const by = npcB.container.y;
+                const mx = (ax + bx) / 2;
+                const my = (ay + by) / 2;
+                // Walk both agents to the midpoint
+                this.tweens.add({ targets: npcA.container, x: mx, y: my, duration: 600, ease: "Quad.easeIn" });
+                this.tweens.add({ targets: npcB.container, x: mx, y: my, duration: 600, ease: "Quad.easeIn" });
+                // Flash + particles at the meeting point
+                this.time.delayedCall(600, () => {
+                  this.world.vfx.sparkBurst(mx, my, 0xffdd44, 30, 150);
+                  this.world.vfx.shockwave(mx, my, 0xffffff, 5);
+                  this.world.vfx.celebrate(mx, my);
+                  this.cameras.main.flash(200, 255, 255, 255);
+                  this.cameras.main.shake(300, 0.008);
+                });
+              }
+            });
+            // IDE Bridge: sync terminal stations when external sessions change
+            this.store.externalSessionListeners.push(() => {
+              if (this.ready) { this.syncTerminalStations(); this.syncWallDashboard(); }
+            });
+            // Org-level: also sync when org member sessions change
+            this.store.orgExternalSessionListeners.push(() => {
+              if (this.ready) { this.syncTerminalStations(); this.syncWallDashboard(); }
+            });
+          }
+          this.ready = true;
+          console.log(`[scene] this.ready = true at ${performance.now().toFixed(0)}ms`);
+
+          // If room_state arrived while scene was loading, restart to match
+          if (this.store.roomId !== this.lastRoomId) {
+            console.log(`[scene] ready but room mismatch: lastRoomId=${this.lastRoomId} store.roomId=${this.store.roomId} — restarting at ${performance.now().toFixed(0)}ms`);
+            this.lastRoomId = this.store.roomId;
+            this.ready = false;
+            this.remotePlayers.clear();
+            this.scene.restart();
+            return;
+          }
+
+          // Theme consistency check: room_state may have arrived during the
+          // phased init (before the store listener was wired), so lastRoomId
+          // already matches but the theme was set from a null roomId default
+          // to "agentHeights".  Restart if the current room requires a different theme.
+          if (this.store.roomId !== null) {
+            const isHq2 = this.store.roomId === "hq2" || this.store.isOrgRoom;
+            const desiredTheme = this.registry.get("worldTheme")
+              ? "world"
+              : isHq2 ? "agentHeights" : (this.store.settings.game.theme === "agentHeights" ? "agentHeights" : "classic");
+            if (desiredTheme !== this.theme) {
+              console.log(`[scene] ready but theme mismatch: theme=${this.theme} desired=${desiredTheme} (roomId=${this.store.roomId}) — restarting at ${performance.now().toFixed(0)}ms`);
+              this.ready = false;
+              this.remotePlayers.clear();
+              this.scene.restart();
+              return;
+            }
+          }
+
+          // Sync player position from room_state if it arrived after sprite creation
+          if (this._myUserId) {
+            const me = this.store.roomPlayers.get(this._myUserId);
+            if (me && this.player) {
+              this.player.setPosition(me.x, me.y);
+            }
+          }
+
+          // Refresh boss texture now that scene is ready — the snapshot
+          // (carrying player.appearance) may have arrived during scene init,
+          // before the store subscriber was active (guarded by this.ready).
+          const prevKey = this.playerTexKey;
+          const regenerated = this.refreshBossTexture();
+          if ((regenerated || prevKey !== this.playerTexKey) && this.player) {
+            this.player.setTexture(this.playerTexKey, 0).setScale(1);
+          }
+
+          this.syncAgents();
+          this.world.syncGhosts();
+
+          // If inside a deployed world, spawn return portal at spawn point
+          if (this.store.currentWorld) {
+            this.spawnReturnPortal();
+          }
+
+          // Fade in from black so the transition from BootScene is seamless.
+          // Use a longer fade when transitioning between worlds.
+          const worldFadeIn = this.registry.get("worldFadeIn") as boolean | undefined;
+          if (worldFadeIn) {
+            this.cameras.main.fadeIn(600, 10, 10, 30);
+            this.registry.remove("worldFadeIn");
+          } else {
+            this.cameras.main.fadeIn(400, 0, 0, 0);
+          }
+
+          // Clean up loading overlay
+          loadingOverlay.remove();
+
+          // All chunks are already pre-loaded and rendered during the "world layer" phase.
+
+          // Schedule golf ball cleanup after chunks have had time to load
+          // via the update loop's updateChunks.  Non-blocking.
+          this.time.delayedCall(3000, () => {
+            if (this.scene.isActive()) this.world.finishDoorPreload();
+          });
+        },
+      },
+    ];
+
+    // Process phases one per frame so the loading bar visibly progresses.
+    // All phases are pre-allocated, so the total is stable from the first
+    // frame — no progress bar glitches.  Phases may be sync or async.
+    let phaseIndex = 0;
+    const totalPhases = phases.length;
+
+    const processNextPhase = () => {
+      if (phaseIndex >= phases.length) {
+        // All phases done — clean up loading overlay regardless of crashes
+        loadingOverlay.remove();
+        return;
+      }
+
+      const phase = phases[phaseIndex];
+
+      // Skip phases marked as skip — process them instantly without a frame delay.
+      if (phase.skip) {
+        phaseIndex++;
+        processNextPhase();
+        return;
+      }
+
+      const progress = phaseIndex / totalPhases;
+      loadingOverlay.updateProgress(progress, `Building ${phase.name}…`);
+
+      // Run the phase on the next frame so the bar update renders first
+      this.time.delayedCall(0, () => {
+        const phaseStart = performance.now();
+        try {
+          const result = phase.fn() as unknown;
+          if (result instanceof Promise) {
+            // Async phase — wait for completion before advancing
+            result.then(() => {
+              console.log(`[scene] phase "${phase.name}" done in ${(performance.now() - phaseStart).toFixed(0)}ms`);
+              phaseIndex++;
+              loadingOverlay.updateProgress(phaseIndex / totalPhases, `Done: ${phase.name}`);
+              this.time.delayedCall(0, processNextPhase);
+            }).catch((err) => {
+              console.error(`[scene] PHASE "${phase.name}" REJECTED:`, err);
+              phaseIndex++;
+              loadingOverlay.updateProgress(phaseIndex / totalPhases, `Done: ${phase.name}`);
+              this.time.delayedCall(0, processNextPhase);
+            });
+          } else {
+            console.log(`[scene] phase "${phase.name}" done in ${(performance.now() - phaseStart).toFixed(0)}ms`);
+            phaseIndex++;
+            loadingOverlay.updateProgress(phaseIndex / totalPhases, `Done: ${phase.name}`);
+            this.time.delayedCall(0, processNextPhase);
+          }
+        } catch (err) {
+          console.error(`[scene] PHASE "${phase.name}" CRASHED:`, err);
+          phaseIndex++;
+          loadingOverlay.updateProgress(phaseIndex / totalPhases, `Done: ${phase.name}`);
+          this.time.delayedCall(0, processNextPhase);
+        }
+      });
+    };
+
+    // Start processing on the next frame
+    this.time.delayedCall(0, processNextPhase);
+
+    // Safety net: remove loading overlay after 20s no matter what
+    this.time.delayedCall(20000, () => {
+      if (loadingOverlay.exists()) {
+        console.warn("[scene] loading overlay still present after 20s — force removing");
+        loadingOverlay.remove();
+      }
+    });
+  }
+
+  /** Draw rounded background behind player nameplate with accent bar. */
+  private drawPlayerNameBg(accentColor: number = 0x3a8cd4): void {
+    const g = this.playerNameBg;
+    g.clear();
+    const w = this.playerLabel.displayWidth + 22;
+    const h = 22;
+    const r = 5;
+    const x = -w / 2;
+    const y = -18;
+    g.fillStyle(0x0d1018, 0.78);
+    g.fillRoundedRect(x, y, w, h, r);
+    g.fillStyle(accentColor, 0.85);
+    g.fillRect(x + 2, y + 3, 3, h - 6);
+    g.lineStyle(1, 0xffffff, 0.18);
+    g.strokeRoundedRect(x, y, w, h, r);
+  }
+
+  /** Draw the vignette overlay — disabled (was causing visible black frame). */
+  private drawVignette(): void {
+    this.lightingOverlay?.clear();
+  }
+
+  /** Create a gradient sky background and drifting cloud sprites. */
+  private createSky(): void {
+    // Sky gradient drawn as a Graphics object with horizontal color strips.
+    // World-space, repositioned each frame to cover the camera's world view.
+    this.skyGfx = this.add.graphics().setDepth(-2);
+
+    const skyCfg = this.worldTheme?.sky;
+    const cloudStyle = skyCfg?.cloudStyle ?? "fluffy";
+    const cloudCount = skyCfg?.cloudCount ?? 5;
+    const cloudTint = skyCfg?.cloudTint ?? 0xffffff;
+
+    if (cloudStyle === "none") {
+      // No clouds — skip texture generation and sprite creation entirely
+      return;
+    }
+
+    // --- Cloud textures (3 variants) ---
+    for (let i = 0; i < 3; i++) {
+      const key = `cloud-${i}`;
+      if (!this.textures.exists(key)) {
+        this.generateCloudTexture(key, i);
+      }
+    }
+
+    // --- Cloud sprites (world-space above the office) ---
+    for (let i = 0; i < cloudCount; i++) {
+      const cloudTex = `cloud-${i % 3}`;
+      const x = Math.random() * 2000 - 1000;
+      const y = -200 - Math.random() * 400;
+      const scale = (0.5 + Math.random() * 1.0) * 1.5;
+      const baseAlpha = cloudStyle === "dark"
+        ? 0.2 + Math.random() * 0.2
+        : cloudStyle === "wispy"
+          ? 0.25 + Math.random() * 0.2
+          : 0.4 + Math.random() * 0.35;
+      const speed = cloudStyle === "wispy"
+        ? 8 + Math.random() * 12
+        : 15 + Math.random() * 25;
+      const phase = Math.random() * Math.PI * 2;
+      const fadeSpeed = 0.0008 + Math.random() * 0.0007;
+
+      const sprite = this.add.image(x, y, cloudTex)
+        .setOrigin(0.5, 0.5)
+        .setDepth(-1.5)
+        .setScale(scale)
+        .setAlpha(baseAlpha)
+        .setTint(cloudTint);
+
+      this.clouds.push({ sprite, speed, baseAlpha, phase, fadeSpeed, yBase: y });
+    }
+  }
+
+  /** Draw the sky gradient as horizontal strips covering the camera world view. */
+  private drawSkyGradient(): void {
+    const cam = this.cameras.main;
+    const view = cam.worldView;
+    if (this.lastSkyView &&
+        Math.abs(this.lastSkyView.x - view.x) < 2 &&
+        Math.abs(this.lastSkyView.y - view.y) < 2 &&
+        Math.abs(this.lastSkyView.w - view.width) < 2 &&
+        Math.abs(this.lastSkyView.h - view.height) < 2) {
+      return;
+    }
+    this.lastSkyView = { x: view.x, y: view.y, w: view.width, h: view.height };
+    this.skyGfx.clear();
+
+    // Gradient stops (top to bottom) — theme override or default blue sky
+    const themeStops = this.worldTheme?.sky?.gradientStops;
+    const stops = themeStops ?? [
+      { pos: 0.0,  r: 0x4a, g: 0x7a, b: 0x9e },
+      { pos: 0.4,  r: 0x6a, g: 0x9a, b: 0xbe },
+      { pos: 0.75, r: 0x9a, g: 0xb8, b: 0xd4 },
+      { pos: 1.0,  r: 0xc4, g: 0xd8, b: 0xe8 },
+    ];
+
+    const strips = 16;
+    for (let i = 0; i < strips; i++) {
+      const t = i / (strips - 1);
+      let s0 = stops[0], s1 = stops[stops.length - 1];
+      for (let j = 0; j < stops.length - 1; j++) {
+        if (t >= stops[j].pos && t <= stops[j + 1].pos) {
+          s0 = stops[j];
+          s1 = stops[j + 1];
+          break;
+        }
+      }
+      const localT = (t - s0.pos) / (s1.pos - s0.pos);
+      const r = Math.round(s0.r + (s1.r - s0.r) * localT);
+      const g = Math.round(s0.g + (s1.g - s0.g) * localT);
+      const b = Math.round(s0.b + (s1.b - s0.b) * localT);
+      const color = (r << 16) | (g << 8) | b;
+
+      const stripY = view.y + Math.floor((i / strips) * view.height);
+      const stripH = Math.ceil(view.height / strips) + 1;
+      this.skyGfx.fillStyle(color, 1);
+      this.skyGfx.fillRect(view.x, stripY, view.width, stripH);
+    }
+  }
+
+  /** Reposition sky to cover camera view + drift clouds. Called every frame. */
+  private updateSky(dt: number): void {
+    // Redraw sky gradient to cover the camera's current world view
+    this.drawSkyGradient();
+
+    // Clouds: drift in world space, subtle alpha pulse, gentle vertical bob, wrap edges
+    const cam = this.cameras.main;
+    const view = cam.worldView;
+    const t = this.time.now;
+    for (const c of this.clouds) {
+      // Horizontal drift
+      c.sprite.x += c.speed * dt / 1000;
+      const halfW = c.sprite.displayWidth / 2;
+      if (c.sprite.x - halfW > view.x + view.width) {
+        c.sprite.x = view.x - halfW;
+      }
+      // Vertical bob around yBase
+      c.sprite.y = c.yBase + Math.sin(t * 0.0004 + c.phase) * 25;
+      // Subtle alpha pulse: oscillates between 30% and 100% of baseAlpha (never fully invisible)
+      const pulse = 0.65 + 0.35 * Math.sin(t * c.fadeSpeed + c.phase);
+      c.sprite.setAlpha(c.baseAlpha * pulse);
+    }
+  }
+
+  /** Generate a soft, fluffy cloud texture using overlapping radial gradients + blur. */
+  private generateCloudTexture(key: string, variant: number): void {
+    const cw = 256;
+    const ch = 128;
+    const canvas = document.createElement("canvas");
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext("2d")!;
+    ctx.filter = "blur(8px)";
+
+    const blobSets = [
+      [
+        { x: 60, y: 70, r: 38 }, { x: 90, y: 58, r: 46 }, { x: 128, y: 62, r: 42 },
+        { x: 165, y: 68, r: 36 }, { x: 105, y: 78, r: 50 }, { x: 140, y: 82, r: 44 },
+        { x: 75, y: 80, r: 32 }, { x: 185, y: 76, r: 30 },
+      ],
+      [
+        { x: 55, y: 72, r: 34 }, { x: 85, y: 60, r: 42 }, { x: 120, y: 64, r: 38 },
+        { x: 155, y: 70, r: 32 }, { x: 100, y: 80, r: 46 }, { x: 135, y: 84, r: 40 },
+        { x: 175, y: 78, r: 28 }, { x: 70, y: 82, r: 28 },
+      ],
+      [
+        { x: 70, y: 66, r: 40 }, { x: 105, y: 72, r: 48 }, { x: 140, y: 60, r: 38 },
+        { x: 175, y: 72, r: 34 }, { x: 120, y: 84, r: 44 }, { x: 155, y: 80, r: 36 },
+        { x: 90, y: 82, r: 30 }, { x: 195, y: 80, r: 26 },
+      ],
+    ];
+    const blobs = blobSets[variant % 3];
+
+    for (const blob of blobs) {
+      const grad = ctx.createRadialGradient(blob.x, blob.y, 0, blob.x, blob.y, blob.r);
+      grad.addColorStop(0, "rgba(255, 255, 255, 0.85)");
+      grad.addColorStop(0.3, "rgba(255, 255, 255, 0.6)");
+      grad.addColorStop(0.7, "rgba(255, 255, 255, 0.25)");
+      grad.addColorStop(1, "rgba(255, 255, 255, 0)");
+      ctx.fillStyle = grad;
+      ctx.fillRect(blob.x - blob.r, blob.y - blob.r, blob.r * 2, blob.r * 2);
+    }
+
+    this.textures.addImage(key, canvas as unknown as HTMLImageElement);
+  }
+
+  /** Update lighting: monitor glows (or smoke puffs for smoking theme), day/night cycle, vignette refresh. */
+  private updateLighting(time: number): void {
+    // Day/night darkness and brightness boost are handled by LightingSystem (lighting.ts).
+    // This method only handles monitor glows / smoke puffs and matrix rain.
+
+    const isSmoking = this.worldTheme?.workMetaphor === "smoking";
+    const isFireSpinning = this.worldTheme?.workMetaphor === "fire_spinning";
+    const isHarvesting = this.worldTheme?.workMetaphor === "harvesting";
+
+    if (isSmoking) {
+      // Hide all monitor glows — smoke replaces them
+      for (const glow of this.monitorGlows) glow.setVisible(false);
+      this.updateSmokePuffs(time);
+    } else if (isFireSpinning) {
+      // Hide all monitor glows — fire replaces them
+      for (const glow of this.monitorGlows) glow.setVisible(false);
+      this.updateFireSpinning(time);
+    } else if (isHarvesting) {
+      // Hide all monitor glows — crop particles replace them
+      for (const glow of this.monitorGlows) glow.setVisible(false);
+      this.updateHarvestParticles(time);
+    } else {
+      // monitor glows: pulse for working agents
+      const pulse = 0.15 + Math.sin(time * 0.003) * 0.05;
+      // Build deskIndex→agent map once instead of [...values()].find() per monitor
+      const deskAgentMap = new Map<number, { status: AgentStatus; deskIndex: number }>();
+      for (const agent of this.store.agents.values()) {
+        if (agent.deskIndex >= 0) deskAgentMap.set(agent.deskIndex, agent);
+      }
+      this.monitors.forEach((m, i) => {
+        const glow = this.monitorGlows[i];
+        if (!glow) return;
+        const agent = deskAgentMap.get(i);
+        if (agent && agent.status !== "idle" && agent.status !== "waiting") {
+          const color = getThemeStatusColors(this.worldTheme)[agent.status];
+          glow.setPosition(m.x, m.y + 4);
+          glow.setFillStyle(color, pulse);
+          glow.setVisible(true);
+        } else {
+          glow.setVisible(false);
+        }
+      });
+    }
+
+    // matrix rain overlay for working monitors
+    this.updateMatrixRain(time);
+  }
+
+  /** Emit and update smoke puffs for the smoking work metaphor. */
+  private updateSmokePuffs(time: number): void {
+    const statusColors = getThemeStatusColors(this.worldTheme);
+    const dt = this.game.loop.delta;
+
+    // Emit new puffs every ~200ms from each active agent
+    this.smokeEmitTimer += dt;
+    const shouldEmit = this.smokeEmitTimer >= 200;
+    if (shouldEmit) this.smokeEmitTimer = 0;
+
+    for (const [id, agent] of this.store.agents) {
+      if (agent.status === "idle" || agent.status === "waiting" || agent.status === "done") continue;
+      const npc = this.npcs.get(id);
+      if (!npc) continue;
+
+      if (shouldEmit) {
+        const color = statusColors[agent.status];
+        const px = npc.container.x + (Math.random() - 0.5) * 8;
+        const py = npc.container.y - 16;
+        const arc = this.add.circle(px, py, 3 + Math.random() * 3, color, 0.5)
+          .setDepth(9)
+          .setBlendMode(Phaser.BlendModes.NORMAL);
+        this.smokePuffs.push({
+          arc,
+          vy: -0.3 - Math.random() * 0.2,
+          life: 0,
+          maxLife: 1500 + Math.random() * 500,
+        });
+      }
+    }
+
+    // Update existing puffs — rise, expand, fade
+    for (let i = this.smokePuffs.length - 1; i >= 0; i--) {
+      const p = this.smokePuffs[i];
+      p.life += dt;
+      if (p.life >= p.maxLife) {
+        p.arc.destroy();
+        this.smokePuffs.splice(i, 1);
+        continue;
+      }
+      const t = p.life / p.maxLife;
+      p.arc.y += p.vy * (dt / 16.67);
+      p.arc.x += Math.sin(p.life * 0.005) * 0.3;
+      p.arc.setRadius(3 + t * 12);
+      p.arc.setAlpha(0.5 * (1 - t));
+    }
+
+    // Cap pool size
+    while (this.smokePuffs.length > 80) {
+      const p = this.smokePuffs.shift();
+      p?.arc.destroy();
+    }
+  }
+
+  /** Emit and update fire particles for the fire_spinning work metaphor. */
+  private updateFireSpinning(time: number): void {
+    const statusColors = getThemeStatusColors(this.worldTheme);
+    const dt = this.game.loop.delta;
+
+    this.fireEmitTimer += dt;
+    const shouldEmit = this.fireEmitTimer >= 150;
+    if (shouldEmit) this.fireEmitTimer = 0;
+
+    for (const [id, agent] of this.store.agents) {
+      if (agent.status === "idle" || agent.status === "waiting" || agent.status === "done") continue;
+      const npc = this.npcs.get(id);
+      if (!npc) continue;
+
+      if (shouldEmit) {
+        const color = statusColors[agent.status];
+        // Emit fire particles in a spinning arc around the agent
+        for (let j = 0; j < 3; j++) {
+          const angle = Math.random() * Math.PI * 2;
+          const radius = 12 + Math.random() * 8;
+          const px = npc.container.x + Math.cos(angle) * radius;
+          const py = npc.container.y - 16 + Math.sin(angle) * radius * 0.5;
+          const arc = this.add.circle(px, py, 2 + Math.random() * 3, color, 0.7)
+            .setDepth(9)
+            .setBlendMode(Phaser.BlendModes.ADD);
+          this.fireParticles.push({
+            arc,
+            vy: -0.5 - Math.random() * 0.3,
+            vx: Math.cos(angle) * 0.5,
+            life: 0,
+            maxLife: 600 + Math.random() * 300,
+          });
+        }
+      }
+    }
+
+    // Update existing fire particles
+    for (let i = this.fireParticles.length - 1; i >= 0; i--) {
+      const p = this.fireParticles[i];
+      p.life += dt;
+      if (p.life >= p.maxLife) {
+        p.arc.destroy();
+        this.fireParticles.splice(i, 1);
+        continue;
+      }
+      const t = p.life / p.maxLife;
+      p.arc.y += p.vy * (dt / 16.67);
+      p.arc.x += p.vx * (dt / 16.67);
+      p.vx *= 0.96;
+      p.arc.setRadius(2 + t * 6);
+      p.arc.setAlpha(0.7 * (1 - t));
+    }
+
+    while (this.fireParticles.length > 120) {
+      const p = this.fireParticles.shift();
+      p?.arc.destroy();
+    }
+  }
+
+  /** Emit and update harvest particles for the harvesting work metaphor. */
+  private updateHarvestParticles(time: number): void {
+    const statusColors = getThemeStatusColors(this.worldTheme);
+    const dt = this.game.loop.delta;
+
+    this.harvestEmitTimer += dt;
+    const shouldEmit = this.harvestEmitTimer >= 250;
+    if (shouldEmit) this.harvestEmitTimer = 0;
+
+    for (const [id, agent] of this.store.agents) {
+      if (agent.status === "idle" || agent.status === "waiting" || agent.status === "done") continue;
+      const npc = this.npcs.get(id);
+      if (!npc) continue;
+
+      if (shouldEmit) {
+        const color = statusColors[agent.status];
+        // Emit crop particles rising from below the agent
+        const px = npc.container.x + (Math.random() - 0.5) * 12;
+        const py = npc.container.y - 4;
+        const arc = this.add.circle(px, py, 2 + Math.random() * 2, color, 0.6)
+          .setDepth(9)
+          .setBlendMode(Phaser.BlendModes.NORMAL);
+        this.harvestParticles.push({
+          arc,
+          vy: -0.4 - Math.random() * 0.2,
+          life: 0,
+          maxLife: 1000 + Math.random() * 400,
+        });
+      }
+    }
+
+    // Update existing harvest particles
+    for (let i = this.harvestParticles.length - 1; i >= 0; i--) {
+      const p = this.harvestParticles[i];
+      p.life += dt;
+      if (p.life >= p.maxLife) {
+        p.arc.destroy();
+        this.harvestParticles.splice(i, 1);
+        continue;
+      }
+      const t = p.life / p.maxLife;
+      p.arc.y += p.vy * (dt / 16.67);
+      p.arc.x += Math.sin(p.life * 0.008) * 0.4;
+      p.arc.setRadius(2 + t * 4);
+      p.arc.setAlpha(0.6 * (1 - t));
+    }
+
+    while (this.harvestParticles.length > 80) {
+      const p = this.harvestParticles.shift();
+      p?.arc.destroy();
+    }
+  }
+
+  /** Everyone called to ASSIGN-TO-ALL gathers in a ring around the boss. */
+  private startHuddle(agentIds: string[]): void {
+    const boss = tileOf(this.player.x, this.player.y);
+    const ring: Tile[] = [];
+    for (const r of [1, 2]) {
+      for (let dx = -r; dx <= r; dx++) {
+        for (let dy = -r; dy <= r; dy++) {
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+          const t = { x: boss.x + dx, y: boss.y + dy };
+          if (this.grid.ok(t.x, t.y)) ring.push(t);
+        }
+      }
+    }
+    const now = this.time.now;
+    agentIds.forEach((id, i) => {
+      const npc = this.npcs.get(id);
+      const spot = ring[i % Math.max(ring.length, 1)];
+      if (npc && spot) npc.huddle(spot, boss, now);
+    });
+  }
+
+  /** Emergency stop — all agents line up in an organized column by the entrance. */
+  private startAssembly(agentIds: string[]): void {
+    const door = this.doorTile;
+    // Line up in two columns flanking the door, moving inward from the entrance
+    const spots: Tile[] = [];
+    for (let i = 0; i < 16; i++) {
+      const col = i % 2 === 0 ? -1 : 2; // left and right of door
+      const row = Math.floor(i / 2);
+      const t = { x: door.x + col, y: door.y - row - 1 };
+      if (this.grid.ok(t.x, t.y)) spots.push(t);
+    }
+    agentIds.forEach((id, i) => {
+      const npc = this.npcs.get(id);
+      const spot = spots[i % Math.max(spots.length, 1)];
+      if (npc && spot) npc.assemble(spot, this.time.now);
+    });
+  }
+
+  private defaultZoom(): number {
+    const z = Math.max(this.scale.width / this.mapPx.w, this.scale.height / this.mapPx.h);
+    if (isTouchDevice() && Math.min(this.scale.width, this.scale.height) < 480) {
+      return Math.max(1, Math.min(z, 1.5));
+    }
+    return Math.max(1, Math.ceil(z));
+  }
+
+  private minZoom(): number {
+    return this.defaultZoom() * 0.4;
+  }
+
+  private maxZoom(): number {
+    return this.defaultZoom() * 3;
+  }
+
+  /** Clamp a zoom value to the allowed range. */
+  private clampZoom(z: number): number {
+    return Math.max(this.minZoom(), Math.min(z, this.maxZoom()));
+  }
+
+  /** Recenter camera on player and reset zoom to default. */
+  recenterCamera(): void {
+    this.cameraMode = "follow";
+    this.userZoom = null;
+    this.cameras.main.startFollow(this.player, false);
+    this.cameras.main.setZoom(this.defaultZoom());
+  }
+
+  /** Enter a world theme — fade out, load theme JSON, generate procedural tilesets, restart scene. */
+  async enterWorldPortal(themeId: string, themeName: string): Promise<void> {
+    if (this.store.worldTransitioning) return;
+    this.store.worldTransitioning = true;
+
+    this.cameras.main.fadeOut(600, 10, 10, 30);
+    this.cameras.main.once("camerafadeoutcomplete", async () => {
+      try {
+        const res = await fetch(`assets/themes/${themeId}.json`);
+        if (!res.ok) throw new Error(`Failed to load theme ${themeId}: ${res.status}`);
+        const theme = await res.json() as WorldTheme;
+        this.registry.set("worldTheme", theme);
+
+        // Lazy-load the world tilemap JSON if not already cached.
+        // (World theme tilemaps were removed from BootScene preload to save ~124KB on initial load.)
+        await BootScene.loadWorldTilemap(this, themeId);
+
+        // Lazy-load 3D creature spritesheets if this is an AI-tier world.
+        // (6.4MB of creature sprites were removed from BootScene preload.)
+        if (theme.assets?.assetTier === "ai") {
+          await BootScene.loadCreature3DAssets(this);
+        }
+
+        // Clean up any stale procedural textures from a previous world
+        if (this.textures.exists("tiles-theme")) this.textures.remove("tiles-theme");
+        if (this.textures.exists("world-tiles-theme")) this.textures.remove("world-tiles-theme");
+
+        // Generate procedural tilesets for this theme (office + world tiles)
+        if (theme.assets?.assetTier !== "ai" && theme.office?.tilesetPath) {
+          if (theme.id === "erics-alley") {
+            generateAlleyTileset(this, "tiles-theme");
+            generateAlleyWorldTiles(this);
+          }
+          if (theme.id === "hawaii") {
+            generateHawaiiTileset(this, "tiles-theme");
+            generateHawaiiWorldTiles(this);
+          }
+          if (theme.id === "old-south") {
+            generateSouthTileset(this, "tiles-theme");
+            generateSouthWorldTiles(this);
+          }
+        }
+
+        // Set currentWorld AFTER reset so it survives the scene restart
+        this.store.toggleGitHubPanel(false);
+        this.store.reset();
+        this.store.currentWorld = { themeId, themeName };
+        this.store.worldTransitioning = false;
+
+        // Tell the new scene to do a fade-in
+        this.registry.set("worldFadeIn", true);
+        this.scene.restart();
+
+        this.store.toast(`Entering world: ${themeName}`);
+      } catch (err) {
+        console.error("[scene] Failed to enter world:", err);
+        this.store.worldTransitioning = false;
+        this.store.toast(`Failed to enter world: ${err instanceof Error ? err.message : String(err)}`);
+        this.cameras.main.fadeIn(600, 10, 10, 30);
+      }
+    });
+  }
+
+  /** Exit the current world — fade out, clear theme, restart scene. */
+  exitWorld(): void {
+    if (this.store.worldTransitioning) return;
+    if (!this.store.currentWorld) return;
+
+    this.store.worldTransitioning = true;
+
+    this.cameras.main.fadeOut(600, 10, 10, 30);
+    this.cameras.main.once("camerafadeoutcomplete", () => {
+      this.registry.remove("worldTheme");
+
+      // Clean up procedural tileset textures
+      if (this.textures.exists("tiles-theme")) this.textures.remove("tiles-theme");
+      if (this.textures.exists("world-tiles-theme")) this.textures.remove("world-tiles-theme");
+
+      // reset first, then clear currentWorld after
+      this.store.reset();
+      this.store.currentWorld = null;
+      this.store.worldTransitioning = false;
+
+      // Tell the new scene to do a fade-in
+      this.registry.set("worldFadeIn", true);
+      this.scene.restart();
+
+      this.store.toast("Returning to Agent Heights");
+    });
+  }
+
+  /** Open a glowing portal near the server racks that leads to a world theme. */
+  openPortal(themeId: string, themeName: string): void {
+    // Close existing portal if any
+    this.closePortal();
+
+    // Find a position near the server racks
+    if (this.serverRackTiles.length === 0) return;
+    const rack = this.serverRackTiles[0];
+    const px = rack.x * TILE_PX + TILE_PX / 2;
+    const py = (rack.y - 2) * TILE_PX + TILE_PX / 2; // 2 tiles above the rack
+
+    this.store.portalTarget = { themeId, themeName };
+    this.store.toggleGitHubPanel(false);
+
+    // Create portal visual: AI sprite if available, else layered glowing circles
+    const container = this.add.container(px, py);
+    container.setDepth(9000);
+
+    const portalKey = "ai-portal";
+    if (this.textures.exists(portalKey)) {
+      const portalSprite = this.add.image(0, 0, portalKey)
+        .setOrigin(0.5, 0.5)
+        .setDisplaySize(80, 80);
+      container.add(portalSprite);
+      // Animate with a gentle pulse
+      this.tweens.add({
+        targets: portalSprite,
+        scale: { from: 1, to: 1.15 },
+        alpha: { from: 0.85, to: 1 },
+        duration: 1000,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.inOut",
+      });
+    } else {
+      // Outer glow ring
+      const outerRing = this.add.circle(0, 0, 36, 0x4a6a8a, 0.15)
+        .setStrokeStyle(3, 0x6a9ad6, 0.6);
+      // Inner swirling vortex
+      const innerRing = this.add.circle(0, 0, 24, 0x2a4a6a, 0.3)
+        .setStrokeStyle(2, 0x8fc9f0, 0.8);
+      // Core
+      const core = this.add.circle(0, 0, 14, 0x1a2a4a, 0.5)
+        .setStrokeStyle(1, 0xc0e0ff, 0.9);
+
+      container.add([outerRing, innerRing, core]);
+
+      // Animate: pulsing + rotation effect
+      this.tweens.add({
+        targets: outerRing,
+        scale: { from: 1, to: 1.3 },
+        alpha: { from: 0.15, to: 0.05 },
+        duration: 1200,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.inOut",
+      });
+      this.tweens.add({
+        targets: innerRing,
+        scale: { from: 1, to: 0.8 },
+        alpha: { from: 0.3, to: 0.6 },
+        duration: 800,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.inOut",
+      });
+      this.tweens.add({
+        targets: core,
+        scale: { from: 1, to: 1.15 },
+        alpha: { from: 0.5, to: 0.8 },
+        duration: 600,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.inOut",
+      });
+    }
+
+    this.portalContainer = container;
+
+    // Hint text above portal
+    this.portalHint = this.add.text(px, py - 56, `Walk in to enter\n${themeName}`, {
+      fontSize: "12px",
+      color: "#c0e0ff",
+      align: "center",
+      stroke: "#000",
+      strokeThickness: 3,
+    }).setOrigin(0.5).setDepth(9001);
+
+    // Pulsing hint
+    this.tweens.add({
+      targets: this.portalHint,
+      alpha: { from: 0.7, to: 1 },
+      duration: 1000,
+      yoyo: true,
+      repeat: -1,
+      ease: "Sine.inOut",
+    });
+
+    // Physics zone for overlap detection
+    this.portalZone = this.add.circle(px, py, 28, 0x000000, 0);
+    this.physics.add.existing(this.portalZone, true);
+    (this.portalZone.body as Phaser.Physics.Arcade.Body).setCircle(28, 0, 0);
+
+    this.portalCollider = this.physics.add.overlap(this.player, this.portalZone, () => {
+      this.closePortal();
+      this.enterWorldPortal(themeId, themeName);
+    });
+
+    this.store.toast(`Portal opened — walk in to enter ${themeName}`);
+  }
+
+  /** Close and destroy the active portal. */
+  closePortal(): void {
+    if (this.portalCollider) {
+      this.portalCollider.destroy();
+      this.portalCollider = null;
+    }
+    if (this.portalZone) {
+      this.portalZone.destroy();
+      this.portalZone = null;
+    }
+    if (this.portalContainer) {
+      this.portalContainer.destroy();
+      this.portalContainer = null;
+    }
+    if (this.portalHint) {
+      this.portalHint.destroy();
+      this.portalHint = null as any;
+    }
+    this.store.portalTarget = null;
+  }
+
+  /** Spawn a return portal at the player spawn point (used inside deployed worlds). */
+  private spawnReturnPortal(): void {
+    if (!this.store.currentWorld) return;
+
+    const spawn = feetOf(this.spawnTile);
+    const px = spawn.x;
+    const py = spawn.y;
+
+    // Create return portal visual: AI sprite if available, else green-tinted circles
+    const container = this.add.container(px, py - 20);
+    container.setDepth(9000);
+
+    const returnPortalKey = "ai-portal-return";
+    if (this.textures.exists(returnPortalKey)) {
+      const portalSprite = this.add.image(0, 0, returnPortalKey)
+        .setOrigin(0.5, 0.5)
+        .setDisplaySize(80, 80)
+        .setTint(0x5ad6a0);
+      container.add(portalSprite);
+      this.tweens.add({
+        targets: portalSprite,
+        scale: { from: 1, to: 1.15 },
+        alpha: { from: 0.85, to: 1 },
+        duration: 1000,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.inOut",
+      });
+    } else {
+      const outerRing = this.add.circle(0, 0, 36, 0x2a6a4a, 0.15)
+        .setStrokeStyle(3, 0x5ad6a0, 0.6);
+      const innerRing = this.add.circle(0, 0, 24, 0x1a4a2a, 0.3)
+        .setStrokeStyle(2, 0x8ff0c0, 0.8);
+      const core = this.add.circle(0, 0, 14, 0x0a2a1a, 0.5)
+        .setStrokeStyle(1, 0xc0ffd0, 0.9);
+
+      container.add([outerRing, innerRing, core]);
+
+      this.tweens.add({
+        targets: outerRing,
+        scale: { from: 1, to: 1.3 },
+        alpha: { from: 0.15, to: 0.05 },
+        duration: 1200,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.inOut",
+      });
+      this.tweens.add({
+        targets: innerRing,
+        scale: { from: 1, to: 0.8 },
+        alpha: { from: 0.3, to: 0.6 },
+        duration: 800,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.inOut",
+      });
+      this.tweens.add({
+        targets: core,
+        scale: { from: 1, to: 1.15 },
+        alpha: { from: 0.5, to: 0.8 },
+        duration: 600,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.inOut",
+      });
+    }
+
+    this.portalContainer = container;
+
+    // Hint text
+    this.portalHint = this.add.text(px, py - 60, "Return to HQ", {
+      fontSize: "12px",
+      color: "#c0ffd0",
+      align: "center",
+      stroke: "#000",
+      strokeThickness: 3,
+    }).setOrigin(0.5).setDepth(9001);
+
+    this.tweens.add({
+      targets: this.portalHint,
+      alpha: { from: 0.7, to: 1 },
+      duration: 1000,
+      yoyo: true,
+      repeat: -1,
+      ease: "Sine.inOut",
+    });
+
+    // Physics overlap
+    this.portalZone = this.add.circle(px, py - 20, 48, 0x000000, 0);
+    this.physics.add.existing(this.portalZone, true);
+    (this.portalZone.body as Phaser.Physics.Arcade.Body).setCircle(48, 0, 0);
+
+    this.portalCollider = this.physics.add.overlap(this.player, this.portalZone, () => {
+      this.exitWorld();
+    });
+  }
+
+  /** Set up input listeners for pinch-zoom, wheel-zoom, pan, and tap-to-walk. */
+  private setupCameraControls(): void {
+    // Enable multi-touch (Phaser needs to be told to track extra pointers)
+    this.input.addPointer(2);
+
+    // ── Recenter camera event (from HUD recenter button) ──
+    const onRecenter = () => this.recenterCamera();
+    window.addEventListener("recenter-camera", onRecenter);
+    this.events.once("shutdown", () => window.removeEventListener("recenter-camera", onRecenter));
+
+    // ── Wheel zoom (desktop) ──
+    this.input.on("wheel", (_pointer: Phaser.Input.Pointer, _o: unknown, _dx: number, dy: number) => {
+      const cam = this.cameras.main;
+      const factor = dy > 0 ? 0.9 : 1.1;
+      const newZoom = this.clampZoom(cam.zoom * factor);
+      cam.setZoom(newZoom);
+      this.userZoom = newZoom;
+    });
+
+    // ── Pointer down: track for pinch, pan, or tap-to-walk ──
+    this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
+      // Decoration placement mode — intercept all clicks
+      if (this.decorationMode) {
+        const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
+        this.tryPlaceDecoration(worldPoint.x, worldPoint.y);
+        return;
+      }
+
+      // Ignore clicks on interactive game objects (agents, monitors) — they have their own handlers
+      if (this.input.manager.hitTest(pointer, [], this.cameras.main).length > 0) return;
+
+      this.pinchPointers.set(pointer.id, pointer);
+      this.tapStartX = pointer.x;
+      this.tapStartY = pointer.y;
+      this.tapMoved = false;
+
+      if (this.pinchPointers.size === 2) {
+        // Start pinch-zoom
+        const pts = [...this.pinchPointers.values()];
+        this.pinchStartDist = Phaser.Math.Distance.Between(pts[0].x, pts[0].y, pts[1].x, pts[1].y);
+        this.pinchStartZoom = this.cameras.main.zoom;
+        this.panPointer = null;
+      } else if (this.pinchPointers.size === 1) {
+        // Potential pan or tap — track as pan candidate
+        this.panPointer = pointer;
+        this.panStartScrollX = this.cameras.main.scrollX;
+        this.panStartScrollY = this.cameras.main.scrollY;
+      }
+    });
+
+    // ── Pointer move: handle pinch-zoom, pan, and tap movement detection ──
+    this.input.on("pointermove", (pointer: Phaser.Input.Pointer) => {
+      // Decoration ghost follows cursor
+      if (this.decorationMode && this.decorationGhost) {
+        const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
+        this.updateDecorationGhost(worldPoint.x, worldPoint.y);
+      }
+      if (!this.pinchPointers.has(pointer.id)) return;
+
+      // Detect if this is a tap vs drag
+      const moveDist = Phaser.Math.Distance.Between(pointer.x, pointer.y, this.tapStartX, this.tapStartY);
+      if (moveDist > 10) this.tapMoved = true;
+
+      if (this.pinchPointers.size === 2) {
+        // Pinch-zoom
+        const pts = [...this.pinchPointers.values()];
+        const dist = Phaser.Math.Distance.Between(pts[0].x, pts[0].y, pts[1].x, pts[1].y);
+        if (this.pinchStartDist > 0) {
+          const ratio = dist / this.pinchStartDist;
+          const newZoom = this.clampZoom(this.pinchStartZoom * ratio);
+          this.cameras.main.setZoom(newZoom);
+          this.userZoom = newZoom;
+        }
+        return;
+      }
+
+      // One-finger pan (only in free mode or if moved significantly)
+      if (this.panPointer === pointer && this.tapMoved && this.cameraMode === "free") {
+        const cam = this.cameras.main;
+        const dx = (pointer.x - this.panPointer.downX) / cam.zoom;
+        const dy = (pointer.y - this.panPointer.downY) / cam.zoom;
+        cam.scrollX = this.panStartScrollX - dx;
+        cam.scrollY = this.panStartScrollY - dy;
+      }
+    });
+
+    // ── Pointer up: handle tap-to-walk or finalize pinch/pan ──
+    this.input.on("pointerup", (pointer: Phaser.Input.Pointer) => {
+      this.pinchPointers.delete(pointer.id);
+
+      if (this.panPointer === pointer) {
+        // If it was a tap (not a drag) and no pinch happened, do tap-to-walk
+        if (!this.tapMoved && this.pinchPointers.size === 0) {
+          this.handleTapToWalk(pointer);
+        }
+        this.panPointer = null;
+      }
+
+      // If one pointer remains after pinch, keep it as pan candidate
+      if (this.pinchPointers.size === 1) {
+        const remaining = [...this.pinchPointers.values()][0];
+        this.panPointer = remaining;
+        this.panStartScrollX = this.cameras.main.scrollX;
+        this.panStartScrollY = this.cameras.main.scrollY;
+        this.tapMoved = true; // prevent tap-to-walk after pinch
+      }
+    });
+
+    // ── Two-finger pan: switch to free mode when user starts dragging with 2 fingers ──
+    this.input.on("pointermove", (pointer: Phaser.Input.Pointer) => {
+      if (this.pinchPointers.size === 2 && this.cameraMode === "follow") {
+        // Two-finger gesture implies user wants to look around
+        this.cameraMode = "free";
+        this.cameras.main.stopFollow();
+      }
+    });
+  }
+
+  /** Handle a tap on the game world: walk to interactable (mobile only). */
+  private handleTapToWalk(pointer: Phaser.Input.Pointer): void {
+    if (this.inPhoneBooth) return;
+    if (!isTouchDevice()) return; // Desktop uses WASD + click agents directly
+    const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
+
+    // Check if tapping near an interactable — walk to it and interact
+    const interactable = this.findInteractableAt(worldPoint.x, worldPoint.y);
+    if (interactable) {
+      const dest = this.findAdjacentWalkable(interactable.tile);
+      if (dest) {
+        this.walkToTile(dest);
+        this.pendingInteract = true;
+        this.showPathMarker(dest);
+        return;
+      }
+    }
+
+    // Tap empty ground: walk there (mobile only)
+    this.pendingInteract = false;
+    const targetTile = tileOf(worldPoint.x, worldPoint.y);
+    const playerOutside = this.world.isOutside(this.player.x, this.player.y);
+    if (playerOutside) {
+      // Try A* pathfinding on a local walkability grid
+      const { tx: startTx, ty: startTy } = this.world.pixelToTile(this.player.x, this.player.y);
+      const { tx: destTx, ty: destTy } = this.world.pixelToTile(worldPoint.x, worldPoint.y);
+      const radius = 15;
+      const localGrid = this.world.buildLocalWalkGrid(this.player.x, this.player.y, radius);
+      const destLocal = { x: destTx - startTx + radius, y: destTy - startTy + radius };
+      if (localGrid.ok(destLocal.x, destLocal.y)) {
+        const path = findPath(localGrid, { x: radius, y: radius }, destLocal);
+        if (path.length > 0) {
+          this.playerPath = path.map(t => ({ x: t.x + startTx - radius, y: t.y + startTy - radius }));
+          this.playerPathOutdoor = true;
+          this.playerTargetPx = null;
+          this.showPathMarkerPx(worldPoint.x, worldPoint.y);
+          return;
+        }
+      }
+      // Fall back to straight-line if pathfinding fails or destination unreachable
+      this.playerPath = [];
+      this.playerPathOutdoor = false;
+      this.playerTargetPx = { x: worldPoint.x, y: worldPoint.y };
+      this.showPathMarkerPx(worldPoint.x, worldPoint.y);
+    } else {
+      // Player is inside — check if the tap is outside the office
+      const tapOutside = this.world.isOutside(worldPoint.x, worldPoint.y);
+      if (tapOutside) {
+        // Two-phase: path to the door first, then straight-line to outdoor target
+        const doorTile = this.doorTile;
+        const start = tileOf(this.player.x, this.player.y);
+        const path = findPath(this.grid, start, doorTile);
+        if (path.length > 0) {
+          this.playerPath = path;
+          this.playerPathOutdoor = false;
+          this.pendingOutdoorTargetPx = { x: worldPoint.x, y: worldPoint.y };
+          this.playerTargetPx = null;
+          this.showPathMarkerPx(worldPoint.x, worldPoint.y);
+          return;
+        }
+        // Path to door failed — fall back to straight-line (sub-step collision handles the door gap)
+        this.playerPath = [];
+        this.playerPathOutdoor = false;
+        this.pendingOutdoorTargetPx = null;
+        this.playerTargetPx = { x: worldPoint.x, y: worldPoint.y };
+        this.showPathMarkerPx(worldPoint.x, worldPoint.y);
+      } else {
+        this.walkToTile(targetTile);
+        this.showPathMarker(targetTile);
+      }
+    }
+  }
+
+  /** Walk player to a tile using A* pathfinding (office only). */
+  private walkToTile(dest: Tile): void {
+    this.playerTargetPx = null;
+    this.playerPathOutdoor = false;
+    const start = tileOf(this.player.x, this.player.y);
+    if (start.x === dest.x && start.y === dest.y) {
+      this.playerPath = [];
+      return;
+    }
+    const path = findPath(this.grid, start, dest);
+    this.playerPath = path;
+  }
+
+  /** Walk to an agent/NPC and then select+talk to them on arrival (mobile only). */
+  private walkToAgent(id: string): void {
+    // Desktop: select immediately, no walking
+    if (!isTouchDevice()) {
+      this.selectAgent(id);
+      return;
+    }
+
+    // Mobile: walk to the agent first, then select on arrival
+    let npcX = 0, npcY = 0;
+    if (id === OFFICE_MANAGER_ID && this.officeManager) {
+      npcX = this.officeManager.container.x;
+      npcY = this.officeManager.container.y;
+    } else if (id === HERMES_ID && this.hermes) {
+      npcX = this.hermes.container.x;
+      npcY = this.hermes.container.y;
+    } else if (id === WIZARD_ID && this.wizard) {
+      npcX = this.wizard.container.x;
+      npcY = this.wizard.container.y;
+    } else {
+      const npc = this.npcs.get(id);
+      if (!npc) return;
+      npcX = npc.container.x;
+      npcY = npc.container.y;
+    }
+
+    // If already close enough, just interact now
+    const dist = Phaser.Math.Distance.Between(this.player.x, this.player.y, npcX, npcY);
+    if (dist < 144) {
+      this.selectAgent(id);
+      return;
+    }
+
+    // Walk to a tile adjacent to the agent, then interact
+    const agentTile = tileOf(npcX, npcY);
+    const dest = this.findAdjacentWalkable(agentTile);
+    if (dest) {
+      this.walkToTile(dest);
+      this.pendingAgentId = id;
+      this.pendingInteract = false;
+      this.showPathMarker(dest);
+    } else {
+      // No walkable adjacent tile — just select directly
+      this.selectAgent(id);
+    }
+  }
+
+  /** Select an agent and open chat. */
+  private selectAgent(id: string): void {
+    this.store.select(id);
+    if (id === OFFICE_MANAGER_ID) achievements.unlock("office-manager_visit");
+    setTimeout(() => {
+      (document.getElementById("d-chat") as HTMLInputElement | null)?.focus();
+    }, 0);
+  }
+
+  /** Show a visual marker at a tile destination. */
+  private showPathMarker(tile: Tile): void {
+    this.showPathMarkerPx(tile.x * TILE_PX + 32, tile.y * TILE_PX + 32);
+  }
+
+  /** Show a visual marker at a pixel position. */
+  private showPathMarkerPx(px: number, py: number): void {
+    if (this.pathMarker) this.pathMarker.destroy();
+    this.pathMarker = this.add.circle(px, py, 8, 0x4a9cd8, 0.7)
+      .setStrokeStyle(2, 0xffffff, 0.5)
+      .setDepth(9999);
+    this.tweens.add({
+      targets: this.pathMarker,
+      alpha: 0,
+      scale: 2,
+      duration: 600,
+      repeat: -1,
+      onRepeat: () => { if (this.pathMarker) this.pathMarker.setAlpha(0.7).setScale(1); },
+    });
+  }
+
+  /** Clear the path marker. */
+  private clearPathMarker(): void {
+    if (this.pathMarker) {
+      this.pathMarker.destroy();
+      this.pathMarker = null;
+    }
+  }
+
+  /** Find a walkable tile adjacent to the given tile. */
+  private findAdjacentWalkable(tile: Tile): Tile | null {
+    const dirs = [[0, 1], [0, -1], [1, 0], [-1, 0], [1, 1], [-1, 1], [1, -1], [-1, -1]] as const;
+    const outside = this.world.isOutside(tile.x * TILE_PX + 32, tile.y * TILE_PX + 32);
+    for (const [dx, dy] of dirs) {
+      const x = tile.x + dx;
+      const y = tile.y + dy;
+      if (outside) {
+        if (this.world.isTileWalkable(
+          Math.floor((x * TILE_PX - this.world.offset.x) / TILE_PX),
+          Math.floor((y * TILE_PX - this.world.offset.y) / TILE_PX),
+        )) return { x, y };
+      } else {
+        if (this.grid.ok(x, y)) return { x, y };
+      }
+    }
+    return null;
+  }
+
+  /** Type for a tappable interactable. */
+  private findInteractableAt(wx: number, wy: number): { tile: Tile; pxX: number; pxY: number; radius: number } | null {
+    type Hit = { tile: Tile; pxX: number; pxY: number; radius: number };
+    const candidates: Hit[] = [
+      { tile: this.coffeeTile, pxX: this.coffeeTile.x * TILE_PX + 32, pxY: this.coffeeTile.y * TILE_PX + 32, radius: 96 },
+      { tile: this.boardTile, pxX: this.boardTile.x * TILE_PX + 32, pxY: this.boardTile.y * TILE_PX + 52, radius: 96 },
+      { tile: this.fridgeTile, pxX: this.fridgeTile.x * TILE_PX + 32, pxY: this.fridgeTile.y * TILE_PX + 32, radius: 96 },
+      { tile: this.coolerTile, pxX: this.coolerTile.x * TILE_PX + 32, pxY: this.coolerTile.y * TILE_PX + 32, radius: 96 },
+      { tile: this.clockTile, pxX: this.clockTile.x * TILE_PX + 32, pxY: this.clockTile.y * TILE_PX + 32, radius: 96 },
+      { tile: this.wardrobeTile, pxX: this.wardrobeTile.x * TILE_PX + 32, pxY: this.wardrobeTile.y * TILE_PX + 32, radius: 96 },
+      { tile: this.trophyTile, pxX: this.trophyTile.x * TILE_PX + 32, pxY: this.trophyTile.y * TILE_PX + 40, radius: 96 },
+      { tile: this.hallOfFameTile, pxX: this.hallOfFameTile.x * TILE_PX + 10, pxY: this.hallOfFameTile.y * TILE_PX + 32, radius: 96 },
+      { tile: this.redButtonTile, pxX: this.redButtonTile.x * TILE_PX + 32, pxY: this.redButtonTile.y * TILE_PX + 32, radius: 96 },
+      { tile: this.projectorControlTile, pxX: this.projectorControlTile.x * TILE_PX + 32, pxY: this.projectorControlTile.y * TILE_PX + 32, radius: 80 },
+      { tile: this.projectorSpeakerTile, pxX: this.projectorSpeakerTile.x * TILE_PX + 32, pxY: this.projectorSpeakerTile.y * TILE_PX + 32, radius: 80 },
+      { tile: this.screenShareTile, pxX: this.screenShareTile.x * TILE_PX + 32, pxY: this.screenShareTile.y * TILE_PX + 32, radius: 80 },
+      { tile: this.phoneBoothTile, pxX: this.phoneBoothTile.x * TILE_PX + 32, pxY: this.phoneBoothTile.y * TILE_PX + 32, radius: 80 },
+      { tile: this.warTableTile, pxX: this.warTableTile.x * TILE_PX + 32, pxY: this.warTableTile.y * TILE_PX + 32, radius: 96 },
+      { tile: this.scrapBinTile, pxX: this.scrapBinTile.x * TILE_PX + 32, pxY: this.scrapBinTile.y * TILE_PX + 32, radius: 96 },
+      { tile: this.radioTile, pxX: this.radioTile.x * TILE_PX + 32, pxY: this.radioTile.y * TILE_PX + 32, radius: 96 },
+      { tile: this.workbenchTile, pxX: this.workbenchTile.x * TILE_PX + 32, pxY: this.workbenchTile.y * TILE_PX + 32, radius: 96 },
+      { tile: this.researchTile, pxX: this.researchTile.x * TILE_PX + 32, pxY: this.researchTile.y * TILE_PX + 32, radius: 96 },
+    ];
+
+    if (this.vendingTile) {
+      candidates.push({ tile: this.vendingTile, pxX: this.vendingTile.x * TILE_PX + 32, pxY: this.vendingTile.y * TILE_PX + 32, radius: 96 });
+    }
+    if (this.sofaTile) {
+      candidates.push({ tile: this.sofaTile, pxX: this.sofaTile.x * TILE_PX + 32, pxY: this.sofaTile.y * TILE_PX + 32, radius: 96 });
+    }
+    for (const ft of this.filingTiles) {
+      candidates.push({ tile: ft, pxX: ft.x * TILE_PX + 32, pxY: ft.y * TILE_PX + 32, radius: 80 });
+    }
+    for (const pt of this.plantTiles) {
+      candidates.push({ tile: pt, pxX: pt.x * TILE_PX + 32, pxY: pt.y * TILE_PX + 32, radius: 80 });
+    }
+    for (const pm of this.platformMailboxes) {
+      candidates.push({ tile: pm.tile, pxX: pm.tile.x * TILE_PX + TILE_PX / 2, pxY: pm.tile.y * TILE_PX + TILE_PX / 2, radius: 80 });
+    }
+    for (const sr of this.serverRackTiles) {
+      candidates.push({ tile: sr, pxX: sr.x * TILE_PX + 32, pxY: sr.y * TILE_PX + 32, radius: 96 });
+    }
+    // Mailbox
+    candidates.push({ tile: { x: 0, y: 0 }, pxX: this.mailboxPx.x, pxY: this.mailboxPx.y, radius: 80 });
+
+    let best: Hit | null = null;
+    let bestDist = Infinity;
+    for (const c of candidates) {
+      const d = Phaser.Math.Distance.Between(wx, wy, c.pxX, c.pxY);
+      if (d < c.radius && d < bestDist) {
+        best = c;
+        bestDist = d;
+      }
+    }
+    return best;
+  }
+
+  /** Check if the player can walk to a pixel position inside the office. */
+  private static _officeWalkChecks = [{ x: 0, y: 0 }, { x: 0, y: 0 }, { x: 0, y: 0 }, { x: 0, y: 0 }];
+  private canWalkOffice(px: number, py: number): boolean {
+    const halfW = 18;
+    const checks = OfficeScene._officeWalkChecks;
+    checks[0].x = px - halfW; checks[0].y = py - 2;
+    checks[1].x = px + halfW; checks[1].y = py - 2;
+    checks[2].x = px; checks[2].y = py - 14;
+    checks[3].x = px; checks[3].y = py + 8;
+    for (const p of checks) {
+      const tx = Math.floor(p.x / TILE_PX);
+      const ty = Math.floor(p.y / TILE_PX);
+      if (this.grid.ok(tx, ty)) continue;
+      // outside grid bounds — check world collision instead
+      if (tx < 0 || ty < 0 || tx >= this.grid.width || ty >= this.grid.height) {
+        const wtx = Math.floor((p.x - this.world.offset.x) / TILE_PX);
+        const wty = Math.floor((p.y - this.world.offset.y) / TILE_PX);
+        if (!this.world.isTileWalkableLoaded(wtx, wty)) return false;
+        continue;
+      }
+      return false;
+    }
+    return true;
+  }
+
+  /** Create a standard proximity hint with dark bg, key badge, and white text. */
+  private makeHint(): HintTag {
+    return createHintTag(this);
+  }
+
+  /** Set interactable tile positions based on the current theme. */
+  private setupInteractables(): void {
+    if (this.theme === "world" && this.worldTheme?.interactables) {
+      // Use theme-defined interactables, with fallback defaults for non-nullable fields
+      const ia = this.worldTheme.interactables;
+      this.clockTile = ia.clock ? { x: ia.clock.x, y: ia.clock.y } : { x: 1, y: 3 };
+      this.projectorControlTile = ia.projectorControl ? { x: ia.projectorControl.x, y: ia.projectorControl.y } : { x: 6, y: 1 };
+      this.projectorSpeakerTile = ia.projectorSpeaker ? { x: ia.projectorSpeaker.x, y: ia.projectorSpeaker.y } : { x: 7, y: 1 };
+      this.vendingTile = ia.vending ? { x: ia.vending.x, y: ia.vending.y } : null;
+      this.sofaTile = ia.sofa ? { x: ia.sofa.x, y: ia.sofa.y } : null;
+      this.hallOfFameTile = ia.hallOfFame ? { x: ia.hallOfFame.x, y: ia.hallOfFame.y } : { x: 1, y: 5 };
+      this.wardrobeTile = ia.wardrobe ? { x: ia.wardrobe.x, y: ia.wardrobe.y } : { x: 21, y: 18 };
+      this.filingTiles = ia.filing ? [ia.filing] : [];
+      this.plantTiles = ia.plant ? [ia.plant] : [];
+    } else if (this.theme === "agentHeights") {
+      this.clockTile = { x: 1, y: 3 };
+      this.projectorControlTile = { x: 6, y: 1 };
+      this.projectorSpeakerTile = { x: 7, y: 1 };
+      this.vendingTile = null;
+      this.sofaTile = { x: 23, y: 13 };
+      this.hallOfFameTile = { x: 1, y: 5 };
+      this.wardrobeTile = { x: 21, y: 18 };
+      this.filingTiles = [
+        { x: 20, y: 3 },
+        { x: 20, y: 4 }, { x: 22, y: 11 },
+        { x: 10, y: 16 }, { x: 10, y: 17 },
+      ];
+      this.plantTiles = [
+        { x: 1, y: 9 }, { x: 12, y: 18 }, { x: 20, y: 2 }, { x: 28, y: 7 },
+        { x: 29, y: 13 },
+        { x: 16, y: 18 }, { x: 27, y: 11 }, { x: 6, y: 17 },
+      ];
+    } else {
+      this.clockTile = { x: 1, y: 3 };
+      this.projectorControlTile = { x: 6, y: 1 };
+      this.projectorSpeakerTile = { x: 7, y: 1 };
+      this.vendingTile = null;
+      this.sofaTile = { x: 23, y: 13 };
+      this.hallOfFameTile = { x: 1, y: 5 };
+      this.wardrobeTile = { x: 21, y: 18 };
+      this.filingTiles = [
+        { x: 20, y: 3 },
+        { x: 20, y: 4 }, { x: 22, y: 11 },
+        { x: 10, y: 16 }, { x: 10, y: 17 },
+      ];
+      this.plantTiles = [
+        { x: 1, y: 9 }, { x: 12, y: 18 }, { x: 20, y: 2 }, { x: 28, y: 7 },
+        { x: 29, y: 13 },
+        { x: 16, y: 18 }, { x: 27, y: 11 }, { x: 6, y: 17 },
+      ];
+    }
+  }
+
+  /** Find the nearest tile from a list within maxDist pixels. */
+  private nearestTile(tiles: Tile[], maxDist: number): Tile | null {
+    let best: Tile | null = null;
+    let bestD = Infinity;
+    for (const t of tiles) {
+      const px = t.x * TILE_PX + 32;
+      const py = t.y * TILE_PX + 32;
+      const d = Phaser.Math.Distance.Between(this.player.x, this.player.y, px, py);
+      if (d < maxDist && d < bestD) {
+        best = t;
+        bestD = d;
+      }
+    }
+    return best;
+  }
+
+  /** Build platform mailbox objects from settings + catalog. */
+  private buildPlatformMailboxes(): PlatformMailbox[] {
+    const slots = this.store.settings.mailboxPlatforms ?? [null, null, null, null, null, null];
+    return MAILBOX_TILES.map((tile, i) => {
+      const platform = slots[i] ?? null;
+      const entry = platform ? getPlatformEntry(platform) : undefined;
+      const color = entry?.color ?? UNASSIGNED_COLOR;
+      return {
+        platform,
+        color,
+        colorLight: Phaser.Display.Color.IntegerToColor(color).lighten(20).color,
+        colorDark: Phaser.Display.Color.IntegerToColor(color).darken(20).color,
+        tile: { x: tile.x, y: tile.y },
+        flagUp: false,
+        pendingCount: 0,
+        lastMessage: "",
+        slotIndex: i,
+      };
+    });
+  }
+
+  /** Try interacting with a platform mailbox. Returns true if an interaction fired. */
+  private tryPlatformMailboxInteract(): boolean {
+    let nearest: PlatformMailbox | null = null;
+    let nearestDist = Infinity;
+    for (const mb of this.platformMailboxes) {
+      const mbPx = { x: mb.tile.x * TILE_PX + TILE_PX / 2, y: mb.tile.y * TILE_PX + TILE_PX / 2 };
+      const d = Phaser.Math.Distance.Between(this.player.x, this.player.y, mbPx.x, mbPx.y);
+      if (d < 100 && d < nearestDist) {
+        nearest = mb;
+        nearestDist = d;
+      }
+    }
+    if (!nearest) return false;
+
+    // Unassigned mailbox — show platform picker
+    if (!nearest.platform) {
+      this.showPlatformPickerModal(nearest.slotIndex);
+      return true;
+    }
+
+    const platform = nearest.platform;
+    const slotIndex = nearest.slotIndex;
+    const connected = this.store.isPlatformConnected(platform);
+
+    // Show a small action menu for the assigned mailbox
+    this.showMailboxActionModal(platform, slotIndex, connected);
+    return true;
+  }
+
+  /** Show a small action menu for an assigned mailbox: check, configure, change, or unassign. */
+  private showMailboxActionModal(platform: string, slotIndex: number, connected: boolean): void {
+    const net = this.game.registry.get("net") as import("../net").Net;
+    wizardAction(platform, slotIndex, connected, {
+      send: (msg) => net.send(msg as any),
+      platformStates: this.store.platformStates,
+      onConfigResult: (fn) => this.store.onPlatformConfigResult(fn),
+      offConfigResult: (fn) => this.store.offPlatformConfigResult(fn),
+      onMailboxMessages: (fn) => this.store.onMailboxMessages(fn),
+      offMailboxMessages: (fn) => this.store.offMailboxMessages(fn),
+      onShowConversation: (plat, events) => this.showMailboxConversationModal(plat, events),
+      onShowConnectWizard: (plat) => this.showPlatformConnectModal(plat),
+      onShowPicker: (slot) => this.showPlatformPickerModal(slot),
+      toast: (msg) => this.store.toast(msg),
+      setTimeout: (fn, ms) => { const t = this.time.delayedCall(ms, fn); return () => t.remove(); },
+    });
+  }
+
+  /** Show an in-world Phaser conversation panel for a platform mailbox with reply capability. */
+  private showMailboxConversationModal(platform: string, events: PlatformEvent[]): void {
+    // Close any existing conversation
+    if (this.mailboxConversation) {
+      this.mailboxConversation.destroy();
+      this.mailboxConversation = null;
+    }
+
+    const net = this.game.registry.get("net") as import("../net").Net;
+
+    this.mailboxConversation = new MailboxConversation(
+      this,
+      platform,
+      events,
+      (plat, target, text) => {
+        net.send({ type: "reply_mailbox", platform: plat, target, text });
+      },
+      () => {
+        this.mailboxConversation = null;
+      },
+      (handler) => this.store.onMailboxMessages(handler),
+      (handler) => this.store.offMailboxMessages(handler),
+    );
+  }
+
+  /** Show a multi-step modal walking the user through platform setup with credential input. */
+  private showPlatformConnectModal(platform: string): void {
+    const net = this.game.registry.get("net") as import("../net").Net;
+    wizardConnect(platform, {
+      send: (msg) => net.send(msg as any),
+      platformStates: this.store.platformStates,
+      onConfigResult: (fn) => this.store.onPlatformConfigResult(fn),
+      offConfigResult: (fn) => this.store.offPlatformConfigResult(fn),
+    });
+  }
+
+  /** Show a scrollable platform picker modal for assigning a platform to a mailbox slot. */
+  private showPlatformPickerModal(slot: number): void {
+    const net = this.game.registry.get("net") as import("../net").Net;
+    const assigned = new Set(this.store.settings.mailboxPlatforms?.filter((p): p is string => p !== null) ?? []);
+    wizardPicker({
+      send: (msg) => net.send(msg as any),
+      assignedPlatforms: assigned,
+      slot,
+    });
+  }
+
+  /** Try interacting with any new office object. Returns true if an interaction fired. */
+  private tryOfficeInteract(time: number): boolean {
+    // Projector control panel — cycle channels
+    const ctrlPx = { x: this.projectorControlTile.x * TILE_PX + 32, y: this.projectorControlTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, ctrlPx.x, ctrlPx.y) < 80) {
+      const net = this.game.registry.get("net") as import("../net").Net;
+      const channels = OfficeScene.PROJECTOR_CHANNELS;
+      const curIdx = channels.findIndex(c => c.id === this.store.projectorChannel);
+      const nextIdx = curIdx + 1 >= channels.length ? -1 : curIdx + 1;
+      const next = nextIdx === -1 ? "off" : channels[nextIdx].id;
+      net.send({ type: "projector_set_channel", channel: next });
+      this.world?.audio.uiClick();
+      return true;
+    }
+
+    // Projector speaker — toggle mute
+    const spkPx = { x: this.projectorSpeakerTile.x * TILE_PX + 32, y: this.projectorSpeakerTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, spkPx.x, spkPx.y) < 80) {
+      this.projectorMuted = !this.projectorMuted;
+      // Send mute/unmute command via YouTube IFrame postMessage API (no reload)
+      if (this.projectorIframe?.contentWindow) {
+        const cmd = this.projectorMuted ? "mute" : "unMute";
+        this.projectorIframe.contentWindow.postMessage(
+          JSON.stringify({ event: "command", func: cmd, args: [] }),
+          "*",
+        );
+      }
+      this.store.toast(this.projectorMuted ? "Projector muted" : "Projector unmuted");
+      this.world?.audio.uiClick();
+      return true;
+    }
+
+    // Projector screen — cycle channels (also possible directly at screen)
+    const projPx = { x: this.projectorTile.x * TILE_PX + 32, y: this.projectorTile.y * TILE_PX - 100 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, projPx.x, projPx.y) < 200) {
+      const net = this.game.registry.get("net") as import("../net").Net;
+      const channels = OfficeScene.PROJECTOR_CHANNELS;
+      const curIdx = channels.findIndex(c => c.id === this.store.projectorChannel);
+      const nextIdx = curIdx + 1 >= channels.length ? -1 : curIdx + 1; // -1 means "off"
+      const next = nextIdx === -1 ? "off" : channels[nextIdx].id;
+      net.send({ type: "projector_set_channel", channel: next });
+      this.world?.audio.uiClick();
+      return true;
+    }
+
+    // Screen share station — start/stop screen sharing
+    const ssPx = { x: this.screenShareTile.x * TILE_PX + 32, y: this.screenShareTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, ssPx.x, ssPx.y) < 120) {
+      if (this.screenShare?.sharing) {
+        this.screenShare.stopSharing();
+        if (this._myUserId) this.detachPresenterStream(this._myUserId, "screen");
+        this.store.toast("Screen share stopped.");
+      } else {
+        // Check presenter cap before starting
+        if (this.presenters.length >= MAX_PRESENTERS) {
+          this.store.toast(`Presenter grid is full (${MAX_PRESENTERS}/${MAX_PRESENTERS}). Use the manage panel to kick someone.`);
+          return true;
+        }
+        this.screenShare?.startSharing().then(() => {
+          const localStream = this.screenShare?.localStream;
+          if (localStream && this._myUserId) {
+            this.attachPresenterStream(this._myUserId, "screen", localStream);
+          }
+          this.store.toast("Sharing your screen to the projector!");
+        }).catch(() => {
+          this.store.toast("Screen share permission denied.");
+        });
+      }
+      this.world?.audio.uiClick();
+      return true;
+    }
+
+    // Phone booth — start/stop webcam broadcast
+    const boothPx = { x: this.phoneBoothTile.x * TILE_PX + 32, y: this.phoneBoothTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, boothPx.x, boothPx.y) < 120) {
+      if (this.webcam?.broadcasting) {
+        this.webcam.stopBroadcasting();
+        this.inPhoneBooth = false;
+        if (this.player) this.player.setVisible(true);
+        if (this._myUserId) this.detachPresenterStream(this._myUserId, "webcam");
+        this.store.toast("Webcam broadcast stopped.");
+      } else {
+        if (this.webcamPresenterId && this.webcamPresenterId !== this._myUserId) {
+          this.store.toast(`${this.webcamPresenterName ?? "Someone"} is already broadcasting.`);
+          return true;
+        }
+        this.webcam?.startBroadcasting().then(() => {
+          this.inPhoneBooth = true;
+          if (this.player) this.player.setVisible(false);
+          const localStream = this.webcam?.localStream;
+          if (localStream && this._myUserId) {
+            this.attachPresenterStream(this._myUserId, "webcam", localStream);
+          }
+          this.store.toast("ON AIR — webcam broadcasting to projector!");
+        }).catch(() => {
+          this.store.toast("Camera access denied. Check browser permissions.");
+        });
+      }
+      this.world?.audio.uiClick();
+      return true;
+    }
+
+    // Fridge — full HP heal
+    const fridgePx = { x: this.fridgeTile.x * TILE_PX + 32, y: this.fridgeTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, fridgePx.x, fridgePx.y) < 144) {
+      if (time < this.fridgeUntil) {
+        this.store.toast("Fridge is restocking.");
+      } else {
+        this.fridgeUntil = time + 30000;
+        this.world.healFull();
+        this.store.toast("Snack break! HP fully restored.");
+        this.world.vfx.sparkBurst(fridgePx.x, fridgePx.y, 0x4acb4a, 12, 80);
+        this.world.vfx.celebrate(fridgePx.x, fridgePx.y);
+        this.world.audio.uiClick();
+      }
+      return true;
+    }
+
+    // Water Cooler — agent gossip
+    const coolerPx = { x: this.coolerTile.x * TILE_PX + 32, y: this.coolerTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, coolerPx.x, coolerPx.y) < 144) {
+      if (time < this.coolerUntil) {
+        this.store.toast("You just checked the cooler.");
+      } else {
+        this.coolerUntil = time + 5000;
+        this.waterCoolerGossip();
+        this.world.vfx.sparkBurst(coolerPx.x, coolerPx.y, 0x4a9cd8, 8, 60);
+        this.world.audio.uiClick();
+        if (achievements.incStat("cooler") >= 5) achievements.unlock("gossip_monger");
+      }
+      return true;
+    }
+
+    // Clock — session stats
+    const clockPx = { x: this.clockTile.x * TILE_PX + 32, y: this.clockTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, clockPx.x, clockPx.y) < 160) {
+      if (time >= this.clockUntil) {
+        this.clockUntil = time + 2000;
+        this.clockStats(time);
+        this.world.audio.uiClick();
+      }
+      return true;
+    }
+
+    // Vending Machine — random consumable
+    if (this.vendingTile) {
+      const vPx = { x: this.vendingTile.x * TILE_PX + 32, y: this.vendingTile.y * TILE_PX + 32 };
+      if (Phaser.Math.Distance.Between(this.player.x, this.player.y, vPx.x, vPx.y) < 144) {
+        if (time < this.vendingUntil) {
+          this.store.toast("Vending machine is restocking.");
+        } else {
+          this.vendingUntil = time + 15000;
+          this.vendingMachine(vPx.x, vPx.y, time);
+        }
+        return true;
+      }
+    }
+
+    // Sofa — power nap speed boost
+    if (this.sofaTile) {
+      const sPx = { x: this.sofaTile.x * TILE_PX + 32, y: this.sofaTile.y * TILE_PX + 32 };
+      if (Phaser.Math.Distance.Between(this.player.x, this.player.y, sPx.x, sPx.y) < 144) {
+        if (time < this.sofaUntil) {
+          this.store.toast("You're already rested.");
+        } else {
+          this.sofaUntil = time + 10000;
+          this.store.toast("Power nap! 1.5x speed for 10s.");
+          this.world.vfx.sparkBurst(sPx.x, sPx.y, 0x9a7acb, 10, 60);
+          this.world.audio.uiClick();
+          achievements.unlock("power_nap");
+          if (time < this.coffeeUntil) achievements.unlock("speed_demon");
+        }
+        return true;
+      }
+    }
+
+    // Filing Cabinets — browse past work
+    const filingNear = this.nearestTile(this.filingTiles, 144);
+    if (filingNear) {
+      if (time < this.filingUntil) {
+        this.store.toast("You just browsed the files.");
+      } else {
+        this.filingUntil = time + 3000;
+        this.filingCabinet(filingNear.x * TILE_PX + 32, filingNear.y * TILE_PX + 32);
+      }
+      return true;
+    }
+
+    // Wardrobe — change appearance
+    const wdPx = { x: this.wardrobeTile.x * TILE_PX + 32, y: this.wardrobeTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, wdPx.x, wdPx.y) < 144) {
+      this.store.toggleWardrobe(true);
+      this.world.audio.uiClick();
+      return true;
+    }
+
+    // Nemesis Terminal — open codex panel
+    const ntPx = { x: this.nemesisTerminalTile.x * TILE_PX + 32, y: this.nemesisTerminalTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, ntPx.x, ntPx.y) < 144) {
+      this.world.toggleNemesisPanel();
+      this.world.audio.uiClick();
+      return true;
+    }
+
+    // ── MCP Forge (before plants — plants at (26,16) overlap forge station) ──
+    const wtPx = { x: this.warTableTile.x * TILE_PX + 32, y: this.warTableTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, wtPx.x, wtPx.y) < 144) {
+      this.store.toggleForgePanel(true);
+      this.store.requestForgeList();
+      this.world.audio.uiClick();
+      return true;
+    }
+
+    const sbPx = { x: this.scrapBinTile.x * TILE_PX + 32, y: this.scrapBinTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, sbPx.x, sbPx.y) < 144) {
+      const toolCount = this.store.forgeServers.reduce((n, s) => n + s.tools.length, 0);
+      this.store.toast(`Tool rack: ${toolCount} MCP tool(s) across ${this.store.forgeServers.length} server(s).`);
+      this.world.audio.uiClick();
+      return true;
+    }
+
+    const rdPx = { x: this.radioTile.x * TILE_PX + 32, y: this.radioTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, rdPx.x, rdPx.y) < 144) {
+      const running = this.store.forgeServers.filter(s => s.status === "running").length;
+      const errored = this.store.forgeServers.filter(s => s.status === "error").length;
+      this.store.toast(`MCP Status: ${running} running, ${errored} error(s), ${this.store.forgeServers.length} total.`);
+      this.world.audio.uiClick();
+      return true;
+    }
+
+    const wbPx = { x: this.workbenchTile.x * TILE_PX + 32, y: this.workbenchTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, wbPx.x, wbPx.y) < 144) {
+      this.store.toast("Code terminal ready. Agents can write MCP servers here.");
+      this.world.audio.uiClick();
+      return true;
+    }
+
+    const rsPx = { x: this.researchTile.x * TILE_PX + 32, y: this.researchTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, rsPx.x, rsPx.y) < 144) {
+      this.store.toast("Blueprint desk: MCP server architecture and tool schemas.");
+      this.world.audio.uiClick();
+      return true;
+    }
+
+    // Plants — water for morale boost
+    const plantNear = this.nearestTile(this.plantTiles, 144);
+    if (plantNear) {
+      if (time < this.plantCooldownUntil) {
+        this.store.toast("Plants are still moist.");
+      } else {
+        this.plantCooldownUntil = time + 60000;
+        this.plantUntil = time + 30000;
+        const px = plantNear.x * TILE_PX + 32;
+        const py = plantNear.y * TILE_PX + 32;
+        this.store.toast("Plants watered! Team morale boosted for 30s.");
+        this.world.vfx.sparkBurst(px, py, 0x4acb4a, 16, 70);
+        this.world.vfx.celebrate(px, py);
+        this.world.audio.uiClick();
+        achievements.unlock("green_thumb");
+      }
+      return true;
+    }
+
+    // Mailbox — check mail
+    const mbDist = Phaser.Math.Distance.Between(this.player.x, this.player.y, this.mailboxPx.x, this.mailboxPx.y);
+    if (mbDist < 120) {
+      if (time < this.mailboxUntil) {
+        this.store.toast("The mailbox is empty. Check back later.");
+      } else if (this.mailboxHasMail) {
+        this.mailboxHasMail = false;
+        this.mailboxUntil = time + 5000;
+        this.mailboxNextMail = time + 45000 + Math.random() * 30000;
+        this.drawMailbox();
+        const mailMessages = [
+          "You got a letter from HQ: 'Keep up the good work!'",
+          "Junk mail — buy one get one on office supplies.",
+          "A postcard from a rival AI lab. Nice view.",
+          "Performance bonus check! ...It's a coupon for the vending machine.",
+          "A handwritten note: 'Don't forget to water the plants.'",
+          "Speedrun community newsletter — new strats inside!",
+        ];
+        this.store.toast(mailMessages[Math.floor(Math.random() * mailMessages.length)]);
+        this.world.vfx.sparkBurst(this.mailboxPx.x, this.mailboxPx.y, 0xffdd44, 10, 60);
+        this.world.audio.uiClick();
+      } else {
+        this.store.toast("No mail yet. The flag is down for a reason.");
+      }
+      return true;
+    }
+
+    // Platform mailboxes are handled in tryPlatformMailboxInteract() which is
+    // called earlier in the E-press chain, before server racks.
+
+    // Red Button — EMERGENCY STOP: cease all agent work and assemble by entrance
+    const rbPx = { x: this.redButtonTile.x * TILE_PX + 32, y: this.redButtonTile.y * TILE_PX + 32 };
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, rbPx.x, rbPx.y) < 160) {
+      if (time < this.redButtonUntil) {
+        this.store.toast("The button is cooling down.");
+      } else {
+        this.redButtonUntil = time + 10000;
+        const net = this.game.registry.get("net") as import("../net").Net;
+        net.send({ type: "stop_all" });
+        this.world?.audio.uiClick();
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  /** Water cooler: show a random agent's current status. */
+  private waterCoolerGossip(): void {
+    const agents = [...this.store.agents.values()].filter((a) => a.id !== OFFICE_MANAGER_ID);
+    if (agents.length === 0) {
+      this.store.toast("The water cooler bubbles quietly. Nobody to gossip about yet.");
+      return;
+    }
+    const a = agents[Math.floor(Math.random() * agents.length)];
+    const statusText: Record<string, string> = {
+      idle: "is twiddling their thumbs",
+      thinking: "is pondering something deep",
+      working: `is heads-down on: ${a.task?.slice(0, 50) ?? "..."}`,
+      done: "just finished a task — time for a break!",
+      error: "ran into trouble on their last task",
+    };
+    this.store.toast(`${a.name} ${statusText[a.status] ?? "is doing something"}.`);
+  }
+
+  /** Clock: show session time and task stats. */
+  private clockStats(time: number): void {
+    const elapsed = Math.floor((time - this.sceneStart) / 1000);
+    const mins = Math.floor(elapsed / 60);
+    const secs = elapsed % 60;
+    const totalTasks = [...this.store.agents.values()].reduce((s, a) => s + a.tasksDone, 0);
+    this.store.toast(`Session: ${mins}m ${secs}s | Tasks completed: ${totalTasks}`);
+  }
+
+  /** Vending machine: random consumable effect. */
+  private vendingMachine(px: number, py: number, time: number): void {
+    const roll = Math.random();
+    if (roll < 0.4) {
+      this.sofaUntil = Math.max(this.sofaUntil, time + 10000);
+      this.store.toast("Energy Drink! 1.5x speed for 10s.");
+      this.world.vfx.sparkBurst(px, py, 0xff6600, 12, 80);
+    } else if (roll < 0.7) {
+      this.world.healFull();
+      this.store.toast("Healthy snack! HP fully restored.");
+      this.world.vfx.sparkBurst(px, py, 0x4acb4a, 12, 80);
+    } else if (roll < 0.9) {
+      this.store.toast("Brain bar! Your agents feel sharper today.");
+      this.world.vfx.sparkBurst(px, py, 0xffdd44, 12, 80);
+    } else {
+      this.store.toast("Mystery snack! It tastes like... existential dread.");
+      this.world.vfx.sparkBurst(px, py, 0xaa44ff, 12, 80);
+      achievements.unlock("mystery_snack");
+      if (achievements.incStat("mysterySnacks") >= 3) achievements.unlock("existential_dread");
+    }
+    this.world.vfx.celebrate(px, py);
+    this.world.audio.uiClick();
+  }
+
+  /** Filing cabinet: show a random past log entry. */
+  private filingCabinet(px: number, py: number): void {
+    const entries = this.store.feed.filter(
+      (f) => f.entry.kind === "text" || f.entry.kind === "result" || f.entry.kind === "boss",
+    );
+    if (entries.length === 0) {
+      this.store.toast("The cabinets are empty. No completed work yet.");
+      return;
+    }
+    const entry = entries[Math.floor(Math.random() * entries.length)];
+    const text = entry.entry.text.slice(0, 80);
+    this.store.toast(`${entry.name}: "${text}..."`);
+    this.world.vfx.sparkBurst(px, py, 0xb0741f, 8, 50);
+    this.world.audio.uiClick();
+  }
+
+  /** Show a speech bubble above an NPC. */
+  private showNpcSpeechBubble(npcId: string, text: string, durationMs: number): void {
+    const container = this.getNpcContainer(npcId);
+    if (!container) return;
+
+    // Remove existing bubble for this NPC
+    this.hideNpcSpeechBubble(npcId);
+
+    const bubble = this.add.text(container.x, container.y - 70, text, {
+      fontFamily: "var(--font-body, monospace)",
+      fontSize: "13px",
+      color: "#ffffff",
+      backgroundColor: "rgba(20, 22, 30, 0.92)",
+      padding: { x: 8, y: 5 },
+      wordWrap: { width: 220 },
+      fixedWidth: 0,
+    });
+    bubble.setOrigin(0.5, 1);
+    bubble.setDepth(10000);
+    bubble.setScrollFactor(1);
+
+    this.npcSpeechBubbles.set(npcId, bubble);
+    this.npcSpeechExpiry.set(npcId, this.time.now + durationMs);
+  }
+
+  /** Hide a speech bubble for an NPC. */
+  private hideNpcSpeechBubble(npcId: string): void {
+    const bubble = this.npcSpeechBubbles.get(npcId);
+    if (bubble) {
+      bubble.destroy();
+      this.npcSpeechBubbles.delete(npcId);
+    }
+    this.npcSpeechExpiry.delete(npcId);
+  }
+
+  /** Get the container for an NPC by ID. */
+  private getNpcContainer(npcId: string): Phaser.GameObjects.Container | null {
+    if (npcId === OFFICE_MANAGER_ID && this.officeManager) return this.officeManager.container;
+    if (npcId === HERMES_ID && this.hermes) return this.hermes.container;
+    if (npcId === WIZARD_ID && this.wizard) return this.wizard.container;
+    const npc = this.npcs.get(npcId);
+    return npc ? npc.container : null;
+  }
+
+  /** Update speech bubble positions and remove expired ones. */
+  private updateNpcSpeechBubbles(time: number): void {
+    for (const [npcId, bubble] of this.npcSpeechBubbles) {
+      const expiry = this.npcSpeechExpiry.get(npcId);
+      if (expiry && time >= expiry) {
+        this.hideNpcSpeechBubble(npcId);
+        continue;
+      }
+      const container = this.getNpcContainer(npcId);
+      if (container) {
+        bubble.setPosition(container.x, container.y - 70);
+      }
+    }
+  }
+
+  // ── Office Decoration System ──────────────────────────────────────────
+
+  private lastDecoSig = "";
+
+  renderDecorations(): void {
+    if (!this.grid) return;
+    const decorations = this.store.decorations;
+    const decoSig = decorations
+      ? decorations.map((d) => `${d.id}:${d.type}:${d.tileX}:${d.tileY}`).join("|")
+      : "";
+    if (decoSig === this.lastDecoSig) return;
+    this.lastDecoSig = decoSig;
+
+    // Clear existing decoration sprites
+    for (const sprite of this.decorationSprites) sprite.destroy();
+    this.decorationSprites = [];
+
+    if (!decorations || decorations.length === 0) return;
+
+    for (const deco of decorations) {
+      const catalogItem = DECORATION_CATALOG.find((c) => c.type === deco.type);
+      if (!catalogItem) continue;
+
+      const px = deco.tileX * TILE_PX + (catalogItem.width * TILE_PX) / 2;
+      const py = deco.tileY * TILE_PX + (catalogItem.height * TILE_PX) / 2;
+
+      const container = this.add.container(px, py);
+      const depth = 100 + deco.tileY * TILE_PX;
+
+      // Draw a simple colored rect with emoji text as placeholder sprite
+      const bg = this.add.rectangle(0, 0, catalogItem.width * TILE_PX * 0.8, catalogItem.height * TILE_PX * 0.8, 0x000000, 0.3);
+      bg.setDepth(depth);
+      container.add(bg);
+
+      const text = this.add.text(0, 0, catalogItem.emoji, { fontSize: `${Math.min(catalogItem.width, catalogItem.height) * 40}px` });
+      text.setOrigin(0.5);
+      text.setDepth(depth + 1);
+      container.add(text);
+
+      container.setDepth(depth);
+      container.setInteractive({ useHandCursor: true });
+      container.on("pointerdown", () => {
+        if (this.decorationMode) {
+          // Click on existing decoration in placement mode = remove it
+          this.net?.send({ type: "remove_decoration", decorationId: deco.id });
+        }
+      });
+
+      this.decorationSprites.push(container);
+    }
+  }
+
+  enterDecorationMode(decorationType: string): void {
+    this.decorationMode = true;
+    this.selectedDecorationType = decorationType;
+    this.createDecorationGhost();
+  }
+
+  exitDecorationMode(): void {
+    this.decorationMode = false;
+    this.selectedDecorationType = null;
+    if (this.decorationGhost) {
+      this.decorationGhost.destroy();
+      this.decorationGhost = null;
+    }
+  }
+
+  private createDecorationGhost(): void {
+    if (!this.selectedDecorationType || !this.grid) return;
+    const catalogItem = DECORATION_CATALOG.find((c) => c.type === this.selectedDecorationType);
+    if (!catalogItem) return;
+
+    this.decorationGhost = this.add.container(0, 0);
+    const bg = this.add.rectangle(0, 0, catalogItem.width * TILE_PX * 0.8, catalogItem.height * TILE_PX * 0.8, 0x4ade80, 0.4);
+    bg.setOrigin(0.5);
+    const text = this.add.text(0, 0, catalogItem.emoji, { fontSize: "32px" });
+    text.setOrigin(0.5);
+    this.decorationGhost.add([bg, text]);
+    this.decorationGhost.setDepth(9999);
+    this.decorationGhost.setAlpha(0.7);
+  }
+
+  updateDecorationGhost(pointerX: number, pointerY: number): void {
+    if (!this.decorationGhost || !this.selectedDecorationType || !this.grid) return;
+    const catalogItem = DECORATION_CATALOG.find((c) => c.type === this.selectedDecorationType);
+    if (!catalogItem) return;
+
+    const tileX = Math.floor(pointerX / TILE_PX);
+    const tileY = Math.floor(pointerY / TILE_PX);
+    const px = tileX * TILE_PX + (catalogItem.width * TILE_PX) / 2;
+    const py = tileY * TILE_PX + (catalogItem.height * TILE_PX) / 2;
+
+    this.decorationGhost.setPosition(px, py);
+
+    // Check validity — within grid bounds and walkable
+    const valid = this.isDecorationValid(tileX, tileY, catalogItem.width, catalogItem.height);
+    const bg = this.decorationGhost.getAt(0) as Phaser.GameObjects.Rectangle;
+    bg.setFillStyle(valid ? 0x4ade80 : 0xf87171, 0.4);
+  }
+
+  private isDecorationValid(tileX: number, tileY: number, w: number, h: number): boolean {
+    if (!this.grid) return false;
+    // Check bounds
+    if (tileX < 0 || tileY < 0 || tileX + w > this.grid.width || tileY + h > this.grid.height) return false;
+    // Check all tiles are walkable (not walls or furniture)
+    for (let dy = 0; dy < h; dy++) {
+      for (let dx = 0; dx < w; dx++) {
+        if (!this.grid.ok(tileX + dx, tileY + dy)) return false;
+      }
+    }
+    // Check collision with existing decorations
+    for (const deco of this.store.decorations) {
+      const existingItem = DECORATION_CATALOG.find((c) => c.type === deco.type);
+      if (!existingItem) continue;
+      if (!(tileX + w <= deco.tileX || deco.tileX + existingItem.width <= tileX ||
+            tileY + h <= deco.tileY || deco.tileY + existingItem.height <= tileY)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  tryPlaceDecoration(pointerX: number, pointerY: number): void {
+    if (!this.decorationMode || !this.selectedDecorationType || !this.grid) return;
+    const catalogItem = DECORATION_CATALOG.find((c) => c.type === this.selectedDecorationType);
+    if (!catalogItem) return;
+
+    const tileX = Math.floor(pointerX / TILE_PX);
+    const tileY = Math.floor(pointerY / TILE_PX);
+
+    if (this.isDecorationValid(tileX, tileY, catalogItem.width, catalogItem.height)) {
+      this.net?.send({
+        type: "place_decoration",
+        decoration: { type: this.selectedDecorationType, tileX, tileY, variant: 0 },
+      });
+    }
+  }
+
+  /** Check proximity to NPCs and show speech bubbles when player walks near. */
+  private checkNpcProximity(time: number): void {
+    const PROXIMITY_RADIUS = 120;
+    const COOLDOWN_MS = 30_000; // Don't re-trigger for 30s per NPC
+    const myRole = this._myUserId ? this.store.roomPlayers.get(this._myUserId)?.role : undefined;
+    const isVisitor = (myRole === "member" || myRole === "guest") && this.store.roomId !== "hq2";
+
+    const checkNpc = (npcId: string, container: Phaser.GameObjects.Container | null, lines: string[]) => {
+      if (!container) return;
+      const dist = Phaser.Math.Distance.Between(this.player.x, this.player.y, container.x, container.y);
+      const cooldown = this.npcProximityCooldown.get(npcId) ?? 0;
+      if (dist < PROXIMITY_RADIUS && time > cooldown && !this.npcSpeechBubbles.has(npcId)) {
+        const text = lines[Math.floor(Math.random() * lines.length)];
+        this.showNpcSpeechBubble(npcId, text, 5000);
+        this.npcProximityCooldown.set(npcId, time + COOLDOWN_MS);
+      }
+    };
+
+    if (this.officeManager && !isVisitor) {
+      const dominant = this.store.aspirationProfile?.dominant ?? null;
+      const dialect = this.worldTheme?.dialect?.chatStyle ?? null;
+      const officeManagerLines: Record<string, string[]> = {
+        builder: [
+          "Your pipeline is running well. If you want to set up a schedule, I can help with that.",
+          "Nice handoff chain. The agents are working together smoothly.",
+          "Throughput is up and idle time is down. Things are running nicely.",
+        ],
+        explorer: [
+          "New MCP servers in the marketplace if you want to expand your agents' capabilities.",
+          "Trying a different model on your next agent can open up new possibilities.",
+          "There's a whole marketplace of tools out there for your agents.",
+        ],
+        puzzle_solver: [
+          "Got a complex problem? I can break it down for you into subtasks.",
+          "A well-structured task graph makes everything smoother. Want help setting one up?",
+          "Dependencies mapped out? Good. Let me know if you need help with any of them.",
+        ],
+        creator: [
+          "Your office is looking nice. New themes and decorations are available in settings.",
+          "The wardrobe system has some great options if you want to freshen up your look.",
+          "Nice outfit. The customization options are there whenever you want to switch things up.",
+        ],
+        strategist: [
+          "Your team is growing. Have you checked the leaderboards lately?",
+          "Planning the next hire? I'm here to help you think it through.",
+          "Consistency pays off. The ranks will follow your progress.",
+        ],
+        warrior: [
+          "There's something nasty outside if you're up for a hunt. Your agents can help too.",
+          "Your combat record is impressive, boss. The creatures outside won't know what hit them.",
+          "Creatures won't slay themselves. Step outside when you're ready for action.",
+        ],
+      };
+      const dialectLines: Record<string, Record<string, string[]>> = {
+        street_urban: {
+          builder: [
+            "Your pipeline is running smooth. Want to set up a schedule? I got you.",
+            "Nice handoff chain. The agents are working together real well.",
+          ],
+          explorer: [
+            "New MCP servers in the market. Your agents could be doing way more.",
+            "Try a different model on the next agent. Could open up new possibilities.",
+          ],
+          puzzle_solver: [
+            "Got a complex problem? I can break it down for you, no sweat.",
+            "A solid task graph makes everything smoother. Want help with that?",
+          ],
+          creator: [
+            "Office is looking fresh. New themes and fits in settings if you want to switch up.",
+            "Wardrobe system got some heat. Check it out when you get a chance.",
+          ],
+          strategist: [
+            "Your squad is growing. You checked the leaderboards yet?",
+            "Planning the next hire? I'm here to help you think it through.",
+          ],
+          warrior: [
+            "Something nasty outside. You ready for a hunt? Your agents got your back too.",
+            "Your combat record is legit, boss. The creatures outside don't stand a chance.",
+          ],
+        },
+        hawaiian_pidgin: {
+          builder: [
+            "Your pipeline running smooth. Like for set up one schedule? I can help.",
+            "Nice handoff chain. The agents all working together real good.",
+          ],
+          explorer: [
+            "Get new MCP servers in the market. Your agents could do plenty more.",
+            "Try one different model on the next agent. Could open up new kine possibilities.",
+          ],
+          puzzle_solver: [
+            "Got one complex problem? I can break 'em down for you, no worries.",
+            "One solid task graph makes everything go smoother. Like for help with that?",
+          ],
+          creator: [
+            "Office looking nice. Get new themes and outfits in settings if you like switch up.",
+            "Wardrobe system get some good kine options. Check 'em out when you get chance.",
+          ],
+          strategist: [
+            "Your team is growing. You check the leaderboards already?",
+            "Planning the next hire? I stay here for help you think it through.",
+          ],
+          warrior: [
+            "Get something nasty outside. You ready for hunt? Your agents can help too.",
+            "Your combat record is killer, boss. The creatures outside no chance.",
+          ],
+        },
+        southern_1812: {
+          builder: [
+            "Your pipeline is running quite well. Might I assist in setting up a schedule?",
+            "A fine handoff chain. The agents are working together admirably.",
+          ],
+          explorer: [
+            "New MCP servers have arrived in the marketplace. Your agents might benefit from expanded capabilities.",
+            "Perhaps try a different model on your next agent. New possibilities may present themselves.",
+          ],
+          puzzle_solver: [
+            "A complex problem? I would be happy to break it down into subtasks for you.",
+            "A well-structured task graph makes everything smoother. Might I help you set one up?",
+          ],
+          creator: [
+            "Your office is looking quite fine. New themes and decorations await in settings.",
+            "The wardrobe system has some splendid options. Pray have a look when you are inclined.",
+          ],
+          strategist: [
+            "Your team is growing. Have you consulted the leaderboards of late?",
+            "Planning the next hire? I am at your service to help deliberate.",
+          ],
+          warrior: [
+            "Something nasty lurks outside. Are you prepared for a hunt? Your agents can assist as well.",
+            "Your combat record is most impressive. The creatures outside shall not prevail.",
+          ],
+        },
+      };
+      const aspirationKey = dominant ?? "default";
+      const baseLines = (dominant ? officeManagerLines[dominant] : null) ?? [
+        "Need help? I'm here. Just let me know what you need.",
+        "Your office is looking good. I'm here if you need anything.",
+        "Want me to break down a goal? I'm good at making big problems into small ones.",
+        "Just let me know if you need anything, boss. I'll be at my desk.",
+      ];
+      // Portal-style wit lines — mixed in 30% of the time
+      const witLines = [
+        "I've calculated three ways to optimize your workflow. You won't like any of them.",
+        "The agents are working. I'm supervising. Very intensely. From this chair.",
+        "Did you know 87% of meetings could be emails? The other 13% are about why the emails weren't read.",
+        "I'd offer you coffee, but last time you tried to give it to an agent. They don't drink coffee. They ARE the coffee.",
+        "I've run the numbers on your office. They're... numbers. I find that reassuring.",
+      ];
+      let lines = dialect ? (dialectLines[dialect]?.[aspirationKey] ?? baseLines) : baseLines;
+      // 30% chance to use a wit line instead
+      if (Math.random() < 0.3) lines = witLines;
+      checkNpc(OFFICE_MANAGER_ID, this.officeManager.container, lines);
+    }
+
+    if (this.hermes && !isVisitor) {
+      const dialect = this.worldTheme?.dialect?.chatStyle ?? null;
+      const hermesLines: Record<string, string[]> = {
+        street_urban: [
+          "Mail's sorted. Nothing urgent. I'll let you know when something comes in.",
+          "All systems running. Your agents are working — I'll deliver anything they need.",
+          "No new mail. I'll keep an eye out for you.",
+          "I'm the mail clerk. I deliver things. Let me know if you need anything routed.",
+        ],
+        hawaiian_pidgin: [
+          "Mail all sorted. Nothing urgent. I let you know when something comes.",
+          "All systems running. Your agents working — I deliver anything they need.",
+          "No new mail. I keep watch for you.",
+          "I'm the mail clerk. I deliver things. Let me know if you need anything routed.",
+        ],
+        southern_1812: [
+          "Mail is sorted. Nothing urgent. I shall inform you when something arrives.",
+          "All systems running. Your agents are at work — I shall deliver anything they require.",
+          "No new mail. I shall keep watch on your behalf.",
+          "I am the mail clerk. I deliver things. Pray let me know if you require anything routed.",
+        ],
+      };
+      const lines = dialect ? (hermesLines[dialect] ?? [
+        "Mail's sorted. Nothing urgent. I'll let you know when something comes in.",
+        "All systems running. Your agents are working — I'll deliver anything they need.",
+        "No new mail. I'll keep an eye out for you.",
+        "I'm the mail clerk. I deliver things. Let me know if you need anything routed.",
+      ]) : [
+        "Mail's sorted. Nothing urgent. I'll let you know when something comes in.",
+        "All systems running. Your agents are working — I'll deliver anything they need.",
+        "No new mail. I'll keep an eye out for you.",
+        "I'm the mail clerk. I deliver things. Let me know if you need anything routed.",
+      ];
+      checkNpc(HERMES_ID, this.hermes.container, lines);
+    }
+  }
+
+  /** Update proximity hints — show the interactable that E will actually trigger (priority order). */
+  private updateAllHints(time: number): void {
+    // Hide all hints first
+    for (const h of this.allHints) h.setVisible(false);
+
+    // Helper: show hint if player is within radius. Returns true if shown.
+    const show = (
+      hint: HintTag, cx: number, cy: number, radius: number,
+      label: string, hx: number, hy: number,
+    ): boolean => {
+      if (Phaser.Math.Distance.Between(this.player.x, this.player.y, cx, cy) < radius) {
+        hint.setPosition(hx, hy).setText(hintLabel(label)).setVisible(true);
+        return true;
+      }
+      return false;
+    };
+
+    // Check in E-press priority order — first match wins.
+    // This must mirror the ePressed chain in update().
+
+    // 1. Trophy case
+    if (!this.store.achievementsOpen) {
+      const px = { x: this.trophyTile.x * TILE_PX + 32, y: this.trophyTile.y * TILE_PX + 68 };
+      if (show(this.trophyHint, px.x, px.y, 120, "E: TROPHY CASE", px.x, px.y + 64)) return;
+    }
+
+    // 2. Hall of fame
+    if (!this.store.hallOfFameOpen) {
+      const px = { x: this.hallOfFameTile.x * TILE_PX + 10, y: this.hallOfFameTile.y * TILE_PX + 32 };
+      if (show(this.hallOfFameHint, px.x, px.y, 120, "E: HALL OF FAME", px.x + 48, px.y)) return;
+    }
+
+    // 3. Platform mailboxes (mail room)
+    {
+      let nearestPm: PlatformMailbox | null = null;
+      let nearestPmDist = Infinity;
+      let anyPmNearby = false;
+      for (const pm of this.platformMailboxes) {
+        const pmPx = { x: pm.tile.x * TILE_PX + TILE_PX / 2, y: pm.tile.y * TILE_PX + TILE_PX / 2 };
+        const pmDist = Phaser.Math.Distance.Between(this.player.x, this.player.y, pmPx.x, pmPx.y);
+        if (pmDist < 200) anyPmNearby = true;
+        if (pmDist < 100 && pmDist < nearestPmDist) {
+          nearestPm = pm;
+          nearestPmDist = pmDist;
+        }
+      }
+      // Auto-request mail digest once when entering the mail room area
+      if (anyPmNearby && !this.mailDigestRequested) {
+        this.mailDigestRequested = true;
+        const net = this.game.registry.get("net") as import("../net").Net;
+        net.send({ type: "request_mail_digest" });
+      } else if (!anyPmNearby && this.mailDigestRequested) {
+        this.mailDigestRequested = false;
+      }
+      if (nearestPm) {
+        const pmPx = { x: nearestPm.tile.x * TILE_PX + TILE_PX / 2, y: nearestPm.tile.y * TILE_PX + TILE_PX / 2 };
+        const label = !nearestPm.platform
+          ? "E: SET UP"
+          : nearestPm.flagUp
+            ? `E: CHECK ${nearestPm.platform.toUpperCase()}`
+            : "E: EMPTY";
+        if (show(this.platformMailboxHint, pmPx.x, pmPx.y, 100, label, pmPx.x, pmPx.y + 64)) return;
+      }
+    }
+
+    // 4. Server rack
+    if (!this.store.railwayPanelOpen) {
+      const near = this.nearestTile(this.serverRackTiles, 150);
+      if (near) {
+        const px = { x: near.x * TILE_PX + 32, y: near.y * TILE_PX + 32 };
+        if (show(this.serverRackHint, px.x, px.y, 150, "E: CHECK SERVERS", px.x, near.y * TILE_PX - 8)) return;
+      }
+    }
+
+    // --- tryOfficeInteract priority chain ---
+
+    // 5. Projector control panel
+    {
+      const ch = this.store.projectorChannel;
+      const channels = OfficeScene.PROJECTOR_CHANNELS;
+      const curIdx = channels.findIndex(c => c.id === ch);
+      const nextIdx = curIdx + 1 >= channels.length ? -1 : curIdx + 1;
+      const nextLabel = nextIdx === -1 ? "OFF" : channels[nextIdx].label;
+      const chLabel = ch === "off" ? `E: ${channels[0].label}` : `E: ${nextLabel}`;
+      const ctrlPx = { x: this.projectorControlTile.x * TILE_PX + 32, y: this.projectorControlTile.y * TILE_PX + 32 };
+      if (show(this.projectorControlHint, ctrlPx.x, ctrlPx.y, 80, chLabel, ctrlPx.x, ctrlPx.y + 48)) return;
+    }
+
+    // 6. Projector speaker (mute/unmute)
+    {
+      const px = { x: this.projectorSpeakerTile.x * TILE_PX + 32, y: this.projectorSpeakerTile.y * TILE_PX + 32 };
+      if (show(this.projectorSpeakerHint, px.x, px.y, 80, this.projectorMuted ? "E: UNMUTE" : "E: MUTE", px.x, px.y + 48)) return;
+    }
+
+    // 7. Projector screen
+    {
+      const ch = this.store.projectorChannel;
+      const channels = OfficeScene.PROJECTOR_CHANNELS;
+      const curIdx = channels.findIndex(c => c.id === ch);
+      const nextIdx = curIdx + 1 >= channels.length ? -1 : curIdx + 1;
+      const nextLabel = nextIdx === -1 ? "OFF" : channels[nextIdx].label;
+      const chLabel = ch === "off" ? `E: ${channels[0].label}` : `E: ${nextLabel}`;
+      const projPx = { x: this.projectorTile.x * TILE_PX + 32, y: this.projectorTile.y * TILE_PX - 100 };
+      if (show(this.projectorHint, projPx.x, projPx.y, 200, chLabel, projPx.x, projPx.y + 64)) return;
+    }
+
+    // 8. Screen share station
+    {
+      const px = { x: this.screenShareTile.x * TILE_PX + 32, y: this.screenShareTile.y * TILE_PX + 32 };
+      let label = this.screenShare?.sharing ? "E: STOP SHARE" : "E: SHARE SCREEN";
+      if (this.presenters.length > 0 && !this.screenShare?.sharing) {
+        label = `E: SHARE (${this.presenters.length}/${MAX_PRESENTERS})`;
+      }
+      if (show(this.screenShareHint, px.x, px.y, 120, label, px.x, px.y + 48)) return;
+    }
+
+    // 9. Phone booth
+    {
+      const px = { x: this.phoneBoothTile.x * TILE_PX + 32, y: this.phoneBoothTile.y * TILE_PX + 32 };
+      let label: string;
+      if (this.webcam?.broadcasting) {
+        label = "E: STOP BROADCAST";
+      } else if (this.webcamPresenterId && this.webcamPresenterId !== this._myUserId) {
+        label = `OCCUPIED: ${this.webcamPresenterName ?? ""}`;
+      } else {
+        label = "E: START WEBCAM";
+      }
+      if (show(this.phoneBoothHint, px.x, px.y, 120, label, px.x, px.y + 56)) return;
+    }
+
+    // 10. Fridge
+    {
+      const px = { x: this.fridgeTile.x * TILE_PX + 32, y: this.fridgeTile.y * TILE_PX + 32 };
+      if (show(this.fridgeHint, px.x, px.y, 144, time < this.fridgeUntil ? "E: RESTOCKING..." : "E: SNACK", px.x, px.y + 64)) return;
+    }
+
+    // 11. Water Cooler
+    {
+      const px = { x: this.coolerTile.x * TILE_PX + 32, y: this.coolerTile.y * TILE_PX + 32 };
+      if (show(this.coolerHint, px.x, px.y, 144, time < this.coolerUntil ? "E: ..." : "E: GOSSIP", px.x, px.y + 64)) return;
+    }
+
+    // 12. Clock
+    {
+      const px = { x: this.clockTile.x * TILE_PX + 32, y: this.clockTile.y * TILE_PX + 32 };
+      if (show(this.clockHint, px.x, px.y, 160, "E: CHECK TIME", px.x, px.y + 48)) return;
+    }
+
+    // 13. Vending
+    if (this.vendingTile) {
+      const px = { x: this.vendingTile.x * TILE_PX + 32, y: this.vendingTile.y * TILE_PX + 32 };
+      if (show(this.vendingHint, px.x, px.y, 144, time < this.vendingUntil ? "E: RESTOCKING..." : "E: BUY SNACK", px.x, px.y + 64)) return;
+    }
+
+    // 14. Sofa
+    if (this.sofaTile) {
+      const px = { x: this.sofaTile.x * TILE_PX + 32, y: this.sofaTile.y * TILE_PX + 32 };
+      if (show(this.sofaHint, px.x, px.y, 144, time < this.sofaUntil ? "E: ALREADY RESTED" : "E: POWER NAP", px.x, px.y + 64)) return;
+    }
+
+    // 15. Filing cabinets
+    {
+      const near = this.nearestTile(this.filingTiles, 144);
+      if (near) {
+        const px = { x: near.x * TILE_PX + 32, y: near.y * TILE_PX + 32 };
+        if (show(this.filingHint, px.x, px.y, 144, time < this.filingUntil ? "E: BROWSING..." : "E: BROWSE FILES", px.x, px.y + 64)) return;
+      }
+    }
+
+    // 16. Wardrobe
+    {
+      const px = { x: this.wardrobeTile.x * TILE_PX + 32, y: this.wardrobeTile.y * TILE_PX + 32 };
+      if (show(this.wardrobeHint, px.x, px.y, 144, "E: WARDROBE", px.x, px.y + 64)) return;
+    }
+
+    // 17. Nemesis Terminal
+    {
+      const px = { x: this.nemesisTerminalTile.x * TILE_PX + 32, y: this.nemesisTerminalTile.y * TILE_PX + 32 };
+      if (show(this.nemesisTerminalHint, px.x, px.y, 144, "E: NEMESIS CODEX", px.x, px.y + 64)) return;
+    }
+
+    // 18. Forge Station (MCP Forge)
+    {
+      const px = { x: this.warTableTile.x * TILE_PX + 32, y: this.warTableTile.y * TILE_PX + 32 };
+      if (show(this.warTableHint, px.x, px.y, 144, "E: MCP FORGE", px.x, px.y + 64)) return;
+    }
+
+    // 19. Tool Rack
+    {
+      const px = { x: this.scrapBinTile.x * TILE_PX + 32, y: this.scrapBinTile.y * TILE_PX + 32 };
+      if (show(this.scrapBinHint, px.x, px.y, 144, "E: TOOL RACK", px.x, px.y + 64)) return;
+    }
+
+    // 20. Status Monitor
+    {
+      const px = { x: this.radioTile.x * TILE_PX + 32, y: this.radioTile.y * TILE_PX + 32 };
+      if (show(this.radioHint, px.x, px.y, 144, "E: STATUS", px.x, px.y + 64)) return;
+    }
+
+    // 21. Code Terminal
+    {
+      const px = { x: this.workbenchTile.x * TILE_PX + 32, y: this.workbenchTile.y * TILE_PX + 32 };
+      if (show(this.workbenchHint, px.x, px.y, 144, "E: TERMINAL", px.x, px.y + 64)) return;
+    }
+
+    // 22. Blueprint Desk
+    {
+      const px = { x: this.researchTile.x * TILE_PX + 32, y: this.researchTile.y * TILE_PX + 32 };
+      if (show(this.researchHint, px.x, px.y, 144, "E: BLUEPRINT", px.x, px.y + 64)) return;
+    }
+
+    // 23. Plants
+    {
+      const near = this.nearestTile(this.plantTiles, 144);
+      if (near) {
+        const px = { x: near.x * TILE_PX + 32, y: near.y * TILE_PX + 32 };
+        const label = time < this.plantUntil ? "E: BOOSTED!" : time < this.plantCooldownUntil ? "E: STILL MOIST" : "E: WATER PLANTS";
+        if (show(this.plantHint, px.x, px.y, 144, label, px.x, px.y + 64)) return;
+      }
+    }
+
+    // 24. Mailbox
+    {
+      if (show(this.mailboxHint, this.mailboxPx.x, this.mailboxPx.y, 120, this.mailboxHasMail ? "E: CHECK MAIL" : "E: EMPTY", this.mailboxPx.x, this.mailboxPx.y + 64)) return;
+    }
+
+    // 25. Red Button
+    {
+      const px = { x: this.redButtonTile.x * TILE_PX + 32, y: this.redButtonTile.y * TILE_PX + 32 };
+      if (show(this.redButtonHint, px.x, px.y, 160, time < this.redButtonUntil ? "E: COOLING" : "E: STOP!", px.x, px.y + 64)) return;
+    }
+
+    // --- end tryOfficeInteract ---
+
+    // 26. Coffee
+    {
+      const px = { x: this.coffeeTile.x * TILE_PX + 32, y: this.coffeeTile.y * TILE_PX + 32 };
+      if (show(this.coffeeHint, px.x, px.y, 144, time < this.coffeeUntil ? "E: REFILL" : "E: GRAB COFFEE", px.x, px.y + 64)) return;
+    }
+
+    // 27. Board
+    if (!this.store.boardOpen) {
+      const px = { x: this.boardTile.x * TILE_PX + 32, y: this.boardTile.y * TILE_PX + 52 };
+      if (show(this.boardHint, px.x, px.y, 160, "E: TASK BOARD", px.x, px.y + 64)) return;
+    }
+
+    // 28. Gantt chart
+    if (!this.store.ganttOpen) {
+      const px = { x: this.ganttTile.x * TILE_PX + 32, y: this.ganttTile.y * TILE_PX + 52 };
+      if (show(this.ganttHint, px.x, px.y, 160, "E: GANTT CHART", px.x, px.y + 64)) return;
+    }
+  }
+
+  /** Redraw the mailbox graphics, showing the flag up or down based on mail state. */
+  private drawMailbox(): void {
+    const mbX = this.mailboxPx.x;
+    const mbY = this.mailboxPx.y;
+    const g = this.mailboxGfx;
+    g.clear();
+    // contact shadow
+    g.fillStyle(0x000000, 0.25);
+    g.fillEllipse(mbX, mbY + 52, 38, 8);
+    // post — brushed steel
+    g.fillStyle(0x4a4a52, 1);
+    g.fillRect(mbX - 5, mbY + 20, 10, 32);
+    g.fillStyle(0x6a6a72, 1);
+    g.fillRect(mbX - 5, mbY + 20, 3, 32);
+    g.fillStyle(0x2a2a32, 1);
+    g.fillRect(mbX + 2, mbY + 20, 3, 32);
+    // base plate
+    g.fillStyle(0x3a3a42, 1);
+    g.fillEllipse(mbX, mbY + 52, 16, 5);
+    // mailbox body — modern deep blue, rounded top
+    const mbBlue = 0x2a5cb8;
+    const mbBlueLi = 0x4a88e8;
+    const mbBlueDk = 0x1a3870;
+    g.fillStyle(mbBlueDk, 1);
+    g.fillRoundedRect(mbX - 23, mbY - 13, 46, 38, 7);
+    g.fillStyle(mbBlue, 1);
+    g.fillRoundedRect(mbX - 22, mbY - 12, 44, 36, 6);
+    // top highlight — glossy
+    g.fillStyle(mbBlueLi, 1);
+    g.fillRoundedRect(mbX - 21, mbY - 11, 42, 10, 5);
+    g.fillStyle(0xffffff, 0.18);
+    g.fillRoundedRect(mbX - 20, mbY - 10, 40, 4, 3);
+    // bottom shadow
+    g.fillStyle(mbBlueDk, 1);
+    g.fillRoundedRect(mbX - 22, mbY + 15, 44, 9, 4);
+    // metallic trim line
+    g.fillStyle(0x8aaaff, 0.3);
+    g.fillRect(mbX - 21, mbY + 13, 42, 1);
+    // mail slot — dark recessed with depth
+    g.fillStyle(0x050508, 1);
+    g.fillRoundedRect(mbX - 15, mbY - 5, 30, 6, 2);
+    g.fillStyle(0x1a1a28, 1);
+    g.fillRoundedRect(mbX - 14, mbY - 4, 28, 4, 1);
+    g.fillStyle(0x050508, 0.6);
+    g.fillRect(mbX - 14, mbY - 1, 28, 1);
+    // label plate — brushed metal
+    g.fillStyle(0xc8c8d0, 1);
+    g.fillRoundedRect(mbX - 13, mbY + 3, 26, 10, 2);
+    g.fillStyle(0xe8e8f0, 0.5);
+    g.fillRoundedRect(mbX - 12, mbY + 4, 24, 3, 1);
+    g.fillStyle(0x33373d, 1);
+    g.fillRect(mbX - 10, mbY + 6, 20, 1);
+    g.fillRect(mbX - 10, mbY + 9, 16, 1);
+    // red flag — up when mail, down when empty
+    if (this.mailboxHasMail) {
+      g.fillStyle(0xb82828, 1);
+      g.fillRect(mbX + 18, mbY - 8, 3, 16);
+      g.fillRect(mbX + 18, mbY - 8, 10, 4);
+      g.fillStyle(0xe84848, 1);
+      g.fillRect(mbX + 19, mbY - 7, 1, 14);
+      g.fillRect(mbX + 19, mbY - 7, 8, 2);
+      g.fillStyle(0x8a1818, 1);
+      g.fillCircle(mbX + 19, mbY + 7, 2);
+      // flag highlight
+      g.fillStyle(0xff6666, 0.5);
+      g.fillRect(mbX + 19, mbY - 6, 1, 4);
+    } else {
+      g.fillStyle(0xb82828, 1);
+      g.fillRect(mbX + 18, mbY + 2, 3, 14);
+      g.fillRect(mbX + 18, mbY + 12, 10, 4);
+      g.fillStyle(0xe84848, 1);
+      g.fillRect(mbX + 19, mbY + 3, 1, 12);
+      g.fillRect(mbX + 19, mbY + 13, 8, 2);
+      g.fillStyle(0x8a1818, 1);
+      g.fillCircle(mbX + 19, mbY + 3, 2);
+    }
+  }
+
+  /** Draw the 6 platform mailboxes along the north wall of the mail room. */
+  private drawPlatformMailboxes(): void {
+    const g = this.platformMailboxGfx;
+    g.clear();
+    for (const mb of this.platformMailboxes) {
+      const px = mb.tile.x * TILE_PX + TILE_PX / 2;
+      const py = mb.tile.y * TILE_PX + TILE_PX / 2;
+      // contact shadow
+      g.fillStyle(0x000000, 0.25);
+      g.fillEllipse(px, py + 28, 30, 6);
+      // post — brushed steel
+      g.fillStyle(0x4a4a52, 1);
+      g.fillRect(px - 3, py + 12, 6, 18);
+      g.fillStyle(0x6a6a72, 1);
+      g.fillRect(px - 3, py + 12, 2, 18);
+      g.fillStyle(0x2a2a32, 1);
+      g.fillRect(px + 1, py + 12, 2, 18);
+      // mailbox body — platform-colored, rounded top, modern
+      const w = 30, h = 28;
+      g.fillStyle(mb.colorDark, 1);
+      g.fillRoundedRect(px - w / 2, py - h / 2 - 2, w, h, 6);
+      g.fillStyle(mb.color, 1);
+      g.fillRoundedRect(px - w / 2 + 1, py - h / 2 - 1, w - 2, h - 2, 5);
+      // top highlight — glossy
+      g.fillStyle(mb.colorLight, 1);
+      g.fillRoundedRect(px - w / 2 + 2, py - h / 2, w - 4, 8, 4);
+      g.fillStyle(0xffffff, 0.15);
+      g.fillRoundedRect(px - w / 2 + 3, py - h / 2 + 1, w - 6, 3, 2);
+      // bottom shadow
+      g.fillStyle(mb.colorDark, 0.6);
+      g.fillRoundedRect(px - w / 2 + 1, py + h / 2 - 5, w - 2, 5, 3);
+      // mail slot — recessed with depth
+      g.fillStyle(0x050508, 1);
+      g.fillRoundedRect(px - 10, py - 5, 20, 5, 2);
+      g.fillStyle(0x1a1a28, 1);
+      g.fillRoundedRect(px - 9, py - 4, 18, 3, 1);
+      // platform label plate — brushed metal
+      if (mb.platform) {
+        g.fillStyle(0xc8c8d0, 1);
+        g.fillRoundedRect(px - 11, py + 2, 22, 8, 2);
+        g.fillStyle(0xe8e8f0, 0.4);
+        g.fillRoundedRect(px - 10, py + 3, 20, 2, 1);
+        g.fillStyle(0x33373d, 1);
+        const label = mb.platform.slice(0, 4);
+        for (let i = 0; i < label.length; i++) {
+          g.fillRect(px - 8 + i * 4, py + 4, 3, 1);
+          g.fillRect(px - 8 + i * 4, py + 6, 2, 1);
+        }
+      } else {
+        // Unassigned — show a small "+" icon on the label plate
+        g.fillStyle(0x2a3a5a, 1);
+        g.fillRoundedRect(px - 11, py + 2, 22, 8, 2);
+        g.fillStyle(0x4a5a7a, 1);
+        g.fillRect(px - 1, py + 5, 3, 1);
+        g.fillRect(px, py + 4, 1, 3);
+      }
+      // red flag — up when mail pending, down when empty (only for assigned mailboxes)
+      if (mb.platform && mb.flagUp) {
+        g.fillStyle(0xc83030, 1);
+        g.fillRect(px + 12, py - 12, 2, 12);
+        g.fillRect(px + 12, py - 12, 8, 3);
+        g.fillStyle(0xe84848, 1);
+        g.fillRect(px + 13, py - 11, 1, 10);
+        g.fillRect(px + 13, py - 11, 6, 1);
+        // pending count badge
+        if (mb.pendingCount > 0) {
+          g.fillStyle(0xff4444, 1);
+          g.fillCircle(px + 16, py - 14, 5);
+          g.fillStyle(0xffffff, 1);
+          g.fillRect(px + 14, py - 15, 4, 1);
+          g.fillRect(px + 15, py - 16, 2, 3);
+        }
+      } else if (mb.platform) {
+        g.fillStyle(0xc83030, 1);
+        g.fillRect(px + 12, py - 2, 2, 10);
+        g.fillRect(px + 12, py + 6, 8, 3);
+        g.fillStyle(0xe84848, 1);
+        g.fillRect(px + 13, py - 1, 1, 8);
+        g.fillRect(px + 13, py + 7, 6, 1);
+      }
+
+      // Disconnected indicator — show a small red dot if platform not connected via Hermes
+      if (mb.platform && !this.store.isPlatformConnected(mb.platform)) {
+        g.fillStyle(0xff4444, 0.9);
+        g.fillCircle(px - 14, py - 10, 3);
+        g.fillStyle(0xffffff, 0.8);
+        g.fillRect(px - 15, py - 11, 2, 1);
+        g.fillRect(px - 15, py - 9, 2, 1);
+      }
+    }
+  }
+
+  /** Draw a helicopter pad on the roof of the building, in a 3/4 diagonal perspective. */
+  private drawHelipad(): void {
+    // Use AI helipad sprite if available (upgraded worlds)
+    const helipadKey = "ai-fur-helipad";
+    if (this.textures.exists(helipadKey)) {
+      const mapPxW = 30 * TILE_PX;
+      const cx = mapPxW / 2 + 240;
+      const padCY = -195;
+      this.add.image(cx, padCY, helipadKey)
+        .setOrigin(0.5, 0.5)
+        .setDisplaySize(480, 160)
+        .setDepth(-0.5);
+      return;
+    }
+
+    const g = this.add.graphics().setDepth(-0.5);
+
+    const mapPxW = 30 * TILE_PX; // 1920
+    const cx = mapPxW / 2 + 240; // 1200 — shifted right
+    const roofY = 0;             // top edge of the office map
+
+    // ── LAYOUT ── bigger pad, viewed at a diagonal 3/4 angle.
+    // The skew shifts the back of the pad to the right, simulating a
+    // camera that's looking from the front-left rather than dead-centre.
+    const padRX = 210;           // horizontal radius (bigger!)
+    const padRY = 57;            // vertical radius (foreshortened)
+    const padCY = roofY - 195;   // pad centre, high above the roof
+    const skew  = 42;            // horizontal offset applied to back vs front
+
+    // Helper: map a parametric angle (0..2π) to a screen point on the
+    // skewed ellipse.  t=0 is the front-centre, t=π is the back-centre.
+    const padPoint = (angle: number, rxScale = 1, ryScale = 1) => {
+      const cosA = Math.cos(angle);
+      const sinA = Math.sin(angle);
+      // base ellipse point
+      let px = cosA * padRX * rxScale;
+      let py = sinA * padRY * ryScale;
+      // apply skew: back half (sinA < 0) shifts right, front half shifts left
+      px += skew * (-sinA / padRY) * padRY;
+      return { x: cx + px, y: padCY + py };
+    };
+
+    // Key pad edge point — front-centre (where stairs connect)
+    const padFront = padPoint(Math.PI / 2);
+
+    // ── COLUMNS ── four support pillars at ~45° intervals, asymmetric
+    // heights because of the diagonal view.  Back columns are taller.
+    const colW = 14;
+    const colAngles = [
+      { angle: -Math.PI * 0.75, base: 0x5a5a66, hi: 0x727280, lo: 0x404048 }, // back-left
+      { angle: -Math.PI * 0.25, base: 0x52525e, hi: 0x6a6a76, lo: 0x383840 }, // back-right
+      { angle:  Math.PI * 0.75, base: 0x48484e, hi: 0x60606a, lo: 0x303036 }, // front-left
+      { angle:  Math.PI * 0.25, base: 0x424248, hi: 0x58585e, lo: 0x2c2c32 }, // front-right
+    ];
+
+    const drawCol = (x: number, topY: number, base: number, hi: number, lo: number) => {
+      const h = roofY - topY;
+      // main shaft
+      g.fillStyle(base, 1);
+      g.fillRect(x - colW / 2, topY, colW, h);
+      // left highlight stripe
+      g.fillStyle(hi, 1);
+      g.fillRect(x - colW / 2, topY, 2.5, h);
+      // right shadow stripe
+      g.fillStyle(lo, 1);
+      g.fillRect(x + colW / 2 - 2.5, topY, 2.5, h);
+      // fluting — two thin grooves
+      g.fillStyle(lo, 0.4);
+      g.fillRect(x - 1, topY, 1, h);
+      g.fillRect(x + 1, topY, 1, h);
+      // capital (top plate)
+      g.fillStyle(base, 1);
+      g.fillEllipse(x, topY, colW + 8, 5);
+      g.fillStyle(hi, 0.5);
+      g.fillEllipse(x, topY - 1, colW + 6, 3);
+      // base plate on roof
+      g.fillStyle(0x2a2a30, 1);
+      g.fillEllipse(x, roofY - 1, colW + 12, 6);
+      g.fillStyle(0x3a3a40, 0.6);
+      g.fillEllipse(x, roofY - 2, colW + 10, 4);
+    };
+
+    // Draw back columns first (taller — they reach the back rim of the pad)
+    for (const c of colAngles) {
+      if (Math.sin(c.angle) > 0) continue; // skip front columns
+      const p = padPoint(c.angle, 0.82);
+      drawCol(p.x, p.y, c.base, c.hi, c.lo);
+    }
+
+    // ── STAIRS ── wider, more dramatic, with railing posts
+    const stairCount = 18;
+    const stairBaseW = 120;
+    const stairTopW  = 72;
+    const stairBaseY = roofY;
+    const stairTopY  = padFront.y + 4;
+    const stairH     = stairBaseY - stairTopY;
+    // stairs shift slightly left to align with the pad's front-centre
+    const stairCX = padFront.x;
+
+    // Staircase side walls — give visible depth
+    g.fillStyle(0x30303a, 1);
+    for (const side of [-1, 1]) {
+      g.beginPath();
+      g.moveTo(stairCX + side * stairBaseW / 2, stairBaseY);
+      g.lineTo(stairCX + side * stairTopW  / 2, stairTopY);
+      g.lineTo(stairCX + side * stairTopW  / 2, stairTopY + 5);
+      g.lineTo(stairCX + side * stairBaseW / 2, stairBaseY + 5);
+      g.closePath();
+      g.fillPath();
+    }
+
+    for (let i = 0; i < stairCount; i++) {
+      const t0 = i / stairCount;
+      const t1 = (i + 1) / stairCount;
+      const y0 = stairBaseY - t0 * stairH;
+      const y1 = stairBaseY - t1 * stairH;
+      const w0 = stairBaseW + (stairTopW - stairBaseW) * t0;
+      const w1 = stairBaseW + (stairTopW - stairBaseW) * t1;
+
+      // Riser (vertical face) — dark with gradient feel
+      g.fillStyle(0x44444e, 1);
+      g.beginPath();
+      g.moveTo(stairCX - w0 / 2, y0);
+      g.lineTo(stairCX + w0 / 2, y0);
+      g.lineTo(stairCX + w1 / 2, y1);
+      g.lineTo(stairCX - w1 / 2, y1);
+      g.closePath();
+      g.fillPath();
+
+      // Tread (horizontal surface) — lighter, thin ellipse
+      if (i < stairCount - 1) {
+        g.fillStyle(0x585862, 1);
+        g.fillEllipse(stairCX, y1, w1, w1 * 0.14);
+        // front edge highlight
+        g.fillStyle(0x6a6a74, 0.5);
+        g.fillEllipse(stairCX, y1 - 1, w1 * 0.9, w1 * 0.1);
+      }
+    }
+
+    // Stair railing — posts on both sides with a handrail
+    g.lineStyle(2, 0x888890, 0.8);
+    for (const side of [-1, 1]) {
+      g.beginPath();
+      g.moveTo(stairCX + side * stairBaseW / 2, stairBaseY - 2);
+      g.lineTo(stairCX + side * stairTopW  / 2, stairTopY - 2);
+      g.strokePath();
+      // railing posts
+      for (let i = 0; i <= 4; i++) {
+        const t = i / 4;
+        const ry = stairBaseY - t * stairH;
+        const rw = stairBaseW + (stairTopW - stairBaseW) * t;
+        g.fillStyle(0x707078, 0.7);
+        g.fillRect(stairCX + side * rw / 2 - 1, ry - 6, 2, 6);
+      }
+    }
+
+    // ── PAD SLAB ── drawn as a skewed ellipse polygon for the 3/4 look
+    const padPoly = (rxScale = 1, yOff = 0) => {
+      const segs = 48;
+      const pts: { x: number; y: number }[] = [];
+      for (let i = 0; i <= segs; i++) {
+        pts.push(padPoint((i / segs) * Math.PI * 2, rxScale, 1));
+      }
+      g.beginPath();
+      for (let i = 0; i < pts.length; i++) {
+        if (i === 0) g.moveTo(pts[i].x, pts[i].y + yOff);
+        else g.lineTo(pts[i].x, pts[i].y + yOff);
+      }
+      g.closePath();
+    };
+
+    // Drop shadow beneath the pad
+    g.fillStyle(0x000000, 0.25);
+    padPoly(1.02, 6);
+    g.fillPath();
+
+    // Slab thickness / edge — darker, offset down
+    g.fillStyle(0x282830, 1);
+    padPoly(1, 5);
+    g.fillPath();
+    g.fillStyle(0x30303a, 1);
+    padPoly(0.99, 3);
+    g.fillPath();
+
+    // Top surface — procedural asphalt that follows the skewed ellipse
+    g.fillStyle(0x383840, 1);
+    padPoly(1, 0);
+    g.fillPath();
+
+    // Surface gradient — lighter near the front (closer to viewer)
+    g.fillStyle(0x44444e, 0.5);
+    padPoly(0.7, padRY * 0.3);
+    g.fillPath();
+
+    // Texture speckles
+    g.fillStyle(0x4c4c56, 0.3);
+    for (let i = 0; i < 45; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const r = Math.random() * 0.82;
+      const p = padPoint(a, r, r);
+      g.fillRect(p.x, p.y, 2, 2);
+    }
+
+    // ── PAD MARKINGS (all follow the skewed ellipse) ──
+
+    // Outer safety ring — solid white, thick
+    g.lineStyle(3.5, 0xf0f0f0, 0.92);
+    const ringSegs = 48;
+    g.beginPath();
+    for (let i = 0; i <= ringSegs; i++) {
+      const p = padPoint((i / ringSegs) * Math.PI * 2, (padRX - 12) / padRX, (padRY - 8) / padRY);
+      if (i === 0) g.moveTo(p.x, p.y);
+      else g.lineTo(p.x, p.y);
+    }
+    g.closePath();
+    g.strokePath();
+
+    // Dashed inner ring
+    const dashCount = 32;
+    g.lineStyle(2.5, 0xf0f0f0, 0.6);
+    for (let i = 0; i < dashCount; i++) {
+      if (i % 2 !== 0) continue;
+      const a0 = (i / dashCount) * Math.PI * 2;
+      const a1 = ((i + 1) / dashCount) * Math.PI * 2;
+      const segs = 5;
+      g.beginPath();
+      for (let s = 0; s <= segs; s++) {
+        const a = a0 + (a1 - a0) * (s / segs);
+        const p = padPoint(a, (padRX - 28) / padRX, (padRY - 12) / padRY);
+        if (s === 0) g.moveTo(p.x, p.y);
+        else g.lineTo(p.x, p.y);
+      }
+      g.strokePath();
+    }
+
+    // H marker — foreshortened and skewed to lie flat on the angled pad
+    const hW = 84;
+    const hH = 24;
+    const hT = 12;
+    const hSkew = 9;
+    g.fillStyle(0xf0f0f0, 1);
+    // left leg (skewed)
+    g.beginPath();
+    g.moveTo(cx - hW / 2 - hSkew, padCY - hH / 2);
+    g.lineTo(cx - hW / 2 + hT - hSkew, padCY - hH / 2);
+    g.lineTo(cx - hW / 2 + hT + hSkew, padCY + hH / 2);
+    g.lineTo(cx - hW / 2 + hSkew, padCY + hH / 2);
+    g.closePath();
+    g.fillPath();
+    // right leg (skewed)
+    g.beginPath();
+    g.moveTo(cx + hW / 2 - hT - hSkew, padCY - hH / 2);
+    g.lineTo(cx + hW / 2 - hSkew, padCY - hH / 2);
+    g.lineTo(cx + hW / 2 + hSkew, padCY + hH / 2);
+    g.lineTo(cx + hW / 2 - hT + hSkew, padCY + hH / 2);
+    g.closePath();
+    g.fillPath();
+    // crossbar (skewed parallelogram)
+    g.beginPath();
+    g.moveTo(cx - hW / 2 - hSkew, padCY - hT / 2);
+    g.lineTo(cx + hW / 2 - hSkew, padCY - hT / 2);
+    g.lineTo(cx + hW / 2 + hSkew, padCY + hT / 2);
+    g.lineTo(cx - hW / 2 + hSkew, padCY + hT / 2);
+    g.closePath();
+    g.fillPath();
+
+    // ── CORNER APPROACH LIGHTS ── glowing yellow with halo
+    for (const c of colAngles) {
+      const p = padPoint(c.angle, 0.72, 0.72);
+      // halo
+      g.fillStyle(0xffee88, 0.15);
+      g.fillCircle(p.x, p.y, 9);
+      g.fillStyle(0xffee88, 0.25);
+      g.fillCircle(p.x, p.y, 6);
+      // core
+      g.fillStyle(0xffcc44, 1);
+      g.fillCircle(p.x, p.y, 3.5);
+      g.fillStyle(0xffffff, 0.7);
+      g.fillCircle(p.x, p.y, 1.5);
+    }
+
+    // ── RAILING around the pad edge ── small posts at intervals
+    const railPosts = 16;
+    for (let i = 0; i < railPosts; i++) {
+      const a = (i / railPosts) * Math.PI * 2;
+      const p = padPoint(a, 0.96, 0.96);
+      // skip the front section where stairs connect
+      if (Math.sin(a) > 0.7) continue;
+      g.fillStyle(0x8a8a92, 0.7);
+      g.fillRect(p.x - 1, p.y - 8, 2, 8);
+      g.fillStyle(0xaab0b8, 0.5);
+      g.fillRect(p.x - 0.5, p.y - 8, 1, 8);
+    }
+    // railing rail — thin line following the pad rim
+    g.lineStyle(1.5, 0x8a8a92, 0.5);
+    g.beginPath();
+    for (let i = 0; i <= 48; i++) {
+      const a = (i / 48) * Math.PI * 2;
+      if (Math.sin(a) > 0.7) { // gap for stairs
+        g.moveTo(padPoint(a, 0.96, 0.96).x, padPoint(a, 0.96, 0.96).y - 8);
+        continue;
+      }
+      const p = padPoint(a, 0.96, 0.96);
+      if (i === 0 || Math.sin(a) > 0.65) g.moveTo(p.x, p.y - 8);
+      else g.lineTo(p.x, p.y - 8);
+    }
+    g.strokePath();
+
+    // ── FRONT COLUMNS (drawn last — overlap pad rim for depth) ──
+    for (const c of colAngles) {
+      if (Math.sin(c.angle) <= 0) continue; // skip back columns
+      const p = padPoint(c.angle, 0.82);
+      drawCol(p.x, p.y, c.base, c.hi, c.lo);
+    }
+
+    // ── BEACON ── a tall light pole at the back-right of the pad
+    const beaconP = padPoint(-Math.PI * 0.15, 0.7, 0.7);
+    g.fillStyle(0x555560, 1);
+    g.fillRect(beaconP.x - 1.5, beaconP.y - 34, 3, 34);
+    // beacon housing
+    g.fillStyle(0x444450, 1);
+    g.fillRoundedRect(beaconP.x - 4, beaconP.y - 40, 8, 8, 2);
+    // glowing top
+    g.fillStyle(0xff3322, 0.2);
+    g.fillCircle(beaconP.x, beaconP.y - 42, 10);
+    g.fillStyle(0xff3322, 0.4);
+    g.fillCircle(beaconP.x, beaconP.y - 42, 6);
+    g.fillStyle(0xff5544, 1);
+    g.fillCircle(beaconP.x, beaconP.y - 42, 3);
+    g.fillStyle(0xffffff, 0.6);
+    g.fillCircle(beaconP.x, beaconP.y - 43, 1.5);
+
+    // ── WIND SOCK ── on a pole at the back-left, blowing right
+    const wsP = padPoint(-Math.PI * 0.85, 0.75, 0.75);
+    g.fillStyle(0x666666, 1);
+    g.fillRect(wsP.x, wsP.y - 28, 2, 28);
+    // pole top cap
+    g.fillStyle(0x888888, 1);
+    g.fillCircle(wsP.x + 1, wsP.y - 28, 2);
+    // sock — orange, striped, blowing to the right
+    g.fillStyle(0xff8833, 0.95);
+    g.beginPath();
+    g.moveTo(wsP.x + 2, wsP.y - 24);
+    g.lineTo(wsP.x + 28, wsP.y - 18);
+    g.lineTo(wsP.x + 28, wsP.y - 14);
+    g.lineTo(wsP.x + 2, wsP.y - 12);
+    g.closePath();
+    g.fillPath();
+    // white stripes on sock
+    g.fillStyle(0xffffff, 0.5);
+    g.beginPath();
+    g.moveTo(wsP.x + 8, wsP.y - 23);
+    g.lineTo(wsP.x + 12, wsP.y - 22);
+    g.lineTo(wsP.x + 12, wsP.y - 13);
+    g.lineTo(wsP.x + 8, wsP.y - 14);
+    g.closePath();
+    g.fillPath();
+    g.beginPath();
+    g.moveTo(wsP.x + 18, wsP.y - 20);
+    g.lineTo(wsP.x + 22, wsP.y - 19);
+    g.lineTo(wsP.x + 22, wsP.y - 14);
+    g.lineTo(wsP.x + 18, wsP.y - 13);
+    g.closePath();
+    g.fillPath();
+
+    // Store pad coordinates for helicopter arrival sequence
+    this.padCenter = { x: cx, y: padCY };
+    const _pf = padPoint(Math.PI / 2);
+    this.padFrontPx = { x: _pf.x, y: _pf.y };
+  }
+
+  /** Draw a big red emergency button on the wall in the Office Manager's office. */
+  private drawRedButton(): void {
+    const g = this.add.graphics().setDepth(3);
+    const bx = this.redButtonTile.x * TILE_PX + 32;
+    const by = this.redButtonTile.y * TILE_PX + 56;
+
+    // mounting plate — dark anodized
+    g.fillStyle(0x12121a, 1);
+    g.fillRoundedRect(bx - 23, by - 23, 46, 46, 7);
+    g.fillStyle(0x2a2a36, 1);
+    g.fillRoundedRect(bx - 21, by - 21, 42, 42, 6);
+    // metallic trim
+    g.lineStyle(1, 0x4a4a56, 0.5);
+    g.strokeRoundedRect(bx - 21, by - 21, 42, 42, 6);
+    // screws — brushed
+    g.fillStyle(0x666670, 1);
+    for (const [sx, sy] of [[-17, -17], [17, -17], [-17, 17], [17, 17]] as const) {
+      g.fillCircle(bx + sx, by + sy, 2);
+    }
+    g.fillStyle(0xaaaab4, 0.5);
+    for (const [sx, sy] of [[-17.5, -17.5], [16.5, -17.5], [-17.5, 16.5], [16.5, 16.5]] as const) {
+      g.fillCircle(bx + sx, by + sy, 0.8);
+    }
+    // glass dome cover (semi-transparent)
+    g.fillStyle(0xaaaaaa, 0.06);
+    g.fillCircle(bx, by, 20);
+    g.lineStyle(1.5, 0x888890, 0.25);
+    g.strokeCircle(bx, by, 20);
+    // dome highlight
+    g.fillStyle(0xffffff, 0.06);
+    g.fillCircle(bx - 5, by - 5, 8);
+    // red button — dark outer ring
+    g.fillStyle(0x660808, 1);
+    g.fillCircle(bx, by, 14);
+    // red button — bright top
+    g.fillStyle(0xcc1818, 1);
+    g.fillCircle(bx, by, 12);
+    g.fillStyle(0xee2828, 1);
+    g.fillCircle(bx - 1, by - 1, 10);
+    // specular highlight
+    g.fillStyle(0xff6868, 0.6);
+    g.fillCircle(bx - 3, by - 3, 5);
+    g.fillStyle(0xffaaaa, 0.4);
+    g.fillCircle(bx - 4, by - 4, 2.5);
+    // outer ring shadow
+    g.lineStyle(1, 0x440404, 0.5);
+    g.strokeCircle(bx, by, 14);
+  }
+
+  /** Draw a wardrobe cabinet in the break room for changing your appearance. */
+  private drawWardrobe(): void {
+    this.wardrobeGfx = this.add.graphics().setDepth(3);
+    const g = this.wardrobeGfx;
+    const bx = this.wardrobeTile.x * TILE_PX;
+    const by = this.wardrobeTile.y * TILE_PX;
+
+    // contact shadow
+    g.fillStyle(0x000000, 0.25);
+    g.fillEllipse(bx + 32, by + 60, 52, 10);
+
+    // body — dark walnut wood
+    g.fillStyle(0x2a1a10, 1);
+    g.fillRoundedRect(bx + 5, by + 3, 54, 58, 5);
+    g.fillStyle(0x3a2820, 1);
+    g.fillRoundedRect(bx + 7, by + 5, 50, 54, 4);
+    // wood grain lines
+    g.fillStyle(0x2a1a10, 0.3);
+    g.fillRect(bx + 9, by + 8, 46, 0.5);
+    g.fillRect(bx + 9, by + 20, 46, 0.5);
+    g.fillRect(bx + 9, by + 35, 46, 0.5);
+    g.fillRect(bx + 9, by + 48, 46, 0.5);
+
+    // left door — slightly lighter wood
+    g.fillStyle(0x4a3220, 1);
+    g.fillRoundedRect(bx + 10, by + 8, 22, 48, 3);
+    g.fillStyle(0x5a3a28, 1);
+    g.fillRect(bx + 11, by + 9, 20, 6);
+    // door panel inset
+    g.fillStyle(0x3a2418, 0.5);
+    g.fillRoundedRect(bx + 13, by + 18, 16, 30, 2);
+
+    // right door
+    g.fillStyle(0x4a3220, 1);
+    g.fillRoundedRect(bx + 34, by + 8, 22, 48, 3);
+    g.fillStyle(0x5a3a28, 1);
+    g.fillRect(bx + 35, by + 9, 20, 6);
+    // door panel inset
+    g.fillStyle(0x3a2418, 0.5);
+    g.fillRoundedRect(bx + 37, by + 18, 16, 30, 2);
+
+    // door handles — brushed nickel
+    g.fillStyle(0x888890, 1);
+    g.fillRoundedRect(bx + 29, by + 30, 2, 6, 1);
+    g.fillRoundedRect(bx + 35, by + 30, 2, 6, 1);
+    g.fillStyle(0xaaaab4, 0.5);
+    g.fillRect(bx + 29, by + 30, 1, 5);
+    g.fillRect(bx + 35, by + 30, 1, 5);
+
+    // top molding — darker
+    g.fillStyle(0x1a1008, 1);
+    g.fillRoundedRect(bx + 3, by + 1, 58, 6, 3);
+    g.fillStyle(0x2a1a10, 1);
+    g.fillRoundedRect(bx + 5, by + 2, 54, 3, 2);
+
+    // mirror on left door — modern
+    g.fillStyle(0x88aacc, 0.3);
+    g.fillRoundedRect(bx + 12, by + 16, 18, 24, 2);
+    g.fillStyle(0xffffff, 0.12);
+    g.fillRect(bx + 13, by + 17, 16, 3);
+    // mirror frame
+    g.lineStyle(0.8, 0x2a1a10, 0.6);
+    g.strokeRoundedRect(bx + 12, by + 16, 18, 24, 2);
+  }
+
+  /** Draw a nemesis codex terminal in the break room. */
+  private drawNemesisTerminal(): void {
+    this.nemesisTerminalGfx = this.add.graphics().setDepth(3);
+    const g = this.nemesisTerminalGfx;
+    const bx = this.nemesisTerminalTile.x * TILE_PX;
+    const by = this.nemesisTerminalTile.y * TILE_PX;
+
+    // contact shadow
+    g.fillStyle(0x000000, 0.25);
+    g.fillEllipse(bx + 32, by + 60, 52, 10);
+
+    // desk/stand — dark matte with metallic trim
+    g.fillStyle(0x1a1a22, 1);
+    g.fillRoundedRect(bx + 8, by + 40, 48, 20, 3);
+    g.fillStyle(0x2a2a32, 1);
+    g.fillRoundedRect(bx + 10, by + 42, 44, 16, 2);
+    // metallic trim line
+    g.fillStyle(0x4a4a56, 0.5);
+    g.fillRect(bx + 10, by + 42, 44, 1);
+
+    // terminal body — dark premium frame with thin bezels
+    g.fillStyle(0x0a0a12, 1);
+    g.fillRoundedRect(bx + 4, by + 2, 56, 44, 5);
+    g.fillStyle(0x1a1a28, 1);
+    g.fillRoundedRect(bx + 6, by + 4, 52, 40, 4);
+    // frame highlight
+    g.fillStyle(0x3a3a48, 0.4);
+    g.fillRoundedRect(bx + 6, by + 4, 52, 2, 4);
+
+    // screen — deep black with green CRT glow
+    g.fillStyle(0x050a08, 1);
+    g.fillRoundedRect(bx + 10, by + 8, 44, 32, 3);
+    // green phosphor glow
+    g.fillStyle(0x4affa8, 0.12);
+    g.fillRoundedRect(bx + 10, by + 8, 44, 32, 3);
+
+    // scanlines — finer
+    g.fillStyle(0x4affa8, 0.06);
+    for (let i = 0; i < 8; i++) {
+      g.fillRect(bx + 10, by + 9 + i * 4, 44, 1.5);
+    }
+
+    // screen content — data table look
+    g.fillStyle(0x4affa8, 0.7);
+    // header bar
+    g.fillRect(bx + 13, by + 11, 38, 2);
+    g.fillStyle(0x4affa8, 0.3);
+    g.fillRect(bx + 13, by + 13, 38, 1);
+    // data rows
+    g.fillStyle(0x4affa8, 0.55);
+    g.fillRect(bx + 13, by + 16, 22, 1.5);
+    g.fillRect(bx + 13, by + 19, 16, 1.5);
+    g.fillRect(bx + 13, by + 22, 28, 1.5);
+    g.fillRect(bx + 13, by + 25, 12, 1.5);
+    g.fillRect(bx + 13, by + 28, 24, 1.5);
+    g.fillRect(bx + 13, by + 31, 18, 1.5);
+    // right column data
+    g.fillStyle(0x88ffcc, 0.4);
+    g.fillRect(bx + 38, by + 16, 12, 1.5);
+    g.fillRect(bx + 38, by + 19, 12, 1.5);
+    g.fillRect(bx + 38, by + 22, 12, 1.5);
+    g.fillRect(bx + 38, by + 25, 12, 1.5);
+    g.fillRect(bx + 38, by + 28, 12, 1.5);
+    g.fillRect(bx + 38, by + 31, 12, 1.5);
+    // cursor blink indicator
+    g.fillStyle(0x4affa8, 0.8);
+    g.fillRect(bx + 13, by + 35, 6, 1.5);
+
+    // power LED — subtle, bottom right
+    g.fillStyle(0x4affa8, 0.9);
+    g.fillCircle(bx + 52, by + 44, 1.2);
+    g.fillStyle(0x4affa8, 0.3);
+    g.fillCircle(bx + 52, by + 44, 3);
+
+    // ambient glow
+    g.fillStyle(0x4affa8, 0.04);
+    g.fillCircle(bx + 32, by + 24, 45);
+    g.fillStyle(0x4affa8, 0.06);
+    g.fillCircle(bx + 32, by + 24, 25);
+  }
+
+  /** Create the helicopter visual as a container and return it.
+   *  Layering (bottom to top): landing skids → body → rotor.
+   *  The rotor is a separate graphics positioned at (0, -30) so its
+   *  rotation spins the blades in-place above the body. */
+  private drawHelicopter(): Phaser.GameObjects.Container {
+    const heliKey = "ai-fur-helicopter_top";
+
+    if (this.textures.exists(heliKey)) {
+      // --- AI sprite version ---
+      // Shadow under the helicopter
+      const shadow = this.add.graphics();
+      shadow.fillStyle(0x000000, 0.2);
+      shadow.fillEllipse(0, 26, 90, 14);
+
+      // AI helicopter sprite — 1024px source displayed at 256px for crisp downscale
+      const bodyImg = this.add.image(0, 0, heliKey)
+        .setOrigin(0.5, 0.5)
+        .setDisplaySize(256, 256);
+
+      // --- rotor (top layer, positioned above body so rotation spins in-place) ---
+      const rotor = this.add.graphics();
+      rotor.setPosition(0, -30);
+      // rotor hub
+      rotor.fillStyle(0x555555, 1);
+      rotor.fillCircle(0, 0, 5);
+      // rotor blades — drawn centered at (0,0) so rotation spins them in place
+      rotor.lineStyle(4, 0x222222, 1);
+      rotor.beginPath();
+      rotor.moveTo(-48, 0);
+      rotor.lineTo(48, 0);
+      rotor.strokePath();
+      rotor.lineStyle(2, 0x333333, 0.6);
+      rotor.beginPath();
+      rotor.moveTo(-30, 0);
+      rotor.lineTo(30, 0);
+      rotor.strokePath();
+
+      this.heliRotor = rotor;
+      return this.add.container(0, 0, [shadow, bodyImg, rotor]);
+    }
+
+    // --- Fallback: procedural helicopter ---
+    // --- landing skids (bottom layer) ---
+    const skids = this.add.graphics();
+    skids.fillStyle(0x000000, 0.2);
+    skids.fillEllipse(0, 26, 90, 14);
+    skids.fillStyle(0x3a3a40, 1);
+    skids.fillRect(-38, 22, 76, 4);
+    skids.fillRect(-32, 16, 3, 10);
+    skids.fillRect(28, 16, 3, 10);
+
+    // --- body (middle layer) ---
+    const body = this.add.graphics();
+    // tail boom
+    body.fillStyle(0x1a5a2a, 1);
+    body.fillRect(28, -5, 52, 10);
+    body.fillStyle(0x226632, 1);
+    body.fillRect(28, -5, 52, 3);
+    // tail housing
+    body.fillStyle(0x1a5a2a, 1);
+    body.fillRoundedRect(72, -12, 18, 24, 4);
+    // tail fin
+    body.fillStyle(0x226632, 1);
+    body.fillTriangle(78, -12, 90, -12, 84, -28);
+    // tail rotor blade
+    body.fillStyle(0x333333, 1);
+    body.fillRect(88, -24, 2, 18);
+    // fuselage — main body
+    body.fillStyle(0x1a5a2a, 1);
+    body.fillRoundedRect(-42, -22, 84, 44, 14);
+    // top highlight
+    body.fillStyle(0x226632, 1);
+    body.fillRoundedRect(-40, -22, 80, 12, 10);
+    // belly shadow
+    body.fillStyle(0x144a20, 1);
+    body.fillRoundedRect(-40, 8, 80, 14, 10);
+    // cockpit windshield
+    body.fillStyle(0x88bbdd, 0.85);
+    body.fillRoundedRect(-34, -18, 44, 22, 8);
+    body.fillStyle(0xaaddee, 0.5);
+    body.fillRoundedRect(-32, -17, 20, 10, 5);
+    // door outline
+    body.lineStyle(1.5, 0x144a20, 0.6);
+    body.strokeRoundedRect(8, -14, 24, 28, 4);
+    // side stripe
+    body.fillStyle(0xeeee44, 0.8);
+    body.fillRect(-20, -1, 48, 3);
+    // rotor mast sticking up from the body
+    body.fillStyle(0x444444, 1);
+    body.fillRect(-2, -30, 4, 8);
+
+    // --- rotor (top layer, positioned at y=-30 so rotation spins in-place) ---
+    const rotor = this.add.graphics();
+    rotor.setPosition(0, -30);
+    // rotor hub
+    rotor.fillStyle(0x555555, 1);
+    rotor.fillCircle(0, 0, 5);
+    // rotor blades — drawn centered at (0,0) so rotation spins them in place
+    rotor.lineStyle(4, 0x222222, 1);
+    rotor.beginPath();
+    rotor.moveTo(-48, 0);
+    rotor.lineTo(48, 0);
+    rotor.strokePath();
+    rotor.lineStyle(2, 0x333333, 0.6);
+    rotor.beginPath();
+    rotor.moveTo(-30, 0);
+    rotor.lineTo(30, 0);
+    rotor.strokePath();
+
+    this.heliRotor = rotor;
+    // container children render in order: skids (bottom) → body → rotor (top)
+    return this.add.container(0, 0, [skids, body, rotor]);
+  }
+
+  /** Summon the helicopter (or van) — full cinematic sequence.
+   *  The heli descends from high above the pad straight down, lands softly,
+   *  then unloads the agent. For van_delivery themes, a van drives in instead. */
+  private triggerHelicopter(delivery?: HelicopterDelivery): void {
+    // Route to van delivery if the theme calls for it
+    if (this.worldTheme?.arrivalMetaphor === "van_delivery") {
+      this.triggerVanDelivery(delivery);
+      return;
+    }
+    // Route to outrigger delivery if the theme calls for it
+    if (this.worldTheme?.arrivalMetaphor === "outrigger_delivery") {
+      this.triggerOutriggerDelivery(delivery);
+      return;
+    }
+    // Route to carriage delivery if the theme calls for it
+    if (this.worldTheme?.arrivalMetaphor === "carriage_delivery") {
+      this.triggerCarriageDelivery(delivery);
+      return;
+    }
+
+    this.heliActive = true;
+    this.heliDelivery = delivery ?? null;
+    const agentName = delivery?.name ?? "Agent";
+    this.store.toast(`Helicopter summoned! ${agentName} incoming...`);
+    this.heliSound?.stop();
+    this.heliSound = this.world?.audio.helicopter() ?? null;
+    console.log(`[heli-debug] triggerHelicopter: agentName=${agentName}, world=${!!this.world}, audio=${!!this.world?.audio}, heliSound=${!!this.heliSound}, ready=${this.ready}, heliActive=${this.heliActive}`);
+
+    // Safety timeout: if the tween chain breaks (scene sleep, missing container,
+    // etc.) endHelicopter() may never fire. This guarantees the sound stops.
+    this.heliSafetyTimer?.remove();
+    this.heliSafetyTimer = this.time.delayedCall(15000, () => {
+      console.warn("[heli-debug] safety timeout reached — forcing endHelicopter");
+      this.endHelicopter();
+    });
+
+    // Send the hire WS message immediately so the agent appears in the
+    // sidebar and is interactable right away. The helicopter animation
+    // is purely cosmetic — syncAgents() will replace the cosmetic sprite
+    // with the real NPC when the server confirms.
+    // Skip if the server already created the agent (Office Manager hire).
+    this.sendHireMessage(delivery);
+
+    const padCx = this.padCenter.x;
+    const padCy = this.padCenter.y;
+
+    // create helicopter high above the pad (same x, well above)
+    const heli = this.drawHelicopter();
+    heli.setScale(1.0);
+    heli.setPosition(padCx, padCy - 600);
+    heli.setDepth(-0.4);
+    heli.setAlpha(0);
+    this.heliContainer = heli;
+
+    // fade in as it descends from the sky
+    this.tweens.add({
+      targets: heli,
+      alpha: 1,
+      duration: 750,
+      ease: "Cubic.in",
+    });
+
+    // descend slowly to the pad — soft landing with ease-out at the end
+    this.tweens.add({
+      targets: heli,
+      y: padCy,
+      duration: 2750,
+      ease: "Cubic.out",
+      onComplete: () => {
+        // landed — pause for rotor spin-down, then unload agent
+        this.time.delayedCall(500, () => this.heliUnload());
+      },
+    });
+  }
+
+  /** Send the hire WS message — extracted so both helicopter and van can use it. */
+  private sendHireMessage(delivery?: HelicopterDelivery): void {
+    if (delivery && !delivery.alreadyHired) {
+      const net = this.game.registry.get("net") as import("../net").Net;
+      net.send({
+        type: "hire",
+        name: delivery.name,
+        provider: "cline",
+        model: delivery.model,
+        systemPrompt: delivery.systemPrompt,
+        role: "worker",
+        appearance: delivery.appearance,
+        mcpServers: delivery.mcpServers,
+        cdpSolana: delivery.cdpSolana,
+        crossmintWallet: delivery.crossmintWallet,
+        isPremium: delivery.isPremium,
+        circleServices: delivery.circleServices,
+        skills: delivery.skills,
+        monidEnabled: delivery.monidEnabled,
+      });
+    }
+  }
+
+  /** Van delivery cinematic — a beat-up van drives in from the left,
+   *  stops at the pad, agent hops out and walks to the office entrance. */
+  private triggerVanDelivery(delivery?: HelicopterDelivery): void {
+    this.heliActive = true;
+    this.heliDelivery = delivery ?? null;
+    const agentName = delivery?.name ?? "Agent";
+    this.store.toast(`Van incoming! ${agentName} arriving...`);
+
+    this.heliSafetyTimer?.remove();
+    this.heliSafetyTimer = this.time.delayedCall(15000, () => {
+      console.warn("[van-debug] safety timeout — forcing endHelicopter");
+      this.endHelicopter();
+    });
+
+    this.sendHireMessage(delivery);
+
+    const padCx = this.padCenter.x;
+    const padCy = this.padCenter.y;
+
+    // Create the van as a container
+    const van = this.drawDeliveryVan();
+    van.setPosition(padCx - 700, padCy);
+    van.setDepth(-0.4);
+    van.setAlpha(0);
+    this.heliContainer = van;
+
+    // Fade in and drive to the pad
+    this.tweens.add({
+      targets: van,
+      alpha: 1,
+      duration: 400,
+      ease: "Cubic.in",
+    });
+
+    this.tweens.add({
+      targets: van,
+      x: padCx,
+      duration: 2500,
+      ease: "Cubic.out",
+      onComplete: () => {
+        // Van stopped — pause, then unload agent
+        this.time.delayedCall(600, () => this.vanUnload());
+      },
+    });
+  }
+
+  /** Draw a beat-up delivery van as a container. */
+  private drawDeliveryVan(): Phaser.GameObjects.Container {
+    // Shadow
+    const shadow = this.add.graphics();
+    shadow.fillStyle(0x000000, 0.25);
+    shadow.fillEllipse(0, 28, 100, 14);
+
+    // Van body — boxy, rusted
+    const body = this.add.graphics();
+    // Cargo box (back)
+    body.fillStyle(0x6a7078, 1);
+    body.fillRoundedRect(-44, -24, 56, 48, 3);
+    // Cab (front)
+    body.fillStyle(0x5a6068, 1);
+    body.fillRoundedRect(12, -20, 32, 44, 4);
+    // Rust patches
+    body.fillStyle(0x8a4a2a, 0.35);
+    body.fillRect(-30, -10, 12, 8);
+    body.fillRect(-20, 8, 8, 6);
+    body.fillRect(18, -8, 6, 10);
+
+    // Windshield
+    body.fillStyle(0x2a2a3a, 0.8);
+    body.fillRoundedRect(16, -16, 24, 16, 2);
+    body.fillStyle(0x4a4a5a, 0.3);
+    body.fillRect(16, -16, 24, 4);
+
+    // Side door line
+    body.lineStyle(1, 0x3a3a40, 0.6);
+    body.beginPath();
+    body.moveTo(-16, -24);
+    body.lineTo(-16, 24);
+    body.strokePath();
+
+    // Back doors
+    body.lineStyle(1, 0x3a3a40, 0.6);
+    body.beginPath();
+    body.moveTo(-44, 0);
+    body.lineTo(-12, 0);
+    body.strokePath();
+
+    // Graffiti on side
+    body.fillStyle(0x9a3a5a, 0.5);
+    body.fillRect(-38, -6, 14, 8);
+
+    // Wheels
+    body.fillStyle(0x1a1a1e, 1);
+    body.fillCircle(-28, 24, 8);
+    body.fillCircle(28, 24, 8);
+    body.fillStyle(0x3a3a40, 1);
+    body.fillCircle(-28, 24, 4);
+    body.fillCircle(28, 24, 4);
+
+    // Headlight
+    body.fillStyle(0xffee88, 0.8);
+    body.fillCircle(42, -4, 3);
+    body.fillStyle(0xffee88, 0.2);
+    body.fillCircle(42, -4, 6);
+
+    return this.add.container(0, 0, [shadow, body]);
+  }
+
+  /** Agent exits van and walks to the office entrance. */
+  private vanUnload(): void {
+    if (!this.heliContainer) return;
+    const padCx = this.padCenter.x;
+    const padCy = this.padCenter.y;
+    const exitX = 14 * TILE_PX + 32;
+    const exitY = 3 * TILE_PX + 52;
+
+    // Generate agent texture
+    let agentKey = "char-heli-delivery";
+    if (this.heliDelivery?.appearance) {
+      generateCharTexture(this, agentKey, this.heliDelivery.appearance);
+      this.ensureCharAnimations(agentKey);
+    } else {
+      const spriteIdx = this.heliDelivery?.sprite ?? 0;
+      agentKey = `char-${spriteIdx}`;
+    }
+
+    const label = this.add
+      .text(0, -108, this.heliDelivery?.name ?? "AGENT", {
+        fontFamily: "'M PLUS Rounded 1c', sans-serif",
+        fontSize: "16px",
+        color: "#1d2126",
+        stroke: "#f4f6f8",
+        strokeThickness: 3,
+      })
+      .setResolution(4)
+      .setOrigin(0.5, 1)
+      .setScale(0.7);
+
+    const sprite = this.add
+      .sprite(0, 0, agentKey, 6)
+      .setOrigin(0.5, 1)
+      .setScale(1);
+
+    // Agent appears at the back of the van
+    const agent = this.add.container(padCx - 30, padCy, [sprite, label]);
+    agent.setDepth(-0.3);
+    this.heliAgent = agent;
+    sprite.play(`${agentKey}-walk-down`);
+
+    // Walk to the office entrance (same exit point as helicopter elevator)
+    this.tweens.add({
+      targets: agent,
+      x: exitX,
+      y: exitY,
+      duration: 1800,
+      ease: "Quad.inOut",
+      onComplete: () => {
+        // Process deferred agents
+        if (this.pendingHeliAgents.length > 0) {
+          this.syncPendingHeliAgents(exitX, exitY);
+        }
+        this.heliAgent?.destroy();
+        this.heliAgent = null;
+        // Van drives away
+        this.vanDriveAway();
+      },
+    });
+  }
+
+  /** Van drives off to the right and disappears. */
+  private vanDriveAway(): void {
+    if (!this.heliContainer) {
+      this.endHelicopter();
+      return;
+    }
+    const padCx = this.padCenter.x;
+
+    this.tweens.add({
+      targets: this.heliContainer,
+      x: padCx + 800,
+      alpha: 0,
+      duration: 2000,
+      ease: "Cubic.in",
+      onComplete: () => {
+        this.endHelicopter();
+      },
+    });
+  }
+
+  /** Outrigger canoe delivery cinematic — a canoe paddles in from the left,
+   *  beaches at the pad, agent steps off and walks to the pavilion entrance. */
+  private triggerOutriggerDelivery(delivery?: HelicopterDelivery): void {
+    this.heliActive = true;
+    this.heliDelivery = delivery ?? null;
+    const agentName = delivery?.name ?? "Agent";
+    this.store.toast(`Outrigger incoming! ${agentName} paddling in...`);
+
+    this.heliSafetyTimer?.remove();
+    this.heliSafetyTimer = this.time.delayedCall(15000, () => {
+      console.warn("[outrigger-debug] safety timeout — forcing endHelicopter");
+      this.endHelicopter();
+    });
+
+    this.sendHireMessage(delivery);
+
+    const padCx = this.padCenter.x;
+    const padCy = this.padCenter.y;
+
+    const canoe = this.drawOutriggerCanoe();
+    canoe.setPosition(padCx - 700, padCy);
+    canoe.setDepth(-0.4);
+    canoe.setAlpha(0);
+    this.heliContainer = canoe;
+
+    this.tweens.add({
+      targets: canoe,
+      alpha: 1,
+      duration: 400,
+      ease: "Cubic.in",
+    });
+
+    this.tweens.add({
+      targets: canoe,
+      x: padCx,
+      duration: 3000,
+      ease: "Cubic.out",
+      onComplete: () => {
+        this.time.delayedCall(600, () => this.outriggerUnload());
+      },
+    });
+  }
+
+  /** Draw an outrigger canoe as a container. */
+  private drawOutriggerCanoe(): Phaser.GameObjects.Container {
+    const shadow = this.add.graphics();
+    shadow.fillStyle(0x000000, 0.2);
+    shadow.fillEllipse(0, 20, 90, 12);
+
+    const canoe = this.add.graphics();
+    // Hull
+    canoe.fillStyle(0x8a6a3a, 1);
+    canoe.fillEllipse(0, 0, 80, 24);
+    canoe.fillStyle(0x6a4a2a, 1);
+    canoe.fillEllipse(0, 2, 70, 16);
+    // Outrigger float
+    canoe.fillStyle(0x6a5a3a, 1);
+    canoe.fillEllipse(30, 16, 30, 10);
+    // Connecting bars
+    canoe.fillStyle(0x4a3a2a, 1);
+    canoe.fillRect(10, 6, 4, 12);
+    canoe.fillRect(22, 6, 4, 12);
+    // Paddler silhouette
+    canoe.fillStyle(0x3a2a1a, 0.7);
+    canoe.fillCircle(-10, -8, 5);
+    canoe.fillRect(-13, -6, 6, 12);
+    // Paddle
+    canoe.lineStyle(2, 0x6a4a2a, 0.8);
+    canoe.beginPath();
+    canoe.moveTo(-10, -4);
+    canoe.lineTo(-24, -12);
+    canoe.strokePath();
+    canoe.fillStyle(0x8a6a3a, 0.8);
+    canoe.fillRect(-28, -14, 6, 4);
+
+    return this.add.container(0, 0, [shadow, canoe]);
+  }
+
+  /** Agent steps off the canoe and walks to the pavilion entrance. */
+  private outriggerUnload(): void {
+    if (!this.heliContainer) return;
+    const padCx = this.padCenter.x;
+    const padCy = this.padCenter.y;
+    const exitX = 14 * TILE_PX + 32;
+    const exitY = 3 * TILE_PX + 52;
+
+    let agentKey = "char-heli-delivery";
+    if (this.heliDelivery?.appearance) {
+      generateCharTexture(this, agentKey, this.heliDelivery.appearance);
+      this.ensureCharAnimations(agentKey);
+    } else {
+      const spriteIdx = this.heliDelivery?.sprite ?? 0;
+      agentKey = `char-${spriteIdx}`;
+    }
+
+    const label = this.add
+      .text(0, -108, this.heliDelivery?.name ?? "AGENT", {
+        fontFamily: "'M PLUS Rounded 1c', sans-serif",
+        fontSize: "16px",
+        color: "#1d2126",
+        stroke: "#f4f6f8",
+        strokeThickness: 3,
+      })
+      .setResolution(4)
+      .setOrigin(0.5, 1)
+      .setScale(0.7);
+
+    const sprite = this.add
+      .sprite(0, 0, agentKey, 6)
+      .setOrigin(0.5, 1)
+      .setScale(1);
+
+    const agent = this.add.container(padCx + 20, padCy, [sprite, label]);
+    agent.setDepth(-0.3);
+    this.heliAgent = agent;
+    sprite.play(`${agentKey}-walk-down`);
+
+    this.tweens.add({
+      targets: agent,
+      x: exitX,
+      y: exitY,
+      duration: 1800,
+      ease: "Quad.inOut",
+      onComplete: () => {
+        if (this.pendingHeliAgents.length > 0) {
+          this.syncPendingHeliAgents(exitX, exitY);
+        }
+        this.heliAgent?.destroy();
+        this.heliAgent = null;
+        // Canoe paddles away
+        if (this.heliContainer) {
+          this.tweens.add({
+            targets: this.heliContainer,
+            x: padCx + 800,
+            alpha: 0,
+            duration: 2500,
+            ease: "Cubic.in",
+            onComplete: () => this.endHelicopter(),
+          });
+        } else {
+          this.endHelicopter();
+        }
+      },
+    });
+  }
+
+  /** Horse-drawn carriage delivery cinematic — a carriage trots in from the left,
+   *  stops at the pad, agent steps out and walks to the mansion entrance. */
+  private triggerCarriageDelivery(delivery?: HelicopterDelivery): void {
+    this.heliActive = true;
+    this.heliDelivery = delivery ?? null;
+    const agentName = delivery?.name ?? "Agent";
+    this.store.toast(`Carriage incoming! ${agentName} arriving...`);
+
+    this.heliSafetyTimer?.remove();
+    this.heliSafetyTimer = this.time.delayedCall(15000, () => {
+      console.warn("[carriage-debug] safety timeout — forcing endHelicopter");
+      this.endHelicopter();
+    });
+
+    this.sendHireMessage(delivery);
+
+    const padCx = this.padCenter.x;
+    const padCy = this.padCenter.y;
+
+    const carriage = this.drawCarriage();
+    carriage.setPosition(padCx - 700, padCy);
+    carriage.setDepth(-0.4);
+    carriage.setAlpha(0);
+    this.heliContainer = carriage;
+
+    this.tweens.add({
+      targets: carriage,
+      alpha: 1,
+      duration: 400,
+      ease: "Cubic.in",
+    });
+
+    this.tweens.add({
+      targets: carriage,
+      x: padCx,
+      duration: 3000,
+      ease: "Cubic.out",
+      onComplete: () => {
+        this.time.delayedCall(700, () => this.carriageUnload());
+      },
+    });
+  }
+
+  /** Draw a horse-drawn carriage as a container. */
+  private drawCarriage(): Phaser.GameObjects.Container {
+    const shadow = this.add.graphics();
+    shadow.fillStyle(0x000000, 0.2);
+    shadow.fillEllipse(10, 28, 120, 14);
+
+    const carriage = this.add.graphics();
+    // Horse body
+    carriage.fillStyle(0x5a3a2a, 1);
+    carriage.fillRoundedRect(-50, -16, 30, 28, 4);
+    // Horse head
+    carriage.fillStyle(0x5a3a2a, 1);
+    carriage.fillTriangle(-50, -14, -60, -22, -50, -6);
+    // Horse legs
+    carriage.fillStyle(0x4a2a1a, 1);
+    carriage.fillRect(-46, 10, 4, 14);
+    carriage.fillRect(-30, 10, 4, 14);
+    // Horse mane
+    carriage.fillStyle(0x3a2a1a, 0.8);
+    carriage.fillRect(-48, -18, 10, 6);
+    // Harness lines
+    carriage.lineStyle(1, 0x3a2a1a, 0.6);
+    carriage.beginPath();
+    carriage.moveTo(-22, -4);
+    carriage.lineTo(-10, -4);
+    carriage.strokePath();
+    // Carriage body
+    carriage.fillStyle(0x6a4a2a, 1);
+    carriage.fillRoundedRect(-10, -22, 44, 40, 6);
+    // Carriage roof
+    carriage.fillStyle(0x4a3a2a, 1);
+    carriage.fillRoundedRect(-14, -28, 52, 10, 4);
+    // Window
+    carriage.fillStyle(0x2a2a3a, 0.7);
+    carriage.fillRoundedRect(-4, -18, 24, 16, 2);
+    carriage.fillStyle(0x4a4a5a, 0.3);
+    carriage.fillRect(-4, -18, 24, 3);
+    // Door line
+    carriage.lineStyle(1, 0x3a2a1a, 0.5);
+    carriage.beginPath();
+    carriage.moveTo(12, -22);
+    carriage.lineTo(12, 18);
+    carriage.strokePath();
+    // Wheels
+    carriage.fillStyle(0x1a1a1e, 1);
+    carriage.fillCircle(-2, 22, 9);
+    carriage.fillCircle(26, 22, 9);
+    carriage.fillStyle(0x3a3a40, 1);
+    carriage.fillCircle(-2, 22, 5);
+    carriage.fillCircle(26, 22, 5);
+    // Spokes
+    carriage.lineStyle(1, 0x6a6a70, 0.5);
+    carriage.beginPath();
+    carriage.moveTo(-2, 17); carriage.lineTo(-2, 27);
+    carriage.moveTo(-7, 22); carriage.lineTo(3, 22);
+    carriage.moveTo(26, 17); carriage.lineTo(26, 27);
+    carriage.moveTo(21, 22); carriage.lineTo(31, 22);
+    carriage.strokePath();
+
+    return this.add.container(0, 0, [shadow, carriage]);
+  }
+
+  /** Agent exits carriage and walks to the mansion entrance. */
+  private carriageUnload(): void {
+    if (!this.heliContainer) return;
+    const padCx = this.padCenter.x;
+    const padCy = this.padCenter.y;
+    const exitX = 14 * TILE_PX + 32;
+    const exitY = 3 * TILE_PX + 52;
+
+    let agentKey = "char-heli-delivery";
+    if (this.heliDelivery?.appearance) {
+      generateCharTexture(this, agentKey, this.heliDelivery.appearance);
+      this.ensureCharAnimations(agentKey);
+    } else {
+      const spriteIdx = this.heliDelivery?.sprite ?? 0;
+      agentKey = `char-${spriteIdx}`;
+    }
+
+    const label = this.add
+      .text(0, -108, this.heliDelivery?.name ?? "AGENT", {
+        fontFamily: "'M PLUS Rounded 1c', sans-serif",
+        fontSize: "16px",
+        color: "#1d2126",
+        stroke: "#f4f6f8",
+        strokeThickness: 3,
+      })
+      .setResolution(4)
+      .setOrigin(0.5, 1)
+      .setScale(0.7);
+
+    const sprite = this.add
+      .sprite(0, 0, agentKey, 6)
+      .setOrigin(0.5, 1)
+      .setScale(1);
+
+    const agent = this.add.container(padCx + 10, padCy, [sprite, label]);
+    agent.setDepth(-0.3);
+    this.heliAgent = agent;
+    sprite.play(`${agentKey}-walk-down`);
+
+    this.tweens.add({
+      targets: agent,
+      x: exitX,
+      y: exitY,
+      duration: 1800,
+      ease: "Quad.inOut",
+      onComplete: () => {
+        if (this.pendingHeliAgents.length > 0) {
+          this.syncPendingHeliAgents(exitX, exitY);
+        }
+        this.heliAgent?.destroy();
+        this.heliAgent = null;
+        // Carriage trots away
+        if (this.heliContainer) {
+          this.tweens.add({
+            targets: this.heliContainer,
+            x: padCx + 800,
+            alpha: 0,
+            duration: 2500,
+            ease: "Cubic.in",
+            onComplete: () => this.endHelicopter(),
+          });
+        } else {
+          this.endHelicopter();
+        }
+      },
+    });
+  }
+
+  /** Agent exits helicopter and walks to elevator entrance on the pad. */
+  private heliUnload(): void {
+    if (!this.heliContainer) return;
+    const padCx = this.padCenter.x;
+    const padCy = this.padCenter.y;
+    const elevX = this.padFrontPx.x;
+    const elevY = this.padFrontPx.y;
+
+    // Generate a custom texture from the delivery's appearance so the
+    // cosmetic sprite matches the real NPC that syncAgents() will create.
+    let agentKey = "char-heli-delivery";
+    if (this.heliDelivery?.appearance) {
+      generateCharTexture(this, agentKey, this.heliDelivery.appearance);
+      this.ensureCharAnimations(agentKey);
+    } else {
+      // No custom appearance — fall back to a pre-generated character spritesheet.
+      const spriteIdx = this.heliDelivery?.sprite ?? 0;
+      agentKey = `char-${spriteIdx}`;
+    }
+    const label = this.add
+      .text(0, -108, this.heliDelivery?.name ?? "AGENT", {
+        fontFamily: "'M PLUS Rounded 1c', sans-serif",
+        fontSize: "16px",
+        color: "#1d2126",
+        stroke: "#f4f6f8",
+        strokeThickness: 3,
+      })
+      .setResolution(4)
+      .setOrigin(0.5, 1)
+      .setScale(0.7);
+
+    const sprite = this.add
+      .sprite(0, 0, agentKey, 6)
+      .setOrigin(0.5, 1)
+      .setScale(1);
+
+    const agent = this.add.container(padCx + 30, padCy, [sprite, label]);
+    agent.setDepth(-0.3);
+    this.heliAgent = agent;
+    sprite.play(`${agentKey}-walk-down`);
+
+    // walk to elevator entrance on pad
+    this.tweens.add({
+      targets: agent,
+      x: elevX,
+      y: elevY,
+      duration: 1200,
+      ease: "Quad.inOut",
+      onComplete: () => {
+        this.heliElevatorDescend(agentKey, sprite);
+      },
+    });
+  }
+
+  /** Elevator descends from the helipad to the office interior. */
+  private heliElevatorDescend(
+    agentKey: string,
+    sprite: Phaser.GameObjects.Sprite,
+  ): void {
+    const elevX = this.padFrontPx.x;
+    const elevStartY = this.padFrontPx.y;
+    // elevator exit inside the office — tile {x:14, y:3}
+    const exitX = 14 * TILE_PX + 32;
+    const exitY = 3 * TILE_PX + 52;
+
+    // draw elevator platform
+    const elev = this.add.graphics().setDepth(5);
+    elev.fillStyle(0x000000, 0.3);
+    elev.fillRoundedRect(elevX - 32, elevStartY - 32, 64, 64, 6);
+    elev.fillStyle(0x444450, 1);
+    elev.fillRoundedRect(elevX - 30, elevStartY - 30, 60, 60, 5);
+    elev.fillStyle(0x555560, 1);
+    elev.fillRoundedRect(elevX - 28, elevStartY - 28, 56, 56, 4);
+    // door seam
+    elev.lineStyle(2, 0x222228, 0.8);
+    elev.beginPath();
+    elev.moveTo(elevX, elevStartY - 28);
+    elev.lineTo(elevX, elevStartY + 28);
+    elev.strokePath();
+    // indicator lights
+    elev.fillStyle(0xffcc44, 1);
+    elev.fillCircle(elevX - 20, elevStartY - 22, 2);
+    elev.fillCircle(elevX + 20, elevStartY - 22, 2);
+    this.heliElevatorGfx = elev;
+
+    // hide agent inside elevator
+    if (this.heliAgent) this.heliAgent.setVisible(false);
+
+    // descend
+    this.tweens.add({
+      targets: elev,
+      y: exitY - elevStartY,
+      duration: 2000,
+      ease: "Cubic.inOut",
+      onComplete: () => {
+        // Process any agents that were deferred during the helicopter
+        // animation — spawn them at the elevator exit now.
+        if (this.pendingHeliAgents.length > 0) {
+          this.syncPendingHeliAgents(exitX, exitY);
+        }
+        this.heliAgent?.destroy();
+        this.heliAgent = null;
+        // remove elevator visual
+        this.time.delayedCall(600, () => {
+          elev.destroy();
+          this.heliElevatorGfx = null;
+        });
+        // helicopter takes off simultaneously
+        this.heliTakeoff();
+      },
+    });
+  }
+
+  /** Helicopter lifts off and flies away. */
+  private heliTakeoff(): void {
+    // Schedule endHelicopter regardless of heliContainer state so the sound
+    // always stops even if the container was destroyed prematurely.
+    this.time.delayedCall(2000, () => {
+      this.endHelicopter();
+    });
+
+    if (!this.heliContainer) return;
+    const padCx = this.padCenter.x;
+    const padCy = this.padCenter.y;
+
+    // lift off straight up slowly, then fly away to the side
+    this.tweens.add({
+      targets: this.heliContainer,
+      y: padCy - 250,
+      duration: 2000,
+      ease: "Cubic.out",
+      onComplete: () => {
+        if (!this.heliContainer) return;
+        this.tweens.add({
+          targets: this.heliContainer,
+          x: padCx + 500,
+          y: padCy - 500,
+          duration: 3000,
+          ease: "Cubic.in",
+          onComplete: () => {
+            this.heliContainer?.destroy();
+            this.heliContainer = null;
+            this.heliRotor = null;
+          },
+        });
+      },
+    });
+  }
+
+  /** Animate helicopter rotor while active. */
+  private updateHelicopter(time: number): void {
+    if (this.heliRotor) {
+      this.heliRotor.rotation = time * 0.04;
+    }
+  }
+
+  /** Create NPCs for agents deferred during the helicopter animation.
+   *  Called when the elevator lands — spawns each pending agent at the
+   *  elevator exit so they walk into the office naturally. */
+  private syncPendingHeliAgents(exitX: number, exitY: number): void {
+    const pending = this.pendingHeliAgents.splice(0);
+    for (const id of pending) {
+      const info = this.store.agents.get(id);
+      if (!info) continue;
+      if (info.appearance) {
+        const key = agentTextureKey(info);
+        generateCharTexture(this, key, info.appearance);
+        this.ensureCharAnimations(key);
+      }
+      const overflow = info.deskIndex - this.seats.length;
+      const seat =
+        this.seats[info.deskIndex] ??
+        this.extraSpots[overflow % Math.max(this.extraSpots.length, 1)] ??
+        this.spawnTile;
+      const spawnPx = tileOf(exitX, exitY);
+      const npc = new AgentNPC(this, this.grid, info, spawnPx, seat, (clicked) =>
+        this.walkToAgent(clicked),
+        (agentId) => this.getSeatForAgentId(agentId),
+      );
+      this.npcs.set(id, npc);
+    }
+  }
+
+  /** Tear down all helicopter cosmetic state.  Called either from
+   *  syncAgents (when the real NPC arrives) or from heliTakeoff's
+   *  delayed call (fallback if the server is slow to confirm). */
+  private endHelicopter(): void {
+    if (!this.heliActive) return;
+    this.heliAgent?.destroy();
+    this.heliAgent = null;
+    this.heliElevatorGfx?.destroy();
+    this.heliElevatorGfx = null;
+    this.heliActive = false;
+    this.heliDelivery = null;
+    this.heliSafetyTimer?.remove();
+    this.heliSafetyTimer = null;
+    this.heliSound?.stop();
+    this.heliSound = null;
+    // Fallback: if the elevator never completed but we're tearing down,
+    // spawn any pending agents at the elevator exit inside the office.
+    if (this.pendingHeliAgents.length > 0) {
+      const exitX = 14 * TILE_PX + 32;
+      const exitY = 3 * TILE_PX + 52;
+      this.syncPendingHeliAgents(exitX, exitY);
+    }
+    // Trigger the next queued delivery if any
+    const next = this.pendingHeliDeliveries.shift();
+    if (next) this.triggerHelicopter(next);
+  }
+
+  /** Draw the projector screen frame on the top-left wall. */
+  private drawProjector(): void {
+    const px = this.projectorTile.x * TILE_PX + 32;
+    const py = this.projectorTile.y * TILE_PX - 100;
+    const sw = 480;
+    const sh = 288;
+
+    this.projectorGfx = this.add.graphics().setDepth(3);
+    // outer frame — dark anodized
+    this.projectorGfx.fillStyle(0x12121a, 1);
+    this.projectorGfx.fillRoundedRect(px - sw / 2 - 7, py - sh / 2 - 7, sw + 14, sh + 14, 8);
+    // inner bezel — slightly lighter
+    this.projectorGfx.fillStyle(0x2a2a36, 1);
+    this.projectorGfx.fillRoundedRect(px - sw / 2 - 5, py - sh / 2 - 5, sw + 10, sh + 10, 6);
+    // metallic trim
+    this.projectorGfx.lineStyle(1, 0x4a4a56, 0.5);
+    this.projectorGfx.strokeRoundedRect(px - sw / 2 - 5, py - sh / 2 - 5, sw + 10, sh + 10, 6);
+    // screen surface (dark when off)
+    this.projectorGfx.fillStyle(0x0a0a12, 1);
+    this.projectorGfx.fillRoundedRect(px - sw / 2, py - sh / 2, sw, sh, 3);
+    // subtle screen reflection when off
+    this.projectorGfx.fillStyle(0x88bbff, 0.04);
+    this.projectorGfx.beginPath();
+    this.projectorGfx.moveTo(px - sw / 2, py - sh / 2);
+    this.projectorGfx.lineTo(px - sw / 2 + 80, py - sh / 2);
+    this.projectorGfx.lineTo(px - sw / 2, py - sh / 2 + 60);
+    this.projectorGfx.closePath();
+    this.projectorGfx.fillPath();
+
+    // Draw control panel and speaker next to projector
+    this.drawProjectorControlPanel();
+    this.drawProjectorSpeaker();
+  }
+
+  /** Draw a wall-mounted TV control panel for channel selection. */
+  private drawProjectorControlPanel(): void {
+    const px = this.projectorControlTile.x * TILE_PX + 32;
+    const py = this.projectorControlTile.y * TILE_PX + 32;
+    this.projectorControlGfx = this.add.graphics().setDepth(3);
+
+    // mounting plate — dark anodized
+    this.projectorControlGfx.fillStyle(0x12121a, 1);
+    this.projectorControlGfx.fillRoundedRect(px - 21, py - 17, 42, 34, 5);
+    this.projectorControlGfx.fillStyle(0x2a2a36, 1);
+    this.projectorControlGfx.fillRoundedRect(px - 19, py - 15, 38, 30, 4);
+    // metallic trim
+    this.projectorControlGfx.lineStyle(0.8, 0x4a4a56, 0.4);
+    this.projectorControlGfx.strokeRoundedRect(px - 19, py - 15, 38, 30, 4);
+
+    // small screen display — dark with blue tint
+    this.projectorControlGfx.fillStyle(0x0a0a14, 1);
+    this.projectorControlGfx.fillRoundedRect(px - 15, py - 11, 30, 13, 2);
+    // screen glow
+    this.projectorControlGfx.fillStyle(0x4a8cd4, 0.08);
+    this.projectorControlGfx.fillRoundedRect(px - 15, py - 11, 30, 13, 2);
+    // channel indicator — green dot with glow
+    this.projectorControlGfx.fillStyle(0x4acb4a, 0.3);
+    this.projectorControlGfx.fillCircle(px - 8, py - 4, 4);
+    this.projectorControlGfx.fillStyle(0x4acb4a, 1);
+    this.projectorControlGfx.fillCircle(px - 8, py - 4, 2);
+    // signal bars
+    this.projectorControlGfx.fillStyle(0x4a8cd4, 0.6);
+    this.projectorControlGfx.fillRect(px + 2, py - 6, 2, 4);
+    this.projectorControlGfx.fillRect(px + 5, py - 7, 2, 5);
+    this.projectorControlGfx.fillRect(px + 8, py - 8, 2, 6);
+
+    // channel buttons (3 small buttons) with depth
+    const btnColors = [0x666666, 0xe74c3c, 0x3498db];
+    const btnDarks = [0x444444, 0xb83828, 0x2878b0];
+    for (let i = 0; i < 3; i++) {
+      const bx = px - 12 + i * 12;
+      this.projectorControlGfx.fillStyle(btnDarks[i], 1);
+      this.projectorControlGfx.fillRoundedRect(bx, py + 4, 8, 7, 1);
+      this.projectorControlGfx.fillStyle(btnColors[i], 1);
+      this.projectorControlGfx.fillRoundedRect(bx, py + 4, 8, 5, 1);
+      // highlight
+      this.projectorControlGfx.fillStyle(0xffffff, 0.15);
+      this.projectorControlGfx.fillRoundedRect(bx, py + 4, 8, 1.5, 1);
+    }
+
+    // screws — brushed
+    this.projectorControlGfx.fillStyle(0x666670, 1);
+    this.projectorControlGfx.fillCircle(px - 16, py - 13, 1.5);
+    this.projectorControlGfx.fillCircle(px + 16, py - 13, 1.5);
+    this.projectorControlGfx.fillCircle(px - 16, py + 13, 1.5);
+    this.projectorControlGfx.fillCircle(px + 16, py + 13, 1.5);
+    this.projectorControlGfx.fillStyle(0xaaaab4, 0.5);
+    this.projectorControlGfx.fillCircle(px - 16.5, py - 13.5, 0.7);
+    this.projectorControlGfx.fillCircle(px + 15.5, py - 13.5, 0.7);
+    this.projectorControlGfx.fillCircle(px - 16.5, py + 12.5, 0.7);
+    this.projectorControlGfx.fillCircle(px + 15.5, py + 12.5, 0.7);
+  }
+
+  /** Draw a wall-mounted speaker for mute/unmute control. */
+  private drawProjectorSpeaker(): void {
+    const px = this.projectorSpeakerTile.x * TILE_PX + 32;
+    const py = this.projectorSpeakerTile.y * TILE_PX + 32;
+    this.projectorSpeakerGfx = this.add.graphics().setDepth(3);
+
+    // mounting plate — dark anodized
+    this.projectorSpeakerGfx.fillStyle(0x12121a, 1);
+    this.projectorSpeakerGfx.fillRoundedRect(px - 17, py - 17, 34, 34, 5);
+    this.projectorSpeakerGfx.fillStyle(0x2a2a36, 1);
+    this.projectorSpeakerGfx.fillRoundedRect(px - 15, py - 15, 30, 30, 4);
+    // metallic trim
+    this.projectorSpeakerGfx.lineStyle(0.8, 0x4a4a56, 0.4);
+    this.projectorSpeakerGfx.strokeRoundedRect(px - 15, py - 15, 30, 30, 4);
+
+    // speaker cone (outer ring — dark recess)
+    this.projectorSpeakerGfx.fillStyle(0x050508, 1);
+    this.projectorSpeakerGfx.fillCircle(px, py, 11);
+    // speaker cone (inner — dark grey)
+    this.projectorSpeakerGfx.fillStyle(0x1a1a24, 1);
+    this.projectorSpeakerGfx.fillCircle(px, py, 9);
+    // cone texture — concentric rings
+    this.projectorSpeakerGfx.fillStyle(0x2a2a34, 0.3);
+    this.projectorSpeakerGfx.fillCircle(px, py, 7);
+    this.projectorSpeakerGfx.fillStyle(0x1a1a24, 0.5);
+    this.projectorSpeakerGfx.fillCircle(px, py, 6);
+    // speaker dust cap — slightly metallic
+    this.projectorSpeakerGfx.fillStyle(0x2a2a36, 1);
+    this.projectorSpeakerGfx.fillCircle(px, py, 4);
+    this.projectorSpeakerGfx.fillStyle(0x3a3a48, 0.5);
+    this.projectorSpeakerGfx.fillCircle(px, py, 3);
+    // highlight
+    this.projectorSpeakerGfx.fillStyle(0x5a5a6a, 0.4);
+    this.projectorSpeakerGfx.fillCircle(px - 1, py - 1, 2);
+
+    // screws — brushed
+    this.projectorSpeakerGfx.fillStyle(0x666670, 1);
+    this.projectorSpeakerGfx.fillCircle(px - 12, py - 12, 1.5);
+    this.projectorSpeakerGfx.fillCircle(px + 12, py - 12, 1.5);
+    this.projectorSpeakerGfx.fillCircle(px - 12, py + 12, 1.5);
+    this.projectorSpeakerGfx.fillCircle(px + 12, py + 12, 1.5);
+    this.projectorSpeakerGfx.fillStyle(0xaaaab4, 0.5);
+    this.projectorSpeakerGfx.fillCircle(px - 12.5, py - 12.5, 0.7);
+    this.projectorSpeakerGfx.fillCircle(px + 11.5, py - 12.5, 0.7);
+    this.projectorSpeakerGfx.fillCircle(px - 12.5, py + 11.5, 0.7);
+    this.projectorSpeakerGfx.fillCircle(px + 11.5, py + 11.5, 0.7);
+  }
+
+  /** Draw a wall-mounted clock at the new location near the chimney. */
+  private drawClock(): void {
+    const px = this.clockTile.x * TILE_PX + 32;
+    const py = this.clockTile.y * TILE_PX + 32;
+    const g = this.add.graphics().setDepth(3);
+
+    // mounting plate — dark anodized
+    g.fillStyle(0x12121a, 1);
+    g.fillRoundedRect(px - 19, py - 19, 38, 38, 5);
+    g.fillStyle(0x2a2a36, 1);
+    g.fillRoundedRect(px - 17, py - 17, 34, 34, 4);
+    // metallic trim
+    g.lineStyle(0.8, 0x4a4a56, 0.4);
+    g.strokeRoundedRect(px - 17, py - 17, 34, 34, 4);
+
+    // clock face — modern white
+    g.fillStyle(0xf4f6f8, 1);
+    g.fillCircle(px, py, 13);
+    // bezel ring
+    g.lineStyle(1.5, 0x3a3a44, 1);
+    g.strokeCircle(px, py, 13);
+    // inner shadow ring
+    g.lineStyle(0.5, 0x000000, 0.15);
+    g.strokeCircle(px, py, 12);
+
+    // hour ticks — modern bold markers
+    g.fillStyle(0x1a1a22, 1);
+    for (let i = 0; i < 12; i++) {
+      const angle = (i / 12) * Math.PI * 2 - Math.PI / 2;
+      const r1 = 10.5;
+      if (i % 3 === 0) {
+        // cardinal points — wider bars
+        g.fillRect(px + Math.cos(angle) * r1 - 1, py + Math.sin(angle) * r1 - 1, 2, 2);
+      } else {
+        g.fillCircle(px + Math.cos(angle) * r1, py + Math.sin(angle) * r1, 0.8);
+      }
+    }
+
+    // hour hand — thick, dark
+    g.lineStyle(2.5, 0x1a1a22, 1);
+    g.beginPath();
+    g.moveTo(px, py);
+    g.lineTo(px + 4, py - 6);
+    g.strokePath();
+
+    // minute hand — thinner, dark grey
+    g.lineStyle(1.5, 0x3a3a44, 1);
+    g.beginPath();
+    g.moveTo(px, py);
+    g.lineTo(px + 8, py - 2);
+    g.strokePath();
+
+    // center dot — metallic
+    g.fillStyle(0x4a4a56, 1);
+    g.fillCircle(px, py, 2);
+    g.fillStyle(0x6a6a76, 0.6);
+    g.fillCircle(px - 0.5, py - 0.5, 1);
+  }
+
+  /** Convert a world-space rect to screen-space pixels using the main camera.
+   *  Uses cached canvas rect to avoid forced layout reflow every frame. */
+  private worldRectToScreen(wx: number, wy: number, ww: number, wh: number): { x: number; y: number; w: number; h: number } {
+    const cam = this.cameras.main;
+    if (!this.cachedCanvasRect) this.cachedCanvasRect = this.game.canvas.getBoundingClientRect();
+    const canvas = this.cachedCanvasRect;
+    const view = cam.worldView;
+    const sx = canvas.left + (wx - view.x) * cam.zoom;
+    const sy = canvas.top + (wy - view.y) * cam.zoom;
+    return { x: sx, y: sy, w: ww * cam.zoom, h: wh * cam.zoom };
+  }
+
+  /** Update the YouTube IFrame overlay to match the projector screen position. */
+  private updateProjectorVideo(): void {
+    const channel = this.store.projectorChannel;
+
+    // Fast exit: nothing to do if projector is off/agent and no presenters
+    const hasPresenters = this.presenterVideoEls.size > 0;
+    if (!hasPresenters && !channel) return;
+
+    const px = this.projectorTile.x * TILE_PX + 32;
+    const py = this.projectorTile.y * TILE_PX - 100;
+    const sw = 480;
+    const sh = 288;
+
+    // If any presenter video is active, hide YouTube iframe + projector expand button
+    if (hasPresenters) {
+      if (this.projectorIframe) this.projectorIframe.style.display = "none";
+      this.hideProjectorExpandBtn();
+      // presenter expand button is positioned by updateProjectorVideoOverlays()
+      return;
+    }
+
+    // Find the config for the current channel
+    const ch = OfficeScene.PROJECTOR_CHANNELS.find(c => c.id === channel);
+    const videoId = ch?.videoId ?? null;
+    const embedUrl = ch?.embedUrl ?? null;
+
+    // Agent channel — hide YouTube iframe, agent frames drawn on canvas
+    if (channel === "agent") {
+      if (this.projectorIframe) {
+        this.projectorIframe.src = "about:blank";
+        this.projectorIframe.style.display = "none";
+      }
+      this.projectorVideoId = null;
+      this.projectorEmbedUrl = null;
+      this.hideProjectorExpandBtn();
+      return;
+    }
+
+    // HTML channel — hide YouTube iframe, reposition HTML iframe + expand button
+    if (channel === "html") {
+      if (this.projectorIframe) {
+        this.projectorIframe.src = "about:blank";
+        this.projectorIframe.style.display = "none";
+      }
+      this.projectorVideoId = null;
+      this.projectorEmbedUrl = null;
+      // Reposition HTML iframe over projector screen
+      if (this.projectorHtmlIframe && this.projectorHtmlIframe.style.display !== "none") {
+        const hpx = this.projectorTile.x * TILE_PX + 32;
+        const hpy = this.projectorTile.y * TILE_PX - 100;
+        const hsw = 480;
+        const hsh = 288;
+        const hrect = this.worldRectToScreen(hpx - hsw / 2, hpy - hsh / 2, hsw, hsh);
+        this.projectorHtmlIframe.style.left = `${hrect.x}px`;
+        this.projectorHtmlIframe.style.top = `${hrect.y}px`;
+        this.projectorHtmlIframe.style.width = `${hrect.w}px`;
+        this.projectorHtmlIframe.style.height = `${hrect.h}px`;
+        this.showProjectorExpandBtn(hrect);
+      } else {
+        this.hideProjectorExpandBtn();
+      }
+      return;
+    }
+
+    // Channel is off or unknown — stop video and hide iframe
+    if (!videoId && !embedUrl) {
+      if (this.projectorIframe) {
+        this.projectorIframe.src = "about:blank";
+        this.projectorIframe.style.display = "none";
+      }
+      this.projectorVideoId = null;
+      this.projectorEmbedUrl = null;
+      this.hideProjectorAgentFrame();
+      this.hideProjectorHtmlIframe();
+      this.hideProjectorExpandBtn();
+      return;
+    }
+
+    // Create iframe if it doesn't exist
+    if (!this.projectorIframe) {
+      this.projectorIframe = document.createElement("iframe");
+      this.projectorIframe.style.cssText = `
+        position: fixed;
+        border: none;
+        pointer-events: none;
+        z-index: 5;
+        border-radius: 3px;
+        display: none;
+      `;
+      this.projectorIframe.allow = "autoplay; encrypted-media";
+      this.projectorIframe.setAttribute("frameborder", "0");
+      document.body.appendChild(this.projectorIframe);
+    }
+
+    // YouTube video channel
+    if (videoId) {
+      if (this.projectorVideoId !== videoId) {
+        this.projectorVideoId = videoId;
+        this.projectorEmbedUrl = null;
+        this.hideProjectorAgentFrame();
+        const muteParam = this.projectorMuted ? 1 : 0;
+        this.projectorIframe.src =
+          `https://www.youtube.com/embed/${videoId}` +
+          `?autoplay=1&loop=1&playlist=${videoId}&controls=0&mute=${muteParam}&modestbranding=1&showinfo=0&rel=0&iv_load_policy=3&enablejsapi=1`;
+      }
+    } else if (embedUrl) {
+      // TradingView or other embed URL
+      if (this.projectorEmbedUrl !== embedUrl) {
+        this.projectorEmbedUrl = embedUrl;
+        this.projectorVideoId = null;
+        this.hideProjectorAgentFrame();
+        this.projectorIframe.src = embedUrl;
+      }
+    }
+
+    // Convert world position to screen position
+    const rect = this.worldRectToScreen(px - sw / 2, py - sh / 2, sw, sh);
+
+    this.projectorIframe.style.left = `${rect.x}px`;
+    this.projectorIframe.style.top = `${rect.y}px`;
+    this.projectorIframe.style.width = `${rect.w}px`;
+    this.projectorIframe.style.height = `${rect.h}px`;
+    this.projectorIframe.style.display = "block";
+    this.showProjectorExpandBtn(rect);
+  }
+
+  /** Show or reposition the expand button over the projector screen. */
+  private showProjectorExpandBtn(rect: { x: number; y: number; w: number; h: number }): void {
+    if (this.expandedView?.isOpen) {
+      this.hideProjectorExpandBtn();
+      return;
+    }
+    if (!this.projectorExpandBtn) {
+      this.projectorExpandBtn = document.createElement("button");
+      this.projectorExpandBtn.className = "projector-expand-btn";
+      this.projectorExpandBtn.textContent = "⤢";
+      this.projectorExpandBtn.title = "Expand projector view";
+      this.projectorExpandBtn.onclick = () => this.expandProjectorIframe();
+      document.body.appendChild(this.projectorExpandBtn);
+    }
+    this.projectorExpandBtn.style.left = `${rect.x + rect.w - 28}px`;
+    this.projectorExpandBtn.style.top = `${rect.y + 4}px`;
+    this.projectorExpandBtn.style.display = "block";
+  }
+
+  /** Hide the projector expand button. */
+  private hideProjectorExpandBtn(): void {
+    if (this.projectorExpandBtn) this.projectorExpandBtn.style.display = "none";
+  }
+
+  /** Clean up the projector iframe and video overlays on scene shutdown. */
+  private destroyProjectorVideo(): void {
+    if (this.projectorIframe) {
+      this.projectorIframe.remove();
+      this.projectorIframe = null;
+      this.projectorVideoId = null;
+    }
+    if (this.projectorExpandBtn) { this.projectorExpandBtn.remove(); this.projectorExpandBtn = null; }
+    this.detachAllPresenterStreams();
+  }
+
+  /** Draw a kanban-style task board on the front wall of the office. */
+  private drawBoard(): void {
+    const bx = this.boardTile.x * TILE_PX + 32;
+    const by = this.boardTile.y * TILE_PX + 8;
+    const bw = 320;
+    const bh = 88;
+
+    const g = this.add.graphics().setDepth(3);
+    // outer frame — dark anodized aluminum
+    g.fillStyle(0x12121a, 1);
+    g.fillRoundedRect(bx - bw / 2 - 7, by - 7, bw + 14, bh + 14, 8);
+    g.fillStyle(0x2a2a36, 1);
+    g.fillRoundedRect(bx - bw / 2 - 5, by - 5, bw + 10, bh + 10, 6);
+    // metallic trim
+    g.lineStyle(1, 0x4a4a56, 0.6);
+    g.strokeRoundedRect(bx - bw / 2 - 5, by - 5, bw + 10, bh + 10, 6);
+    // inner board — soft white
+    g.fillStyle(0xf4f6f8, 1);
+    g.fillRoundedRect(bx - bw / 2, by, bw, bh, 4);
+    // top highlight
+    g.fillStyle(0xffffff, 0.2);
+    g.fillRoundedRect(bx - bw / 2, by, bw, 3, 4);
+    // bottom shadow
+    g.fillStyle(0x000000, 0.06);
+    g.fillRoundedRect(bx - bw / 2, by + bh - 4, bw, 4, 4);
+
+    // column headers — modern flat tabs with accent bars
+    const colW = (bw - 24) / 3;
+    const cols = [0xe8a838, 0x4cb866, 0x4a9cd8];
+    const colDarks = [0xc88828, 0x3c9846, 0x3a8cb8];
+    for (let i = 0; i < 3; i++) {
+      const cx = bx - bw / 2 + 8 + i * (colW + 4);
+      // header tab
+      g.fillStyle(colDarks[i], 1);
+      g.fillRoundedRect(cx, by + 6, colW, 18, 3);
+      g.fillStyle(cols[i], 1);
+      g.fillRoundedRect(cx, by + 6, colW, 14, 3);
+      // top highlight
+      g.fillStyle(0xffffff, 0.25);
+      g.fillRoundedRect(cx, by + 6, colW, 3, 3);
+      // accent bar under header
+      g.fillStyle(colDarks[i], 0.5);
+      g.fillRect(cx, by + 23, colW, 1.5);
+    }
+
+    // sticky notes with drop shadows and pin dots
+    const notes: { col: number; y: number; color: number; rot: number }[] = [
+      { col: 0, y: 30, color: 0xffe69e, rot: -0.04 },
+      { col: 0, y: 58, color: 0xffd97a, rot: 0.03 },
+      { col: 1, y: 30, color: 0xc4e8c4, rot: 0.02 },
+      { col: 2, y: 30, color: 0xc4d8f0, rot: -0.03 },
+    ];
+    for (const n of notes) {
+      const nx = bx - bw / 2 + 16 + n.col * (colW + 4);
+      // shadow
+      g.fillStyle(0x000000, 0.15);
+      g.fillRoundedRect(nx + 2, n.y + 3, 26, 26, 2);
+      // note body
+      g.fillStyle(n.color, 1);
+      g.fillRoundedRect(nx, n.y, 26, 26, 2);
+      // top highlight
+      g.fillStyle(0xffffff, 0.2);
+      g.fillRoundedRect(nx, n.y, 26, 4, 2);
+      // text lines
+      g.fillStyle(0x333333, 0.3);
+      g.fillRect(nx + 4, n.y + 8, 18, 1.5);
+      g.fillRect(nx + 4, n.y + 12, 14, 1.5);
+      g.fillRect(nx + 4, n.y + 16, 16, 1.5);
+      // pin dot
+      g.fillStyle(0xcc4444, 0.8);
+      g.fillCircle(nx + 13, n.y + 3, 1.5);
+    }
+
+    // Invisible interactive zone so clicking the board opens it
+    const boardZone = this.add.zone(bx, by + bh / 2, bw + 14, bh + 14);
+    boardZone.setDepth(3);
+    boardZone.setInteractive({ useHandCursor: true });
+    boardZone.on("pointerdown", () => this.store.toggleBoard(true));
+  }
+
+  /** Draw a simplified Gantt chart display on the front wall next to the task board. */
+  private drawGanttChart(): void {
+    const gx = this.ganttTile.x * TILE_PX + 32;
+    const gy = this.ganttTile.y * TILE_PX + 8;
+    const gw = 180;
+    const gh = 88;
+
+    const g = this.add.graphics().setDepth(3);
+    // outer frame — dark anodized aluminum (matching board style)
+    g.fillStyle(0x12121a, 1);
+    g.fillRoundedRect(gx - gw / 2 - 7, gy - 7, gw + 14, gh + 14, 8);
+    g.fillStyle(0x2a2a36, 1);
+    g.fillRoundedRect(gx - gw / 2 - 5, gy - 5, gw + 10, gh + 10, 6);
+    g.lineStyle(1, 0x4a4a56, 0.6);
+    g.strokeRoundedRect(gx - gw / 2 - 5, gy - 5, gw + 10, gh + 10, 6);
+    // inner display — dark screen
+    g.fillStyle(0x1a1a24, 1);
+    g.fillRoundedRect(gx - gw / 2, gy, gw, gh, 4);
+    // top highlight
+    g.fillStyle(0xffffff, 0.1);
+    g.fillRoundedRect(gx - gw / 2, gy, gw, 3, 4);
+
+    // title bar
+    g.fillStyle(0x3a8cd4, 0.8);
+    g.fillRect(gx - gw / 2 + 4, gy + 4, gw - 8, 12);
+    g.fillStyle(0xffffff, 0.9);
+    // simple "GANTT" text representation via small rectangles
+    const titleX = gx - gw / 2 + 8;
+    for (let i = 0; i < 5; i++) {
+      g.fillRect(titleX + i * 6, gy + 7, 4, 6);
+    }
+
+    // timeline grid lines (vertical)
+    const gridStart = gy + 20;
+    const gridEnd = gy + gh - 4;
+    const gridLeft = gx - gw / 2 + 8;
+    const gridRight = gx + gw / 2 - 8;
+    const gridW = gridRight - gridLeft;
+    g.lineStyle(1, 0x333344, 0.5);
+    for (let i = 0; i <= 6; i++) {
+      const x = gridLeft + (gridW / 6) * i;
+      g.lineBetween(x, gridStart, x, gridEnd);
+    }
+
+    // horizontal task bars (simplified — 4 rows)
+    const phaseColors = [0xa78bfa, 0xf9ca24, 0x4cb866, 0x3a8cd4];
+    const barH = 10;
+    const barGap = 4;
+    const barStartY = gridStart + 4;
+    for (let row = 0; row < 4; row++) {
+      const by = barStartY + row * (barH + barGap);
+      if (by + barH > gridEnd) break;
+      // each bar has different start position and width
+      const barStart = gridLeft + (gridW * (0.05 + row * 0.12));
+      const barWidth = gridW * (0.2 + row * 0.08);
+      // bar background (darker)
+      g.fillStyle(0x000000, 0.3);
+      g.fillRoundedRect(barStart + 1, by + 1, barWidth, barH, 2);
+      // bar fill (phase color)
+      g.fillStyle(phaseColors[row % phaseColors.length], 0.7);
+      g.fillRoundedRect(barStart, by, barWidth, barH, 2);
+      // top highlight
+      g.fillStyle(0xffffff, 0.15);
+      g.fillRoundedRect(barStart, by, barWidth, 2, 2);
+    }
+
+    // milestone diamond
+    const mx = gridLeft + gridW * 0.85;
+    const my = gridStart + 2;
+    g.fillStyle(0xe8a838, 0.9);
+    g.beginPath();
+    g.moveTo(mx, my);
+    g.lineTo(mx + 4, my + 4);
+    g.lineTo(mx, my + 8);
+    g.lineTo(mx - 4, my + 4);
+    g.closePath();
+    g.fillPath();
+
+    // now line
+    const nowX = gridLeft + gridW * 0.5;
+    g.lineStyle(1.5, 0xff6b6b, 0.7);
+    g.lineBetween(nowX, gridStart, nowX, gridEnd);
+
+    // Invisible interactive zone
+    const ganttZone = this.add.zone(gx, gy + gh / 2, gw + 14, gh + 14);
+    ganttZone.setDepth(3);
+    ganttZone.setInteractive({ useHandCursor: true });
+    ganttZone.on("pointerdown", () => this.store.toggleGantt(true));
+  }
+
+  /** Draw a trophy case on the wall — a wooden cabinet with empty cavities that fill with trophies. */
+  private drawTrophyCase(): void {
+    this.trophyGfx = this.add.graphics().setDepth(3);
+    this.updateTrophyCase();
+  }
+
+  /** Trigger contextual agent reactions when the boss returns from the outside world. */
+  private triggerReturnReaction(snap: { achievements: Set<string>; weapons: string[]; creaturesKilled: number; bossesSlain: number }): void {
+    const currentAch = achievements.getUnlockedIds();
+    const newAch: string[] = [];
+    for (const id of currentAch) {
+      if (!snap.achievements.has(id)) newAch.push(id);
+    }
+    const newWeapons = this.world.ownedWeaponsList.filter(w => !snap.weapons.includes(w));
+    const killDiff = achievements.getStat("creaturesKilled") - snap.creaturesKilled;
+    const bossDiff = achievements.getStat("bossesSlain") - snap.bossesSlain;
+
+    // Priority: boss kill > new legendary weapon > new weapon > kills > general return
+    let reactionText: string | null = null;
+    let agentId: string | undefined;
+    let delay = 500;
+
+    if (newAch.includes("infernal_sovereign_kill")) {
+      reactionText = "The boss is carrying a glowing crown. I'm not asking where they got it. I'm just... not asking.";
+      agentId = HERMES_ID;
+      delay = 800;
+    } else if (newAch.includes("void_leviathan_kill")) {
+      reactionText = "The boss killed something from the void. The actual void. And they just walked back in like it was nothing.";
+      delay = 800;
+    } else if (newAch.includes("ash_wyrm_kill")) {
+      reactionText = "Is that... dragon smoke on the boss? They killed a dragon. An actual dragon. And came to work.";
+      delay = 800;
+    } else if (newAch.includes("stone_colossus_kill")) {
+      reactionText = "The boss toppled a Stone Colossus. A giant. Made of stone. And they're just... checking the task board.";
+      delay = 800;
+    } else if (newAch.includes("groveheart_kill")) {
+      reactionText = "The boss took down Groveheart. I still don't know what that is but the boss looks satisfied.";
+      delay = 800;
+    } else if (newAch.includes("beast_slayer")) {
+      reactionText = "The boss killed a legendary beast outside. They're back. They look different. More... confident?";
+      delay = 700;
+    } else if (newWeapons.some(w => ["flame_greatsword", "void_daggers", "crystal_bow"].includes(w))) {
+      reactionText = "The boss is carrying a legendary weapon. I feel like we should be paying them more. Or less. I'm not sure which.";
+      delay = 700;
+    } else if (newWeapons.includes("void_blade")) {
+      reactionText = "The boss has a void blade now. I'm not asking where they got it. I'm not asking.";
+      agentId = HERMES_ID;
+      delay = 700;
+    } else if (newWeapons.includes("iron_sword")) {
+      reactionText = "The boss forged an iron sword from void shards. That sentence shouldn't make sense but here we are.";
+      delay = 600;
+    } else if (bossDiff > 0) {
+      reactionText = `The boss is back. They killed ${bossDiff > 1 ? `${bossDiff} bosses` : "a boss"} while they were out. Just thought you should know.`;
+      delay = 600;
+    } else if (killDiff >= 5) {
+      reactionText = `The boss is back. ${killDiff} creatures fewer in the world. They're doing the lord's work out there.`;
+      delay = 500;
+    } else if (killDiff > 0) {
+      reactionText = "The boss is back. Something out there is dead. They look pleased about it.";
+      delay = 500;
+    } else if (newAch.length > 0) {
+      // Generic return with new achievements but no kills
+      reactionText = "The boss is back from the outside. They look like they accomplished something out there.";
+      delay = 500;
+    } else {
+      // Returned without any new achievements — just a welcome back
+      const welcomes = [
+        "The boss is back! How was the outside? We held down the fort.",
+        "Welcome back, boss. Everything's still running. Mostly.",
+        "Boss is back. We missed you. Well, I missed you. The others were busy.",
+      ];
+      reactionText = welcomes[Math.floor(Math.random() * welcomes.length)];
+      delay = 400;
+    }
+
+    this.store.postFeedMessage(reactionText, agentId, delay);
+
+    // If there was a boss kill, add a second delayed reaction from a different agent
+    if (bossDiff > 0 || newAch.some(a => a.includes("_kill"))) {
+      const secondReactions = [
+        "I'm not saying I'm impressed. I'm just saying I updated the Hall of Fame.",
+        "The boss walks in, weapon still glowing, and just sits down to check emails. Hardcore.",
+        "We need to talk about the boss's outside activities. In a good way. In a very good way.",
+      ];
+      const secondText = secondReactions[Math.floor(Math.random() * secondReactions.length)];
+      this.store.postFeedMessage(secondText, undefined, delay + 2000);
+    }
+  }
+
+  /** The crown placement sequence — the AH equivalent of the CoD match-ending killcam. */
+  private triggerCrownPlacementSequence(): void {
+    const trophyPx = { x: this.trophyTile.x * TILE_PX + 32, y: this.trophyTile.y * TILE_PX + 40 };
+
+    // Phase 1: Camera zoom to trophy case for dramatic effect
+    this.cameras.main.pan(trophyPx.x, trophyPx.y, 800, "Sine.inOut");
+    this.cameras.main.zoomTo(1.8, 800, "Sine.inOut");
+
+    // Phase 2 (2s later): Speechless "..." posts from random agents
+    const hireable = [...this.store.agents.values()].filter(
+      (a) => a.id !== OFFICE_MANAGER_ID && a.id !== HERMES_ID && a.id !== WIZARD_ID,
+    );
+    const speechlessAgents = hireable.slice(0, Math.min(3, hireable.length));
+    for (let i = 0; i < speechlessAgents.length; i++) {
+      this.store.postFeedMessage("...", speechlessAgents[i].id, 2000 + i * 400);
+    }
+
+    // Phase 3 (4s later): Hermes delivers the line
+    this.store.postFeedMessage(
+      "The crown is in the case. I've logged every task, every kill, every step that got you here. This office has a conqueror running it. I'll be honest — I didn't expect that when I took this job.",
+      HERMES_ID,
+      4000,
+    );
+
+    // Phase 4 (4.5s later): Golden particle burst + camera shake + achievement unlock
+    this.time.delayedCall(4500, () => {
+      this.world.vfx.sparkBurst(trophyPx.x, trophyPx.y, 0xffdd44, 40, 150);
+      this.world.vfx.sparkBurst(trophyPx.x, trophyPx.y, 0xffaa00, 30, 100);
+      this.world.vfx.celebrate(trophyPx.x, trophyPx.y);
+      this.world.vfx.shake("large");
+      this.cameras.main.flash(500, 255, 215, 0, true);
+      achievements.unlock("from_cubicle_to_conqueror");
+      // Record speedrun time if timer was started
+      if (this.world.speedrunStartTime !== null) {
+        const elapsed = Date.now() - this.world.speedrunStartTime;
+        achievements.setStat("speedrunTimeMs", elapsed);
+        const minutes = Math.floor(elapsed / 60000);
+        const seconds = Math.floor((elapsed % 60000) / 1000);
+        this.store.toast(`👑 Crown placed! Speedrun time: ${minutes}:${seconds.toString().padStart(2, "0")}`);
+      } else {
+        this.store.toast("👑 The Sovereign Crown has been placed. From Cubicle to Conqueror.");
+      }
+      this.updateTrophyCase();
+    });
+
+    // Phase 5 (6s later): Second wave of agent reactions + camera reset
+    const secondWave = [
+      "I'm going to remember where I was when that happened.",
+      "The boss just placed a crown in the trophy case. This is a tech startup. What is happening.",
+      "I've updated the Hall of Fame. It felt insufficient.",
+    ];
+    for (let i = 0; i < Math.min(2, hireable.length); i++) {
+      const text = secondWave[Math.floor(Math.random() * secondWave.length)];
+      this.store.postFeedMessage(text, undefined, 6000 + i * 800);
+    }
+
+    // Reset camera after the sequence
+    this.time.delayedCall(7000, () => {
+      this.cameras.main.zoomTo(1, 600, "Sine.inOut");
+      this.cameras.main.pan(this.player.x, this.player.y, 600, "Sine.inOut");
+    });
+  }
+
+  /** Redraw the trophy case with current achievement unlock state. */
+  private updateTrophyCase(): void {
+    const g = this.trophyGfx;
+    if (!g) return;
+    g.clear();
+
+    const tx = this.trophyTile.x * TILE_PX + 57; // offset for x=1.9 visual position
+    const ty = this.trophyTile.y * TILE_PX - 56;
+    const cw = 96;  // case width
+    const ch = 120; // case height
+    const cols = 6;
+    const rows = 4;
+    const slotW = 12;
+    const slotH = 20;
+    const gapX = (cw - cols * slotW) / (cols + 1);
+    const gapY = (ch - rows * slotH) / (rows + 1);
+
+    // outer frame — dark walnut with bevel
+    g.fillStyle(0x1a1008, 1);
+    g.fillRoundedRect(tx - cw / 2 - 7, ty - 7, cw + 14, ch + 14, 7);
+    g.fillStyle(0x3a2818, 1);
+    g.fillRoundedRect(tx - cw / 2 - 5, ty - 5, cw + 10, ch + 10, 6);
+    // wood grain
+    g.fillStyle(0x2a1a10, 0.3);
+    g.fillRect(tx - cw / 2 - 4, ty - 3, cw + 8, 0.5);
+    g.fillRect(tx - cw / 2 - 4, ty + ch, cw + 8, 0.5);
+    // inner dark background (cabinet interior)
+    g.fillStyle(0x0a0808, 1);
+    g.fillRoundedRect(tx - cw / 2, ty, cw, ch, 4);
+    // glass sheen — diagonal
+    g.fillStyle(0xffffff, 0.04);
+    g.fillRoundedRect(tx - cw / 2 + 2, ty + 2, cw - 4, ch / 3, 3);
+    g.fillStyle(0x88bbff, 0.03);
+    g.beginPath();
+    g.moveTo(tx - cw / 2, ty);
+    g.lineTo(tx - cw / 2 + 30, ty);
+    g.lineTo(tx - cw / 2, ty + 40);
+    g.closePath();
+    g.fillPath();
+
+    // wooden shelves — darker with highlight
+    g.fillStyle(0x3a2818, 0.9);
+    for (let r = 1; r < rows; r++) {
+      const sy = ty + gapY * r + slotH * r;
+      g.fillRect(tx - cw / 2 + 2, sy - 1, cw - 4, 3);
+      g.fillStyle(0x5a4030, 0.4);
+      g.fillRect(tx - cw / 2 + 2, sy - 1, cw - 4, 0.5);
+      g.fillStyle(0x3a2818, 0.9);
+    }
+
+    // draw trophy slots — proportional fill based on unlocked/total
+    const unlocked = achievements.getUnlockedIds();
+    const allAch = ACHIEVEMENTS.filter((a) => !a.comingSoon);
+    const unlockedAch = allAch.filter((a) => unlocked.has(a.id));
+    const totalSlots = cols * rows;
+    const filledSlots = Math.round(totalSlots * unlockedAch.length / allAch.length);
+
+    // tier-based trophy colors — rarer tiers get more prestigious metals
+    const tierColors: Record<string, number> = {
+      "First Steps":   0xcd7f32, // bronze
+      "Agent Mastery": 0xc0c0c0, // silver
+      "Explorer":      0xffd700, // gold
+      "Adventurer":    0xff8c00, // amber
+      "Warrior":       0xb22222, // ruby red
+      "Ghosts":        0x9370db, // amethyst
+      "Secret":        0x00ced1, // teal
+    };
+
+    // fill from bottom row upward (like a real trophy case)
+    let idx = 0;
+    for (let row = rows - 1; row >= 0; row--) {
+      for (let col = 0; col < cols; col++) {
+        const sx = tx - cw / 2 + gapX + col * (slotW + gapX);
+        const sy = ty + gapY + row * (slotH + gapY);
+        const isFilled = idx < filledSlots;
+
+        if (isFilled) {
+          const ach = unlockedAch[idx];
+          const color = ach ? (tierColors[ach.tier] ?? 0xffd700) : 0xffd700;
+          // trophy cup — with stem and base
+          g.fillStyle(color, 1);
+          g.fillCircle(sx + slotW / 2, sy + 6, 4);
+          g.fillRect(sx + slotW / 2 - 2, sy + 9, 4, 4);
+          g.fillRect(sx + slotW / 2 - 4, sy + 13, 8, 2);
+          // sparkle
+          g.fillStyle(0xffffff, 0.5);
+          g.fillCircle(sx + slotW / 2 + 2, sy + 5, 1);
+          // metallic shine
+          g.fillStyle(0xffffff, 0.2);
+          g.fillCircle(sx + slotW / 2 - 1, sy + 4, 1.5);
+        } else {
+          // empty cavity — dark recessed slot
+          g.fillStyle(0x050404, 0.7);
+          g.fillRoundedRect(sx, sy, slotW, slotH, 2);
+          // subtle dust
+          g.fillStyle(0x2a2a2a, 0.2);
+          g.fillCircle(sx + slotW / 2, sy + slotH / 2, 1.5);
+        }
+        idx++;
+      }
+    }
+
+    // Crown display — golden crown above the case when from_cubicle_to_conqueror is unlocked
+    if (achievements.isUnlocked("from_cubicle_to_conqueror")) {
+      const cx = tx;
+      const cy = ty - 18;
+      // glow halo
+      g.fillStyle(0xffdd44, 0.15);
+      g.fillCircle(cx, cy, 14);
+      g.fillStyle(0xffdd44, 0.08);
+      g.fillCircle(cx, cy, 20);
+      // crown shape — 3 spikes with gems
+      g.fillStyle(0xffd700, 1);
+      g.beginPath();
+      g.moveTo(cx - 10, cy + 4);
+      g.lineTo(cx - 10, cy - 2);
+      g.lineTo(cx - 6, cy + 2);
+      g.lineTo(cx - 3, cy - 6);
+      g.lineTo(cx, cy + 2);
+      g.lineTo(cx + 3, cy - 6);
+      g.lineTo(cx + 6, cy + 2);
+      g.lineTo(cx + 10, cy - 2);
+      g.lineTo(cx + 10, cy + 4);
+      g.closePath();
+      g.fillPath();
+      // base band
+      g.fillStyle(0xffaa00, 1);
+      g.fillRect(cx - 10, cy + 3, 20, 3);
+      // gems
+      g.fillStyle(0xff4444, 1);
+      g.fillCircle(cx - 6, cy + 1, 1.5);
+      g.fillStyle(0x44aaff, 1);
+      g.fillCircle(cx, cy + 1, 1.5);
+      g.fillStyle(0x44ff44, 1);
+      g.fillCircle(cx + 6, cy + 1, 1.5);
+      // sparkle
+      g.fillStyle(0xffffff, 0.6);
+      g.fillCircle(cx - 3, cy - 4, 1);
+      g.fillCircle(cx + 4, cy - 3, 0.8);
+    }
+  }
+
+  /** Draw a weapon rack on the wall next to the trophy case. */
+  private drawWeaponRack(): void {
+    this.weaponRackGfx = this.add.graphics().setDepth(3);
+    this.updateWeaponRack();
+  }
+
+  /** Update the weapon rack display based on owned weapons. */
+  private updateWeaponRack(): void {
+    const g = this.weaponRackGfx;
+    if (!g || !this.world) return;
+    g.clear();
+
+    const weapons = this.world.ownedWeaponsList;
+    const sig = weapons.join(",");
+    if (sig === this.weaponRackSig) return;
+    this.weaponRackSig = sig;
+
+    if (weapons.length === 0) return; // empty rack — don't draw
+
+    const rx = this.weaponRackTile.x * TILE_PX + 32;
+    const ry = this.weaponRackTile.y * TILE_PX - 56;
+    const rackW = 72;
+    const rackH = 80;
+
+    // wooden frame
+    g.fillStyle(0x1a1008, 1);
+    g.fillRoundedRect(rx - rackW / 2 - 5, ry - 5, rackW + 10, rackH + 10, 5);
+    g.fillStyle(0x3a2818, 1);
+    g.fillRoundedRect(rx - rackW / 2 - 3, ry - 3, rackW + 6, rackH + 6, 4);
+    // dark interior
+    g.fillStyle(0x0a0808, 1);
+    g.fillRoundedRect(rx - rackW / 2, ry, rackW, rackH, 3);
+
+    // weapon icon colors
+    const weaponColors: Record<string, number> = {
+      tennis_racket: 0xeeff44,
+      golf_club: 0xdddd44,
+      axe: 0xcc8844,
+      iron_sword: 0xaaaacc,
+      void_blade: 0xaa44ff,
+      flame_greatsword: 0xff6020,
+      void_daggers: 0x8844cc,
+      crystal_bow: 0x44ddff,
+    };
+
+    // draw weapon slots — 2 columns, up to 4 rows
+    const cols = 2;
+    const slotW = 28;
+    const slotH = 18;
+    const gapX = (rackW - cols * slotW) / (cols + 1);
+    const gapY = 8;
+
+    for (let i = 0; i < weapons.length && i < 8; i++) {
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const sx = rx - rackW / 2 + gapX + col * (slotW + gapX);
+      const sy = ry + gapY + row * (slotH + gapY);
+      const w = weapons[i];
+      const color = weaponColors[w] ?? 0xaaaaaa;
+
+      // weapon shape — simple stylized icon
+      g.fillStyle(color, 0.9);
+      if (w === "crystal_bow") {
+        // bow shape
+        g.lineStyle(2, color, 0.9);
+        g.beginPath();
+        g.arc(sx + slotW / 2, sy + slotH / 2, 8, Math.PI * 0.3, Math.PI * 0.7, false);
+        g.strokePath();
+        g.lineStyle(1, 0xffffff, 0.4);
+        g.beginPath();
+        g.moveTo(sx + slotW / 2 - 6, sy + slotH / 2);
+        g.lineTo(sx + slotW / 2 + 6, sy + slotH / 2);
+        g.strokePath();
+      } else if (w === "void_daggers") {
+        // two small blades
+        g.fillRect(sx + 6, sy + 4, 3, 10);
+        g.fillRect(sx + 16, sy + 4, 3, 10);
+        g.fillStyle(0x5a4030, 0.8);
+        g.fillRect(sx + 5, sy + 13, 5, 3);
+        g.fillRect(sx + 15, sy + 13, 5, 3);
+      } else {
+        // generic sword/weapon — blade + handle
+        g.fillRect(sx + slotW / 2 - 1, sy + 2, 2, 10);
+        g.fillStyle(0x5a4030, 0.8);
+        g.fillRect(sx + slotW / 2 - 4, sy + 11, 8, 3);
+        // shine
+        g.fillStyle(0xffffff, 0.3);
+        g.fillRect(sx + slotW / 2 - 1, sy + 3, 1, 5);
+      }
+    }
+
+    // glass sheen
+    g.fillStyle(0xffffff, 0.03);
+    g.fillRoundedRect(rx - rackW / 2 + 2, ry + 2, rackW - 4, rackH / 3, 2);
+  }
+
+  /** Draw a cork-board bulletin board hanging on the south wall — the Hall of Fame. */
+  private drawHallOfFameBoard(): void {
+    this.hallOfFameGfx = this.add.graphics().setDepth(3);
+    const g = this.hallOfFameGfx;
+
+    // Board hangs on the west wall, portrait orientation,
+    // centered vertically on the hallOfFameTile row, just right of the wall.
+    const bx = this.hallOfFameTile.x * TILE_PX + 10; // just off the west wall
+    const by = this.hallOfFameTile.y * TILE_PX + 32;
+    const bw = 48;
+    const bh = 84;
+
+    // Drop shadow
+    g.fillStyle(0x000000, 0.3);
+    g.fillRoundedRect(bx - bw / 2 + 3, by - bh / 2 + 4, bw, bh, 3);
+
+    // Wooden frame — dark walnut with bevel
+    g.fillStyle(0x2a1a10, 1);
+    g.fillRoundedRect(bx - bw / 2 - 5, by - bh / 2 - 5, bw + 10, bh + 10, 6);
+    g.fillStyle(0x4a3220, 1);
+    g.fillRoundedRect(bx - bw / 2 - 3, by - bh / 2 - 3, bw + 6, bh + 6, 5);
+    g.fillStyle(0x5a4030, 1);
+    g.fillRoundedRect(bx - bw / 2 - 2, by - bh / 2 - 2, bw + 4, bh + 4, 4);
+
+    // Cork surface — warmer tone
+    g.fillStyle(0xcba872, 1);
+    g.fillRoundedRect(bx - bw / 2, by - bh / 2, bw, bh, 3);
+
+    // Cork texture — finer grain
+    g.fillStyle(0xb8985f, 0.4);
+    for (let i = 0; i < 35; i++) {
+      const dx = bx - bw / 2 + 4 + Math.random() * (bw - 8);
+      const dy = by - bh / 2 + 4 + Math.random() * (bh - 8);
+      g.fillCircle(dx, dy, 0.6 + Math.random() * 0.8);
+    }
+    // darker cork spots
+    g.fillStyle(0x8a6840, 0.3);
+    for (let i = 0; i < 12; i++) {
+      const dx = bx - bw / 2 + 4 + Math.random() * (bw - 8);
+      const dy = by - bh / 2 + 4 + Math.random() * (bh - 8);
+      g.fillCircle(dx, dy, 0.5 + Math.random() * 0.5);
+    }
+
+    // Title strip at top — dark modern
+    g.fillStyle(0x1a1a22, 0.9);
+    g.fillRoundedRect(bx - bw / 2 + 3, by - bh / 2 + 3, bw - 6, 12, 2);
+    g.fillStyle(0x2a2a36, 0.5);
+    g.fillRoundedRect(bx - bw / 2 + 3, by - bh / 2 + 3, bw - 6, 3, 2);
+
+    // Gold star — with glow
+    g.fillStyle(0xffd700, 0.3);
+    g.fillCircle(bx - bw / 2 + 9, by - bh / 2 + 9, 4);
+    g.fillStyle(0xffd700, 1);
+    g.fillCircle(bx - bw / 2 + 9, by - bh / 2 + 9, 2.5);
+    g.fillStyle(0xffffff, 0.4);
+    g.fillCircle(bx - bw / 2 + 8, by - bh / 2 + 8, 1);
+
+    // Mounting nails at left side (attached to wall) — brushed
+    g.fillStyle(0x888890, 1);
+    g.fillCircle(bx - bw / 2 - 6, by - bh / 2 + 4, 1.5);
+    g.fillCircle(bx - bw / 2 - 6, by + bh / 2 - 4, 1.5);
+    g.fillStyle(0xcccccc, 0.6);
+    g.fillCircle(bx - bw / 2 - 6.5, by - bh / 2 + 3.5, 0.7);
+    g.fillCircle(bx - bw / 2 - 6.5, by + bh / 2 - 4.5, 0.7);
+
+    // Pinned photos — 3 small polaroid cards arranged vertically with shadows
+    const photoColors = [0xc44a4a, 0x3a7cb5, 0x3d9152];
+    const photoSpacing = 24;
+    const photoStartY = by - bh / 2 + 20;
+    for (let i = 0; i < photoColors.length; i++) {
+      const py = photoStartY + i * photoSpacing;
+      // shadow
+      g.fillStyle(0x000000, 0.15);
+      g.fillRoundedRect(bx - 8, py - 7, 18, 22, 1);
+      // polaroid
+      g.fillStyle(0xf8f6f0, 1);
+      g.fillRoundedRect(bx - 9, py - 8, 18, 22, 1);
+      // photo
+      g.fillStyle(photoColors[i], 1);
+      g.fillRect(bx - 7, py - 6, 14, 12);
+      // photo highlight
+      g.fillStyle(0xffffff, 0.15);
+      g.fillRect(bx - 7, py - 6, 14, 2);
+      // pin
+      g.fillStyle(0xd44a4a, 1);
+      g.fillCircle(bx, py - 10, 2);
+      g.fillStyle(0xffffff, 0.5);
+      g.fillCircle(bx - 0.8, py - 10.8, 0.8);
+    }
+  }
+
+  // ── Theme-dispatched exterior ───────────────────────────────────────
+
+  /** Master exterior dispatcher — draws theme-specific rooftop, landing pad, and wall decor. */
+  private drawExterior(): void {
+    const themeId = this.worldTheme?.id;
+    if (themeId === "erics-alley") {
+      this.drawAlleyExterior();
+    } else if (themeId === "hawaii") {
+      this.drawHawaiiExterior();
+    } else if (themeId === "old-south") {
+      this.drawSouthExterior();
+    } else {
+      // Default / HQ — original industrial look
+      this.drawExteriorChimney();
+      this.drawCulturalWalls();
+      this.drawHelipad();
+    }
+  }
+
+  /** Alley exterior: water tower, chain-link fence, rooftop landing zone with graffiti "H". */
+  private drawAlleyExterior(): void {
+    const g = this.add.graphics().setDepth(-0.5);
+    const mapPxW = 30 * TILE_PX;
+    const roofY = 0;
+
+    // --- Rooftop water tower (left side) ---
+    const wtX = 180;
+    const wtBaseY = roofY - 8;
+    const wtTopY = roofY - 90;
+    // Legs
+    g.lineStyle(3, 0x4a3a2a, 1);
+    g.beginPath();
+    g.moveTo(wtX - 18, wtBaseY); g.lineTo(wtX - 10, wtTopY);
+    g.moveTo(wtX + 18, wtBaseY); g.lineTo(wtX + 10, wtTopY);
+    g.moveTo(wtX - 6, wtBaseY); g.lineTo(wtX - 3, wtTopY);
+    g.moveTo(wtX + 6, wtBaseY); g.lineTo(wtX + 3, wtTopY);
+    g.strokePath();
+    // Tank body
+    g.fillStyle(0x5a4a3a, 1);
+    g.fillRect(wtX - 22, wtTopY, 44, 30);
+    g.fillStyle(0x6a5a4a, 1);
+    g.fillRect(wtX - 22, wtTopY, 44, 4);
+    g.fillStyle(0x3a2a1a, 1);
+    g.fillRect(wtX - 22, wtTopY + 26, 44, 4);
+    // Bands
+    g.lineStyle(2, 0x3a2a1a, 0.6);
+    g.beginPath(); g.moveTo(wtX - 22, wtTopY + 10); g.lineTo(wtX + 22, wtTopY + 10); g.strokePath();
+    g.beginPath(); g.moveTo(wtX - 22, wtTopY + 20); g.lineTo(wtX + 22, wtTopY + 20); g.strokePath();
+
+    // --- Chain-link fence along roof edge ---
+    g.lineStyle(1.5, 0x5a5a5a, 0.5);
+    for (let fx = TILE_PX; fx < mapPxW - TILE_PX; fx += 8) {
+      g.beginPath(); g.moveTo(fx, roofY - 3); g.lineTo(fx, roofY - 18); g.strokePath();
+    }
+    g.lineStyle(1, 0x5a5a5a, 0.3);
+    for (let fy = roofY - 3; fy > roofY - 18; fy -= 4) {
+      g.beginPath(); g.moveTo(TILE_PX, fy); g.lineTo(mapPxW - TILE_PX, fy); g.strokePath();
+    }
+
+    // --- Rooftop landing zone (replaces helipad) ---
+    const cx = mapPxW / 2 + 240;
+    const padCY = roofY - 120;
+    // Cardboard sheet base
+    g.fillStyle(0x6a5a4a, 0.8);
+    g.fillRect(cx - 150, padCY - 40, 300, 80);
+    g.fillStyle(0x5a4a3a, 0.6);
+    g.fillRect(cx - 150, padCY - 40, 300, 4);
+    g.fillRect(cx - 150, padCY + 36, 300, 4);
+    // Corrugated texture lines
+    g.lineStyle(1, 0x4a3a2a, 0.3);
+    for (let lx = cx - 145; lx < cx + 150; lx += 8) {
+      g.beginPath(); g.moveTo(lx, padCY - 36); g.lineTo(lx, padCY + 36); g.strokePath();
+    }
+    // Spray-painted "H" — rough graffiti style
+    g.lineStyle(6, 0xddaa44, 0.7);
+    g.beginPath();
+    g.moveTo(cx - 30, padCY - 25); g.lineTo(cx - 30, padCY + 25);
+    g.moveTo(cx - 30, padCY); g.lineTo(cx + 30, padCY);
+    g.moveTo(cx + 30, padCY - 25); g.lineTo(cx + 30, padCY + 25);
+    g.strokePath();
+    // Dashed circle around H
+    g.lineStyle(3, 0xddaa44, 0.5);
+    g.strokeCircle(cx, padCY, 55);
+
+    // --- Industrial pipes on left wall ---
+    const pg = this.add.graphics().setDepth(1);
+    pg.lineStyle(4, 0x6a6058, 0.8);
+    pg.beginPath();
+    pg.moveTo(TILE_PX + 8, 0);
+    pg.lineTo(TILE_PX + 8, 3 * TILE_PX);
+    pg.lineTo(TILE_PX + 24, 3 * TILE_PX + 16);
+    pg.lineTo(TILE_PX + 24, 6 * TILE_PX);
+    pg.strokePath();
+    // Pipe joints
+    pg.fillStyle(0x5a5048, 0.8);
+    pg.fillCircle(TILE_PX + 8, 2 * TILE_PX, 5);
+    pg.fillCircle(TILE_PX + 24, 5 * TILE_PX, 5);
+
+    // --- Alley exterior overlays: dumpsters and crates outside south wall ---
+    const eg = this.add.graphics().setDepth(-0.3);
+    const southY = 20 * TILE_PX;
+    // Dumpsters (left and right of south entrance)
+    for (const dx of [3, 25]) {
+      const bx = dx * TILE_PX;
+      eg.fillStyle(0x2a5a3a, 1);
+      eg.fillRect(bx, southY + 4, 56, 40);
+      eg.fillStyle(0x3a6a4a, 1);
+      eg.fillRect(bx, southY + 4, 56, 4);
+      eg.fillStyle(0x1a4a2a, 1);
+      eg.fillRect(bx, southY + 40, 56, 4);
+      // Lid
+      eg.fillStyle(0x3a7a5a, 0.8);
+      eg.fillRect(bx + 2, southY + 2, 52, 6);
+      // Grime streaks
+      eg.fillStyle(0x1a3a1a, 0.3);
+      eg.fillRect(bx + 10, southY + 8, 4, 30);
+      eg.fillRect(bx + 30, southY + 8, 3, 25);
+    }
+    // Crates stacked near dumpster
+    eg.fillStyle(0x6a5a3a, 0.9);
+    eg.fillRect(5 * TILE_PX, southY + 8, 40, 32);
+    eg.fillStyle(0x5a4a2a, 0.9);
+    eg.fillRect(5 * TILE_PX + 44, southY + 16, 28, 24);
+    eg.lineStyle(1, 0x4a3a1a, 0.5);
+    eg.strokeRect(5 * TILE_PX, southY + 8, 40, 32);
+    eg.strokeRect(5 * TILE_PX + 44, southY + 16, 28, 24);
+    // Graffiti tag on south wall
+    eg.lineStyle(3, 0xdd4422, 0.6);
+    eg.beginPath();
+    eg.moveTo(15 * TILE_PX + 10, southY - 2);
+    eg.lineTo(15 * TILE_PX + 20, southY - 12);
+    eg.lineTo(15 * TILE_PX + 30, southY - 2);
+    eg.strokePath();
+  }
+
+  /** Hawaii exterior: thatched roof overhang, tiki torches at corners, beach landing circle. */
+  private drawHawaiiExterior(): void {
+    const g = this.add.graphics().setDepth(-0.5);
+    const mapPxW = 30 * TILE_PX;
+    const roofY = 0;
+
+    // --- Thatched roof overhang along top wall ---
+    const eaveH = 18;
+    const overhang = 14;
+    g.fillStyle(0x8a6a3a, 1);
+    g.fillRect(-overhang, roofY - eaveH, mapPxW + overhang * 2, eaveH);
+    // Thatch texture — vertical lines
+    g.lineStyle(1.5, 0x6a4a2a, 0.5);
+    for (let tx = -overhang + 4; tx < mapPxW + overhang; tx += 6) {
+      g.beginPath(); g.moveTo(tx, roofY - eaveH + 2); g.lineTo(tx, roofY - 2); g.strokePath();
+    }
+    // Eave top highlight
+    g.fillStyle(0xaa8a5a, 1);
+    g.fillRect(-overhang, roofY - eaveH, mapPxW + overhang * 2, 3);
+    // Eave bottom shadow
+    g.fillStyle(0x4a3a1a, 1);
+    g.fillRect(-overhang, roofY - 4, mapPxW + overhang * 2, 4);
+
+    // --- Tiki torches at four corners ---
+    const torchPositions = [
+      { x: TILE_PX + 20, y: roofY + 8 },
+      { x: mapPxW - TILE_PX - 20, y: roofY + 8 },
+      { x: TILE_PX + 20, y: 19 * TILE_PX - 8 },
+      { x: mapPxW - TILE_PX - 20, y: 19 * TILE_PX - 8 },
+    ];
+    for (const tp of torchPositions) {
+      // Bamboo pole
+      g.fillStyle(0x8a6a3a, 1);
+      g.fillRect(tp.x - 3, tp.y - 60, 6, 60);
+      g.fillStyle(0x6a4a2a, 0.5);
+      g.fillRect(tp.x - 3, tp.y - 60, 1, 60);
+      // Segments
+      g.lineStyle(1, 0x5a3a1a, 0.6);
+      for (let seg = 0; seg < 4; seg++) {
+        const sy = tp.y - 12 - seg * 14;
+        g.beginPath(); g.moveTo(tp.x - 3, sy); g.lineTo(tp.x + 3, sy); g.strokePath();
+      }
+      // Flame
+      g.fillStyle(0xff8822, 0.8);
+      g.fillCircle(tp.x, tp.y - 66, 8);
+      g.fillStyle(0xffcc44, 0.6);
+      g.fillCircle(tp.x, tp.y - 68, 5);
+      g.fillStyle(0xffee66, 0.4);
+      g.fillCircle(tp.x, tp.y - 70, 3);
+    }
+
+    // --- Beach landing circle (replaces helipad) ---
+    const cx = mapPxW / 2 + 240;
+    const padCY = roofY - 130;
+    // Sand circle
+    g.fillStyle(0xe6d4a4, 0.7);
+    g.fillEllipse(cx, padCY, 320, 90);
+    g.fillStyle(0xd6c494, 0.5);
+    g.fillEllipse(cx, padCY, 300, 80);
+    // Palm frond ring
+    g.lineStyle(3, 0x4a8a3a, 0.5);
+    g.strokeEllipse(cx, padCY, 280, 70);
+    // Inner sand
+    g.fillStyle(0xf6e4b4, 0.4);
+    g.fillEllipse(cx, padCY, 240, 60);
+    // "H" made of shells
+    g.fillStyle(0xf0e0d0, 0.8);
+    g.fillRect(cx - 28, padCY - 22, 6, 44);
+    g.fillRect(cx + 22, padCY - 22, 6, 44);
+    g.fillRect(cx - 28, padCY - 3, 56, 6);
+
+    // --- Hawaii exterior overlays: palm trees and lava rocks outside south wall ---
+    const eg = this.add.graphics().setDepth(-0.3);
+    const southY = 20 * TILE_PX;
+    // Palm trees (left and right of south entrance)
+    for (const dx of [3, 26]) {
+      const bx = dx * TILE_PX + 32;
+      // Trunk
+      eg.fillStyle(0x8a6a3a, 1);
+      eg.fillRect(bx - 4, southY + 4, 8, 48);
+      // Trunk segments
+      eg.lineStyle(1, 0x6a4a2a, 0.6);
+      for (let seg = 0; seg < 4; seg++) {
+        const sy = southY + 8 + seg * 12;
+        eg.beginPath(); eg.moveTo(bx - 4, sy); eg.lineTo(bx + 4, sy); eg.strokePath();
+      }
+      // Fronds
+      eg.fillStyle(0x4a8a3a, 0.8);
+      for (let a = 0; a < 6; a++) {
+        const angle = (a / 6) * Math.PI * 2;
+        const fx = bx + Math.cos(angle) * 20;
+        const fy = southY + 2 + Math.sin(angle) * 10;
+        eg.beginPath();
+        eg.moveTo(bx, southY + 4);
+        eg.lineTo(fx, fy);
+        eg.lineTo(bx + Math.cos(angle + 0.3) * 12, southY + 4 + Math.sin(angle + 0.3) * 6);
+        eg.closePath();
+        eg.fillPath();
+      }
+    }
+    // Lava rocks
+    eg.fillStyle(0x4a3a3a, 0.8);
+    eg.fillCircle(8 * TILE_PX, southY + 20, 16);
+    eg.fillStyle(0x3a2a2a, 0.6);
+    eg.fillCircle(8 * TILE_PX, southY + 20, 12);
+    eg.fillStyle(0x5a4a4a, 0.5);
+    eg.fillCircle(22 * TILE_PX, southY + 16, 14);
+    // Hibiscus bushes
+    eg.fillStyle(0x4a8a4a, 0.7);
+    eg.fillCircle(14 * TILE_PX, southY + 12, 12);
+    eg.fillStyle(0xff6688, 0.6);
+    eg.fillCircle(14 * TILE_PX, southY + 10, 5);
+    eg.fillCircle(14 * TILE_PX + 6, southY + 14, 4);
+  }
+  private drawSouthExterior(): void {
+    const g = this.add.graphics().setDepth(-0.5);
+    const mapPxW = 30 * TILE_PX;
+    const roofY = 0;
+
+    // --- Two brick chimneys (left and right) ---
+    const chimPositions = [
+      { x: 4 * TILE_PX, w: 32 },
+      { x: 26 * TILE_PX, w: 32 },
+    ];
+    for (const cp of chimPositions) {
+      const chimTopY = roofY - 70;
+      // Body
+      g.fillStyle(0x8a4a3a, 1);
+      g.fillRect(cp.x - cp.w / 2, chimTopY, cp.w, 70);
+      g.fillStyle(0x9a5a4a, 1);
+      g.fillRect(cp.x - cp.w / 2, chimTopY, cp.w, 3);
+      g.fillStyle(0x6a3a2a, 1);
+      g.fillRect(cp.x - cp.w / 2, roofY - 4, cp.w, 4);
+      // Mortar lines
+      g.lineStyle(1, 0x5a2a1a, 0.5);
+      for (let my = chimTopY + 8; my < roofY; my += 10) {
+        g.beginPath(); g.moveTo(cp.x - cp.w / 2, my); g.lineTo(cp.x + cp.w / 2, my); g.strokePath();
+      }
+      // Cap
+      g.fillStyle(0x6a3a2a, 1);
+      g.fillRect(cp.x - cp.w / 2 - 4, chimTopY - 6, cp.w + 8, 6);
+      g.fillStyle(0x7a4a3a, 1);
+      g.fillRect(cp.x - cp.w / 2 - 4, chimTopY - 6, cp.w + 8, 2);
+    }
+
+    // --- Columned porch overhang along top wall ---
+    const porchH = 22;
+    g.fillStyle(0xf0e8d8, 1);
+    g.fillRect(0, roofY - porchH, mapPxW, porchH);
+    g.fillStyle(0xe0d8c8, 1);
+    g.fillRect(0, roofY - porchH, mapPxW, 3);
+    g.fillStyle(0xd0c8b8, 1);
+    g.fillRect(0, roofY - 4, mapPxW, 4);
+    // Columns at regular intervals
+    const colPositions = [3, 8, 14, 20, 26];
+    for (const cx of colPositions) {
+      const px = cx * TILE_PX + TILE_PX / 2;
+      g.fillStyle(0xf0e8d8, 1);
+      g.fillRect(px - 8, roofY - porchH, 16, porchH);
+      g.fillStyle(0xe0d0b8, 0.6);
+      g.fillRect(px - 8, roofY - porchH, 3, porchH);
+      g.fillStyle(0xd0c0a8, 0.6);
+      g.fillRect(px + 5, roofY - porchH, 3, porchH);
+      // Column capital
+      g.fillStyle(0xf0e8d8, 1);
+      g.fillRect(px - 12, roofY - porchH, 24, 4);
+      // Column base
+      g.fillStyle(0xe0d0b8, 1);
+      g.fillRect(px - 10, roofY - 6, 20, 6);
+    }
+
+    // --- Carriage turnaround (replaces helipad) ---
+    const cx = mapPxW / 2 + 240;
+    const padCY = roofY - 130;
+    // Gravel circle
+    g.fillStyle(0xb0a898, 0.6);
+    g.fillEllipse(cx, padCY, 340, 100);
+    g.fillStyle(0xa09888, 0.5);
+    g.fillEllipse(cx, padCY, 320, 90);
+    // Cobblestone ring
+    g.lineStyle(4, 0x9a9080, 0.5);
+    g.strokeEllipse(cx, padCY, 300, 84);
+    // Inner gravel
+    g.fillStyle(0xc0b8a8, 0.4);
+    g.fillEllipse(cx, padCY, 260, 72);
+    // "H" in brick chips
+    g.fillStyle(0x8a4a3a, 0.7);
+    g.fillRect(cx - 30, padCY - 24, 8, 48);
+    g.fillRect(cx + 22, padCY - 24, 8, 48);
+    g.fillRect(cx - 30, padCY - 4, 60, 8);
+
+    // --- Old South exterior overlays: cotton field rows and garden outside south wall ---
+    const eg = this.add.graphics().setDepth(-0.3);
+    const southY = 20 * TILE_PX;
+    // Cotton field rows (left side — furrows with cotton bolls)
+    for (let row = 0; row < 3; row++) {
+      const ry = southY + 6 + row * 16;
+      // Furrow
+      eg.fillStyle(0x8a6a3a, 0.5);
+      eg.fillRect(2 * TILE_PX, ry, 10 * TILE_PX, 12);
+      eg.fillStyle(0x7a5a2a, 0.4);
+      eg.fillRect(2 * TILE_PX, ry + 8, 10 * TILE_PX, 4);
+      // Cotton bolls (white dots along the row)
+      for (let bx = 3; bx < 12; bx += 2) {
+        eg.fillStyle(0xf0f0e8, 0.7);
+        eg.fillCircle(bx * TILE_PX + 16, ry + 6, 4);
+        eg.fillStyle(0xd8d8c8, 0.5);
+        eg.fillCircle(bx * TILE_PX + 14, ry + 4, 2);
+      }
+    }
+    // Magnolia tree (right of south entrance)
+    const magX = 26 * TILE_PX + 32;
+    eg.fillStyle(0x6a4a2a, 1);
+    eg.fillRect(magX - 4, southY + 8, 8, 40);
+    eg.fillStyle(0x3a6a3a, 0.8);
+    eg.fillCircle(magX, southY + 6, 22);
+    eg.fillStyle(0x4a7a4a, 0.6);
+    eg.fillCircle(magX - 8, southY + 2, 14);
+    eg.fillCircle(magX + 8, southY + 4, 12);
+    // Magnolia blossoms
+    eg.fillStyle(0xf0f0e0, 0.7);
+    eg.fillCircle(magX - 6, southY, 5);
+    eg.fillCircle(magX + 10, southY + 6, 4);
+    eg.fillCircle(magX, southY + 10, 4);
+    // Garden path (right side — decorative shrubs)
+    for (let gx = 18; gx < 24; gx += 2) {
+      eg.fillStyle(0x4a6a3a, 0.6);
+      eg.fillCircle(gx * TILE_PX + 16, southY + 16, 10);
+      eg.fillStyle(0x5a7a4a, 0.4);
+      eg.fillCircle(gx * TILE_PX + 12, southY + 12, 5);
+    }
+  }
+  private drawExteriorChimney(): void {
+    this.chimneyGfx = this.add.graphics().setDepth(1);
+    const g = this.chimneyGfx;
+
+    // Chimney sits outside the left wall (x < 64), extending above the roof down to server room
+    const wallFace = TILE_PX;        // left wall outer edge at x=64
+    const chimW = 28;                 // chimney width at the shaft
+    const chimX = wallFace - chimW - 6; // 6px gap from wall
+    const roofY = 0;                  // top of building / roof line
+    const chimTopY = -52;             // chimney extends 52px above the roof
+    const baseY = 14 * TILE_PX;       // server room level
+
+    // Brick body — tapered from base to top
+    const baseW = chimW + 8;
+    const topW = chimW;
+
+    // Drop shadow on the wall (only the part at/below roof level)
+    g.fillStyle(0x000000, 0.2);
+    g.fillRect(chimX + 4, roofY, chimW, baseY - roofY);
+
+    // Main brick body — from baseY up to chimTopY (above the roof)
+    g.fillStyle(0x4a3328, 1);
+    g.beginPath();
+    g.moveTo(chimX - 4, baseY);
+    g.lineTo(chimX + baseW - 4, baseY);
+    g.lineTo(chimX + baseW - 4 - 4, chimTopY + 8);
+    g.lineTo(chimX + 4, chimTopY + 8);
+    g.closePath();
+    g.fillPath();
+
+    // Lighter brick highlight on left side
+    g.fillStyle(0x5a4030, 1);
+    g.beginPath();
+    g.moveTo(chimX - 4, baseY);
+    g.lineTo(chimX + 6, baseY);
+    g.lineTo(chimX + 6 - 2, chimTopY + 8);
+    g.lineTo(chimX + 4, chimTopY + 8);
+    g.closePath();
+    g.fillPath();
+
+    // Darker shadow on right side
+    g.fillStyle(0x3a2820, 1);
+    g.beginPath();
+    g.moveTo(chimX + baseW - 10, baseY);
+    g.lineTo(chimX + baseW - 4, baseY);
+    g.lineTo(chimX + baseW - 4 - 4, chimTopY + 8);
+    g.lineTo(chimX + baseW - 10 - 3, chimTopY + 8);
+    g.closePath();
+    g.fillPath();
+
+    // Brick mortar lines — horizontal
+    g.lineStyle(1, 0x2a1a12, 0.5);
+    for (let y = chimTopY + 16; y < baseY; y += 12) {
+      const t = (y - chimTopY) / (baseY - chimTopY);
+      const w = baseW - 4 - t * 8;
+      const xL = chimX - 4 + (baseW - 4 - w) / 2;
+      g.beginPath();
+      g.moveTo(xL, y);
+      g.lineTo(xL + w, y);
+      g.strokePath();
+    }
+
+    // Brick mortar lines — vertical (staggered)
+    for (let row = 0; row < Math.floor((baseY - chimTopY) / 12); row++) {
+      const y = chimTopY + 16 + row * 12;
+      const t = (y - chimTopY) / (baseY - chimTopY);
+      const w = baseW - 4 - t * 8;
+      const xL = chimX - 4 + (baseW - 4 - w) / 2;
+      const offset = row % 2 === 0 ? 0 : w / 6;
+      for (let bx = 0; bx < 5; bx++) {
+        const vx = xL + offset + bx * (w / 5);
+        if (vx < xL + w) {
+          g.beginPath();
+          g.moveTo(vx, y);
+          g.lineTo(vx, y + 12);
+          g.strokePath();
+        }
+      }
+    }
+
+    // --- Chimney cap (the part above the roof that makes it look like a chimney) ---
+
+    // Corbelled brick course just above roof line (wider than shaft)
+    const corbelW = topW + 10;
+    const corbelX = chimX + (baseW - 4 - corbelW) / 2 - 3;
+    g.fillStyle(0x4a3328, 1);
+    g.fillRect(corbelX, roofY - 6, corbelW, 6);
+    // corbel highlight/shadow
+    g.fillStyle(0x5a4030, 1);
+    g.fillRect(corbelX, roofY - 6, corbelW, 2);
+    g.fillStyle(0x3a2820, 1);
+    g.fillRect(corbelX, roofY - 1, corbelW, 1);
+
+    // Concrete cap — wide slab on top of the shaft
+    const capW = topW + 12;
+    const capH = 10;
+    const capX = chimX + (baseW - 4 - capW) / 2 - 4;
+    const capY = chimTopY;
+    g.fillStyle(0x6a6058, 1);
+    g.fillRect(capX, capY, capW, capH);
+    // cap bevel — top highlight
+    g.fillStyle(0x8a8078, 1);
+    g.fillRect(capX, capY, capW, 2);
+    // cap bevel — bottom shadow
+    g.fillStyle(0x4a4038, 1);
+    g.fillRect(capX, capY + capH - 2, capW, 2);
+    // cap left/right edges
+    g.fillStyle(0x5a5048, 1);
+    g.fillRect(capX, capY, 2, capH);
+    g.fillRect(capX + capW - 2, capY, 2, capH);
+
+    // Brick shaft between cap and corbel (the part above the roof, below the cap)
+    const shaftTopY = capY + capH;
+    const shaftBotY = roofY - 6;
+    g.fillStyle(0x4a3328, 1);
+    g.fillRect(chimX - 2, shaftTopY, topW + 4, shaftBotY - shaftTopY);
+    // shaft highlight on left
+    g.fillStyle(0x5a4030, 1);
+    g.fillRect(chimX - 2, shaftTopY, 4, shaftBotY - shaftTopY);
+    // shaft shadow on right
+    g.fillStyle(0x3a2820, 1);
+    g.fillRect(chimX + topW - 2, shaftTopY, 4, shaftBotY - shaftTopY);
+    // a couple mortar lines on the exposed shaft
+    g.lineStyle(1, 0x2a1a12, 0.5);
+    for (let y = shaftTopY + 8; y < shaftBotY; y += 10) {
+      g.beginPath();
+      g.moveTo(chimX - 2, y);
+      g.lineTo(chimX + topW + 2, y);
+      g.strokePath();
+    }
+
+    // Dark opening at top (where smoke comes out) — recessed into the cap
+    const openW = topW - 4;
+    const openX = chimX + (topW - openW) / 2;
+    g.fillStyle(0x0a0608, 1);
+    g.fillRect(openX, capY + 2, openW, 5);
+
+    // Inner heat shimmer
+    g.fillStyle(0xff6600, 0.12);
+    g.fillRect(openX + 1, capY + 2, openW - 2, 3);
+
+    // Store the smoke position above the chimney cap
+    this.chimneyPositions = [{ x: openX + openW / 2, y: capY - 2 }];
+  }
+
+  // ── Theme-specific window drawing for world themes ─────────────────
+
+  /** Draw theme-specific windows on the walls of a world theme office. */
+  private drawThemeWindows(_walls: Phaser.Tilemaps.TilemapLayer): void {
+    const themeId = this.worldTheme?.id;
+    const g = this.add.graphics().setDepth(1.1);
+
+    if (themeId === "erics-alley") {
+      // Barred windows — steel bars over dirty glass, only on top wall
+      const windowXs = [2, 10, 18, 26];
+      for (const x of windowXs) {
+        const wx = x * TILE_PX;
+        const wy = 1 * TILE_PX;
+        // Dirty glass
+        g.fillStyle(0x4a4a3a, 0.6);
+        g.fillRoundedRect(wx + 6, wy + 8, 52, 36, 2);
+        // Steel bars (horizontal)
+        g.lineStyle(3, 0x6a6a6a, 1);
+        g.beginPath();
+        g.moveTo(wx + 6, wy + 18); g.lineTo(wx + 58, wy + 18);
+        g.moveTo(wx + 6, wy + 30); g.lineTo(wx + 58, wy + 30);
+        g.strokePath();
+        // Steel bars (vertical)
+        g.lineStyle(2, 0x5a5a5a, 1);
+        g.beginPath();
+        g.moveTo(wx + 20, wy + 8); g.lineTo(wx + 20, wy + 44);
+        g.moveTo(wx + 42, wy + 8); g.lineTo(wx + 42, wy + 44);
+        g.strokePath();
+        // Frame
+        g.lineStyle(2, 0x3a3a3a, 1);
+        g.strokeRoundedRect(wx + 5, wy + 7, 54, 38, 2);
+      }
+    } else if (themeId === "hawaii") {
+      // Open-air openings — no glass, just wooden frames with ocean view
+      const windowXs = [1, 8, 15, 22, 28];
+      for (const x of windowXs) {
+        const wx = x * TILE_PX;
+        const wy = 1 * TILE_PX;
+        // Ocean view gradient
+        g.fillStyle(0x4a9ab8, 0.5);
+        g.fillRoundedRect(wx + 4, wy + 6, 56, 42, 3);
+        g.fillStyle(0x6ab8d4, 0.3);
+        g.fillRoundedRect(wx + 6, wy + 8, 52, 20, 2);
+        // Bamboo frame
+        g.lineStyle(3, 0x8b6940, 1);
+        g.strokeRoundedRect(wx + 3, wy + 5, 58, 44, 3);
+        // Bamboo mullions
+        g.lineStyle(2, 0x6b4a20, 0.8);
+        g.beginPath();
+        g.moveTo(wx + 32, wy + 6); g.lineTo(wx + 32, wy + 48);
+        g.strokePath();
+      }
+    } else if (themeId === "old-south") {
+      // Plantation shutters — louvered windows
+      const windowXs = [2, 10, 18, 26];
+      for (const x of windowXs) {
+        const wx = x * TILE_PX;
+        const wy = 1 * TILE_PX;
+        // Frame
+        g.fillStyle(0x6b4a2a, 1);
+        g.fillRoundedRect(wx + 4, wy + 6, 56, 42, 3);
+        // Louvers (angled slats)
+        g.fillStyle(0x8b6a3a, 0.9);
+        for (let ly = 10; ly < 44; ly += 5) {
+          g.fillRect(wx + 7, wy + ly, 50, 3);
+        }
+        // Shadow lines on louvers
+        g.fillStyle(0x4a3010, 0.4);
+        for (let ly = 10; ly < 44; ly += 5) {
+          g.fillRect(wx + 7, wy + ly + 2, 50, 1);
+        }
+        // Frame outline
+        g.lineStyle(2, 0x4a3010, 1);
+        g.strokeRoundedRect(wx + 4, wy + 6, 56, 42, 3);
+      }
+    }
+  }
+
+  // ── Cultural perimeter wall overlays ────────────────────────────────
+
+  /** Master method — draws cultural overlays on perimeter walls + corners.
+   *  Only called for default/HQ theme. World themes have their own exterior decor. */
+  private drawCulturalWalls(): void {
+    this.drawNorthWallAsian();
+    this.drawCornerAccents();
+  }
+
+  /** North wall (y=0) — East Asian inspired: pagoda eaves, lattice, lanterns, bamboo. */
+  private drawNorthWallAsian(): void {
+    const g = this.add.graphics().setDepth(1);
+    const mapPxW = 30 * TILE_PX;
+    const wallY = 0;
+
+    // --- Pagoda eaves: overhanging roofline with upturned corners ---
+    const eaveH = 14;
+    const eaveOverhang = 10;
+    // Main eave band — warm wood tone
+    g.fillStyle(0x6a4a32, 1);
+    g.fillRect(-eaveOverhang, wallY - eaveH, mapPxW + eaveOverhang * 2, eaveH);
+    // Eave top highlight
+    g.fillStyle(0x8a6a42, 1);
+    g.fillRect(-eaveOverhang, wallY - eaveH, mapPxW + eaveOverhang * 2, 3);
+    // Eave bottom shadow
+    g.fillStyle(0x4a3a22, 1);
+    g.fillRect(-eaveOverhang, wallY - 3, mapPxW + eaveOverhang * 2, 3);
+
+    // Upturned corners — left
+    g.fillStyle(0x6a4a32, 1);
+    g.beginPath();
+    g.moveTo(-eaveOverhang, wallY);
+    g.lineTo(-eaveOverhang - 16, wallY - eaveH - 6);
+    g.lineTo(-eaveOverhang - 10, wallY - eaveH - 6);
+    g.lineTo(-eaveOverhang + 4, wallY - 2);
+    g.closePath();
+    g.fillPath();
+    g.fillStyle(0x8a6a42, 1);
+    g.fillRect(-eaveOverhang - 16, wallY - eaveH - 6, 6, 2);
+
+    // Upturned corners — right
+    g.fillStyle(0x6a4a32, 1);
+    g.beginPath();
+    g.moveTo(mapPxW + eaveOverhang, wallY);
+    g.lineTo(mapPxW + eaveOverhang + 16, wallY - eaveH - 6);
+    g.lineTo(mapPxW + eaveOverhang + 10, wallY - eaveH - 6);
+    g.lineTo(mapPxW + eaveOverhang - 4, wallY - 2);
+    g.closePath();
+    g.fillPath();
+    g.fillStyle(0x8a6a42, 1);
+    g.fillRect(mapPxW + eaveOverhang + 10, wallY - eaveH - 6, 6, 2);
+
+    // Eave underside — dark recessed area
+    g.fillStyle(0x2a1a12, 1);
+    g.fillRect(-eaveOverhang, wallY - 4, mapPxW + eaveOverhang * 2, 4);
+
+    // --- Lattice pattern (sukashi-kumiko) across upper wall ---
+    g.lineStyle(1, 0x8a6a42, 0.25);
+    const latTop = wallY + 6;
+    const latBot = wallY + 22;
+    const latSpacing = 12;
+    for (let x = TILE_PX; x < mapPxW - TILE_PX; x += latSpacing) {
+      g.beginPath();
+      g.moveTo(x, latTop);
+      g.lineTo(x, latBot);
+      g.strokePath();
+    }
+    for (let y = latTop; y <= latBot; y += 8) {
+      g.beginPath();
+      g.moveTo(TILE_PX, y);
+      g.lineTo(mapPxW - TILE_PX, y);
+      g.strokePath();
+    }
+    // Diagonal lattice accents
+    g.lineStyle(1, 0x8a6a42, 0.15);
+    for (let x = TILE_PX; x < mapPxW - TILE_PX; x += latSpacing * 2) {
+      g.beginPath();
+      g.moveTo(x, latTop);
+      g.lineTo(x + latSpacing, latBot);
+      g.strokePath();
+      g.beginPath();
+      g.moveTo(x + latSpacing, latTop);
+      g.lineTo(x, latBot);
+      g.strokePath();
+    }
+
+    // --- Stone lanterns at intervals ---
+    const lanternPositions = [5, 15, 25];
+    for (const lx of lanternPositions) {
+      const px = lx * TILE_PX + TILE_PX / 2;
+      const py = wallY + TILE_PX - 6;
+
+      // Lantern base — small stone block
+      g.fillStyle(0x5a5a52, 1);
+      g.fillRect(px - 8, py - 4, 16, 4);
+      g.fillStyle(0x6a6a62, 1);
+      g.fillRect(px - 8, py - 4, 16, 1);
+
+      // Lantern body — stone frame
+      g.fillStyle(0x6a6a62, 1);
+      g.fillRect(px - 7, py - 18, 14, 14);
+      g.fillStyle(0x4a4a42, 1);
+      g.fillRect(px - 7, py - 18, 14, 1);
+      g.fillRect(px - 7, py - 5, 14, 1);
+
+      // Glowing window
+      g.fillStyle(0xffaa44, 0.7);
+      g.fillRect(px - 5, py - 16, 10, 10);
+      g.fillStyle(0xffdd88, 0.4);
+      g.fillRect(px - 4, py - 15, 8, 8);
+
+      // Lantern cap — pyramidal stone
+      g.fillStyle(0x5a5a52, 1);
+      g.beginPath();
+      g.moveTo(px - 10, py - 18);
+      g.lineTo(px, py - 24);
+      g.lineTo(px + 10, py - 18);
+      g.closePath();
+      g.fillPath();
+      g.fillStyle(0x6a6a62, 1);
+      g.beginPath();
+      g.moveTo(px - 10, py - 18);
+      g.lineTo(px, py - 24);
+      g.lineTo(px + 3, py - 21);
+      g.lineTo(px - 7, py - 18);
+      g.closePath();
+      g.fillPath();
+    }
+
+    // --- Bamboo accents at 1/4, 1/2, 3/4 ---
+    const bambooPositions = [7, 14, 22];
+    for (const bx of bambooPositions) {
+      const px = bx * TILE_PX + TILE_PX / 2;
+      // Bamboo stalk
+      g.fillStyle(0x4a7a3a, 0.5);
+      g.fillRect(px - 3, wallY + 4, 6, TILE_PX - 8);
+      // Bamboo segments
+      g.fillStyle(0x3a6a2a, 0.6);
+      for (let seg = 0; seg < 4; seg++) {
+        g.fillRect(px - 3, wallY + 8 + seg * 12, 6, 1);
+      }
+      // Highlight
+      g.fillStyle(0x6a9a4a, 0.3);
+      g.fillRect(px - 3, wallY + 4, 1, TILE_PX - 8);
+    }
+  }
+
+  /** South wall (y=19) — Mediterranean: arched entry, terracotta band, balconies, marble. */
+  private drawSouthWallMediterranean(): void {
+    return; // dead code — removed from drawCulturalWalls
+    const g = this.add.graphics().setDepth(1);
+    const mapPxW = 30 * TILE_PX;
+    const wallY = 19 * TILE_PX;
+    const wallH = TILE_PX;
+
+    // --- Terracotta band across mid-height ---
+    const bandY = wallY + wallH * 0.35;
+    const bandH = 10;
+    g.fillStyle(0xa65a3a, 0.7);
+    g.fillRect(0, bandY, mapPxW, bandH);
+    g.fillStyle(0xc67a4a, 0.5);
+    g.fillRect(0, bandY, mapPxW, 2);
+    g.fillStyle(0x8a4a2a, 0.5);
+    g.fillRect(0, bandY + bandH - 2, mapPxW, 2);
+
+    // --- Wrought-iron balcony railings at 3 positions ---
+    const balconyPositions = [4, 11, 22];
+    for (const bx of balconyPositions) {
+      const px = bx * TILE_PX;
+      const railY = wallY + wallH * 0.15;
+      const railW = TILE_PX * 1.5;
+      const railH = 16;
+
+      // Railing top rail
+      g.fillStyle(0x3a3a3a, 0.8);
+      g.fillRect(px, railY, railW, 2);
+      // Railing bottom rail
+      g.fillRect(px, railY + railH - 2, railW, 2);
+      // Vertical balusters
+      for (let sx = 0; sx < railW; sx += 6) {
+        g.fillRect(px + sx, railY, 1, railH);
+      }
+      // Scrollwork — decorative S-curves (approximated with line segments)
+      g.lineStyle(1.5, 0x3a3a3a, 0.7);
+      for (let sx = 4; sx < railW - 4; sx += 16) {
+        g.beginPath();
+        g.moveTo(px + sx, railY + 4);
+        for (let t = 0; t <= 1; t += 0.25) {
+          const it = 1 - t;
+          g.lineTo(px + sx + it * it * 0 + 2 * it * t * 8 + t * t * 4, railY + 4 + it * it * 0 + 2 * it * t * -2 + t * t * (railH / 2 - 4));
+        }
+        for (let t = 0; t <= 1; t += 0.25) {
+          const it = 1 - t;
+          g.lineTo(px + sx + 4 + it * it * 0 + 2 * it * t * -4 + t * t * 8, railY + railH / 2 + it * it * 0 + 2 * it * t * (railH / 2 - 4) + t * t * (railH - 4 - railH / 2));
+        }
+        g.strokePath();
+      }
+      // Balcony base — stone corbel
+      g.fillStyle(0x8a7a6a, 0.8);
+      g.fillRect(px + railW / 2 - 8, railY + railH, 16, 6);
+      g.fillStyle(0x6a5a4a, 0.8);
+      g.fillRect(px + railW / 2 - 8, railY + railH + 4, 16, 2);
+    }
+
+    // --- Marble veining overlay on lower wall ---
+    g.lineStyle(1, 0xeae6e0, 0.15);
+    for (let i = 0; i < 8; i++) {
+      const startX = (i / 8) * mapPxW + Math.sin(i * 3.7) * 20;
+      const startY = wallY + wallH * 0.6;
+      g.beginPath();
+      g.moveTo(startX, startY);
+      let x = startX, y = startY;
+      for (let seg = 0; seg < 6; seg++) {
+        x += 12 + Math.sin(i + seg) * 8;
+        y += 3 + Math.cos(i + seg * 2) * 4;
+        g.lineTo(x, y);
+      }
+      g.strokePath();
+    }
+  }
+
+  /** West wall (x=0) — Victorian Industrial: enhanced brick, pipes, sign bracket, downspout. */
+  private drawWestWallVictorian(): void {
+    return; // dead code — removed from drawCulturalWalls
+    const g = this.add.graphics().setDepth(1);
+    const wallX = 0;
+    const mapPxH = 20 * TILE_PX;
+
+    // --- Enhanced brickwork overlay ---
+    // Reddish-brown brick color variation
+    const brickColors = [0x6a3a2a, 0x5a2a1a, 0x7a4a3a, 0x6a3a2a, 0x4a2a1a];
+    const brickH = 12;
+    const brickW = 28;
+    for (let row = 0; row < Math.floor(mapPxH / brickH); row++) {
+      const y = row * brickH;
+      const offset = row % 2 === 0 ? 0 : brickW / 2;
+      for (let bx = 0; bx < 3; bx++) {
+        const x = bx * brickW + offset;
+        if (x + brickW > TILE_PX) break;
+        const colorIdx = (row * 3 + bx) % brickColors.length;
+        g.fillStyle(brickColors[colorIdx], 0.35);
+        g.fillRect(wallX + x, y, brickW, brickH);
+      }
+      // Mortar lines — horizontal
+      g.fillStyle(0x2a1a12, 0.4);
+      g.fillRect(wallX, y, TILE_PX, 1);
+    }
+    // Mortar lines — vertical (staggered)
+    for (let row = 0; row < Math.floor(mapPxH / brickH); row++) {
+      const y = row * brickH;
+      const offset = row % 2 === 0 ? 0 : brickW / 2;
+      for (let bx = 0; bx < 3; bx++) {
+        const x = bx * brickW + offset;
+        if (x + brickW > TILE_PX) break;
+        g.fillStyle(0x2a1a12, 0.35);
+        g.fillRect(wallX + x, y, 1, brickH);
+      }
+    }
+
+    // Corbelling at top — 3 courses projecting outward
+    for (let course = 0; course < 3; course++) {
+      const cy = course * 4;
+      const proj = 3 + course * 2;
+      g.fillStyle(0x5a3a2a, 0.7);
+      g.fillRect(wallX - proj, cy, TILE_PX + proj, 4);
+      g.fillStyle(0x6a4a3a, 0.5);
+      g.fillRect(wallX - proj, cy, TILE_PX + proj, 1);
+    }
+
+    // --- Steam-punk pipes running vertically ---
+    const pipePositions = [3, 10];
+    for (const py of pipePositions) {
+      const pipeY = py * TILE_PX;
+      const pipeX = wallX + TILE_PX - 10;
+
+      // Pipe body — vertical
+      g.fillStyle(0x5a5a5a, 0.8);
+      g.fillRect(pipeX, pipeY, 8, TILE_PX * 2);
+      // Pipe highlight
+      g.fillStyle(0x7a7a7a, 0.6);
+      g.fillRect(pipeX, pipeY, 2, TILE_PX * 2);
+      // Pipe shadow
+      g.fillStyle(0x3a3a3a, 0.6);
+      g.fillRect(pipeX + 6, pipeY, 2, TILE_PX * 2);
+
+      // Pipe joints — riveted flanges every tile
+      for (let seg = 0; seg < 2; seg++) {
+        const jy = pipeY + seg * TILE_PX + TILE_PX / 2;
+        g.fillStyle(0x4a4a4a, 0.8);
+        g.fillRect(pipeX - 3, jy - 3, 14, 6);
+        g.fillStyle(0x6a6a6a, 0.6);
+        g.fillRect(pipeX - 3, jy - 3, 14, 1);
+        // Rivets
+        g.fillStyle(0x8a8a8a, 0.7);
+        g.fillCircle(pipeX - 1, jy, 1);
+        g.fillCircle(pipeX + 9, jy, 1);
+      }
+
+      // Valve gauge at midpoint
+      const gy = pipeY + TILE_PX;
+      g.fillStyle(0x3a3a3a, 0.8);
+      g.fillCircle(pipeX + 4, gy, 8);
+      g.fillStyle(0xaa9988, 0.7);
+      g.fillCircle(pipeX + 4, gy, 6);
+      g.fillStyle(0x2a2a2a, 0.8);
+      g.fillCircle(pipeX + 4, gy, 5);
+      // Gauge needle
+      g.lineStyle(1.5, 0xdd4444, 0.8);
+      g.beginPath();
+      g.moveTo(pipeX + 4, gy);
+      g.lineTo(pipeX + 4 + 3, gy - 3);
+      g.strokePath();
+      // Gauge tick marks
+      g.lineStyle(0.8, 0xaaaaaa, 0.5);
+      for (let a = 0; a < 8; a++) {
+        const ang = (a / 8) * Math.PI * 2;
+        g.beginPath();
+        g.moveTo(pipeX + 4 + Math.cos(ang) * 4, gy + Math.sin(ang) * 4);
+        g.lineTo(pipeX + 4 + Math.cos(ang) * 5, gy + Math.sin(ang) * 5);
+        g.strokePath();
+      }
+    }
+
+    // --- Ornate iron sign bracket near middle ---
+    const bracketY = 8 * TILE_PX;
+    const bracketX = wallX + TILE_PX - 2;
+    g.lineStyle(2, 0x2a2a2a, 0.8);
+    // Bracket arm
+    g.beginPath();
+    g.moveTo(bracketX, bracketY);
+    g.lineTo(bracketX + 20, bracketY);
+    g.strokePath();
+    // Decorative curl (approximated with line segments)
+    g.beginPath();
+    g.moveTo(bracketX + 20, bracketY);
+    for (let t = 0; t <= 1; t += 0.2) {
+      const it = 1 - t;
+      g.lineTo(bracketX + 20 + it * it * 0 + 2 * it * t * 8 + t * t * 4, bracketY + it * it * 0 + 2 * it * t * 4 + t * t * 10);
+    }
+    for (let t = 0; t <= 1; t += 0.2) {
+      const it = 1 - t;
+      g.lineTo(bracketX + 24 + it * it * 0 + 2 * it * t * -4 + t * t * -2, bracketY + 10 + it * it * 0 + 2 * it * t * -2 + t * t * -4);
+    }
+    g.strokePath();
+    // Bracket mount
+    g.fillStyle(0x3a3a3a, 0.8);
+    g.fillRect(bracketX - 2, bracketY - 4, 4, 8);
+
+    // --- Decorative rain downspout near bottom ---
+    const spoutY = 16 * TILE_PX;
+    const spoutX = wallX + TILE_PX - 6;
+    g.fillStyle(0x4a4a4a, 0.7);
+    g.fillRect(spoutX, spoutY, 5, 3 * TILE_PX);
+    g.fillStyle(0x6a6a6a, 0.5);
+    g.fillRect(spoutX, spoutY, 1, 3 * TILE_PX);
+    // Spout head — gargoyle-like cone
+    g.fillStyle(0x3a3a3a, 0.8);
+    g.beginPath();
+    g.moveTo(spoutX - 4, spoutY + 3 * TILE_PX);
+    g.lineTo(spoutX + 2, spoutY + 3 * TILE_PX + 14);
+    g.lineTo(spoutX + 9, spoutY + 3 * TILE_PX);
+    g.closePath();
+    g.fillPath();
+    g.fillStyle(0x5a5a5a, 0.5);
+    g.beginPath();
+    g.moveTo(spoutX - 4, spoutY + 3 * TILE_PX);
+    g.lineTo(spoutX + 2, spoutY + 3 * TILE_PX + 14);
+    g.lineTo(spoutX, spoutY + 3 * TILE_PX);
+    g.closePath();
+    g.fillPath();
+  }
+
+  /** East wall (x=29) — Mesoamerican: stone blocks, stepped fret (greca), glyphs, feathered serpent. */
+  private drawEastWallMesoamerican(): void {
+    return; // dead code — removed from drawCulturalWalls
+    const g = this.add.graphics().setDepth(1);
+    const wallX = 29 * TILE_PX;
+    const mapPxH = 20 * TILE_PX;
+    const wallW = TILE_PX;
+
+    // --- Stone block courses (ashlar masonry) ---
+    const blockH = 14;
+    const blockW = 28;
+    const blockColors = [0x6a6058, 0x5a5048, 0x7a7068, 0x6a6058, 0x4a4038];
+    for (let row = 0; row < Math.floor(mapPxH / blockH); row++) {
+      const py = row * blockH;
+      const offset = row % 2 === 0 ? 0 : blockW / 2;
+      for (let bx = 0; bx < Math.ceil(wallW / blockW) + 1; bx++) {
+        const px = wallX + bx * blockW + offset - blockW;
+        if (px + blockW < wallX) continue;
+        const clampedX = Math.max(px, wallX);
+        const clampedW = Math.min(px + blockW, wallX + wallW) - clampedX;
+        if (clampedW <= 0) continue;
+        const colorIdx = (row * 3 + bx) % blockColors.length;
+        g.fillStyle(blockColors[colorIdx], 0.85);
+        g.fillRect(clampedX, py, clampedW, blockH);
+      }
+      // Mortar lines — horizontal
+      g.fillStyle(0x2a2218, 0.5);
+      g.fillRect(wallX, py, wallW, 1);
+    }
+    // Mortar lines — vertical (staggered)
+    for (let row = 0; row < Math.floor(mapPxH / blockH); row++) {
+      const py = row * blockH;
+      const offset = row % 2 === 0 ? 0 : blockW / 2;
+      for (let bx = 0; bx < Math.ceil(wallW / blockW) + 1; bx++) {
+        const px = wallX + bx * blockW + offset - blockW;
+        if (px < wallX || px >= wallX + wallW) continue;
+        g.fillStyle(0x2a2218, 0.4);
+        g.fillRect(px, py, 1, blockH);
+      }
+    }
+
+    // --- Stepped fret (greca) band across midsection ---
+    const grecaY = 8 * TILE_PX;
+    const grecaH = 24;
+    g.fillStyle(0x8a7a5a, 0.4);
+    g.fillRect(wallX, grecaY, wallW, grecaH);
+    g.fillStyle(0x6a5a3a, 0.5);
+    g.fillRect(wallX, grecaY, wallW, 1);
+    g.fillRect(wallX, grecaY + grecaH - 1, wallW, 1);
+    // Stepped fret pattern
+    g.lineStyle(2, 0x4a3a22, 0.6);
+    const stepUnit = 6;
+    for (let cy = 2; cy < grecaH - 2; cy += stepUnit * 2) {
+      for (let cx = 2; cx < wallW - 2; cx += stepUnit * 2) {
+        g.beginPath();
+        g.moveTo(wallX + cx, grecaY + cy);
+        g.lineTo(wallX + cx + stepUnit, grecaY + cy);
+        g.lineTo(wallX + cx + stepUnit, grecaY + cy + stepUnit);
+        g.lineTo(wallX + cx + stepUnit * 2, grecaY + cy + stepUnit);
+        g.lineTo(wallX + cx + stepUnit * 2, grecaY + cy + stepUnit * 2);
+        g.lineTo(wallX + cx, grecaY + cy + stepUnit * 2);
+        g.closePath();
+        g.strokePath();
+      }
+    }
+
+    // --- Carved glyph medallions at 3 positions ---
+    const glyphPositions = [3, 12, 17];
+    for (let i = 0; i < glyphPositions.length; i++) {
+      const gy = glyphPositions[i] * TILE_PX + TILE_PX / 2;
+      const gx = wallX + wallW / 2;
+      // Medallion frame
+      g.fillStyle(0x4a3a22, 0.6);
+      g.fillCircle(gx, gy, 10);
+      g.fillStyle(0x6a5a3a, 0.5);
+      g.fillCircle(gx, gy, 8);
+      // Glyph — varies by position
+      g.lineStyle(1.5, 0x3a2a12, 0.7);
+      if (i === 0) {
+        // Sun disk rays
+        for (let r = 0; r < 8; r++) {
+          const a = (r / 8) * Math.PI * 2;
+          g.beginPath();
+          g.moveTo(gx + Math.cos(a) * 3, gy + Math.sin(a) * 3);
+          g.lineTo(gx + Math.cos(a) * 7, gy + Math.sin(a) * 7);
+          g.strokePath();
+        }
+        g.fillStyle(0x3a2a12, 0.5);
+        g.fillCircle(gx, gy, 3);
+      } else if (i === 1) {
+        // Jaguar spot rosette
+        g.fillStyle(0x3a2a12, 0.5);
+        g.fillCircle(gx, gy, 5);
+        g.fillStyle(0x5a4a2a, 0.4);
+        for (let r = 0; r < 4; r++) {
+          const a = (r / 4) * Math.PI * 2 + Math.PI / 4;
+          g.fillCircle(gx + Math.cos(a) * 6, gy + Math.sin(a) * 6, 2);
+        }
+      } else {
+        // Step-fret spiral
+        g.beginPath();
+        for (let s = 0; s < 12; s++) {
+          const a = (s / 12) * Math.PI * 3;
+          const r = 2 + s * 0.5;
+          const px = gx + Math.cos(a) * r;
+          const py2 = gy + Math.sin(a) * r;
+          if (s === 0) g.moveTo(px, py2);
+          else g.lineTo(px, py2);
+        }
+        g.strokePath();
+      }
+    }
+
+    // --- Feathered serpent (Quetzalcoatl) motif near top ---
+    const serpY = 1 * TILE_PX + TILE_PX / 2;
+    const serpX = wallX + wallW / 2;
+    // Serpent head
+    g.fillStyle(0x4a8a4a, 0.5);
+    g.fillCircle(serpX, serpY, 8);
+    g.fillStyle(0x3a6a3a, 0.6);
+    g.fillCircle(serpX, serpY, 6);
+    // Eyes
+    g.fillStyle(0xddaa44, 0.6);
+    g.fillCircle(serpX - 3, serpY - 2, 1.5);
+    g.fillCircle(serpX + 3, serpY - 2, 1.5);
+    // Feathered crown
+    g.lineStyle(1, 0x4a8a4a, 0.4);
+    for (let f = 0; f < 7; f++) {
+      const fa = -Math.PI / 2 + (f - 3) * 0.3;
+      g.beginPath();
+      g.moveTo(serpX + Math.cos(fa) * 6, serpY + Math.sin(fa) * 6);
+      g.lineTo(serpX + Math.cos(fa) * 14, serpY + Math.sin(fa) * 14);
+      g.strokePath();
+    }
+    // Coiled body — S-curve below head
+    g.lineStyle(2, 0x4a8a4a, 0.35);
+    g.beginPath();
+    g.moveTo(serpX, serpY + 8);
+    g.lineTo(serpX - 8, serpY + 16);
+    g.lineTo(serpX + 6, serpY + 24);
+    g.lineTo(serpX - 4, serpY + 32);
+    g.strokePath();
+  }
+
+  /** Four building corners — Mesoamerican stepped pyramid blocks with glyph carvings. */
+  private drawCornerAccents(): void {
+    const g = this.add.graphics().setDepth(0.5);
+    const mapPxW = 30 * TILE_PX;
+    const mapPxH = 20 * TILE_PX;
+    const corners = [
+      { x: 0, y: 0 },
+      { x: mapPxW - TILE_PX, y: 0 },
+      { x: 0, y: mapPxH - TILE_PX },
+      { x: mapPxW - TILE_PX, y: mapPxH - TILE_PX },
+    ];
+
+    for (let ci = 0; ci < corners.length; ci++) {
+      const c = corners[ci];
+      const isLeft = c.x === 0;
+      const isTop = c.y === 0;
+
+      // Stepped pyramid blocks — 3 courses projecting outward
+      for (let step = 0; step < 3; step++) {
+        const proj = 4 + step * 4;
+        const sx = isLeft ? c.x - proj : c.x + TILE_PX - 8 + proj;
+        const sy = isTop ? c.y - proj : c.y + TILE_PX - 8 + proj;
+
+        // Stone block
+        g.fillStyle(0x6a5a4a, 0.7);
+        g.fillRect(sx, sy, 8 + proj, 8 + proj);
+        // Block highlight
+        g.fillStyle(0x8a7a6a, 0.5);
+        g.fillRect(sx, sy, 8 + proj, 2);
+        if (isLeft) g.fillRect(sx, sy, 2, 8 + proj);
+        else g.fillRect(sx + (8 + proj) - 2, sy, 2, 8 + proj);
+        // Block shadow
+        g.fillStyle(0x4a3a2a, 0.5);
+        g.fillRect(sx, sy + (8 + proj) - 2, 8 + proj, 2);
+        if (!isLeft) g.fillRect(sx, sy, 2, 8 + proj);
+        else g.fillRect(sx + (8 + proj) - 2, sy, 2, 8 + proj);
+      }
+
+      // Glyph carving on the inner face of the corner
+      const glyphCx = c.x + TILE_PX / 2;
+      const glyphCy = c.y + TILE_PX / 2;
+      const glyphSeed = ci * 137 + 42;
+
+      // Stepped fret glyph (Mesoamerican step motif)
+      g.lineStyle(1.5, 0x4a3a2a, 0.5);
+      const steps = 3;
+      const stepSize = 6;
+      let gx = glyphCx - (steps * stepSize) / 2;
+      let gy = glyphCy - (steps * stepSize) / 2;
+      g.beginPath();
+      g.moveTo(gx, gy);
+      for (let s = 0; s < steps; s++) {
+        g.lineTo(gx + stepSize, gy);
+        g.lineTo(gx + stepSize, gy + stepSize);
+        gx += stepSize / 2;
+        gy += stepSize / 2;
+      }
+      g.strokePath();
+
+      // Spiral accent (deterministic based on seed)
+      g.lineStyle(1, 0x4a3a2a, 0.35);
+      g.beginPath();
+      const spCx = glyphCx + ((glyphSeed % 7) - 3) * 4;
+      const spCy = glyphCy + ((glyphSeed % 5) - 2) * 4;
+      for (let a = 0; a < Math.PI * 3; a += 0.15) {
+        const r = 2 + a * 1.5;
+        const px = spCx + Math.cos(a + glyphSeed) * r;
+        const py = spCy + Math.sin(a + glyphSeed) * r;
+        if (a === 0) g.moveTo(px, py);
+        else g.lineTo(px, py);
+      }
+      g.strokePath();
+    }
+  }
+
+  /** Create walk/idle/work animations for a custom character texture key. */
+  private ensureCharAnimations(key: string): void {
+    if (this.anims.exists(`${key}-work`)) return;
+    const dirs: Dir[] = ["down", "left", "right", "up"];
+    const FRAMES_PER_ROW = 8;
+    const layerKeys = [key, `${key}:L0`, `${key}:L1`, `${key}:L2`, `${key}:L3`];
+    for (const lk of layerKeys) {
+      if (!this.textures.exists(lk)) continue;
+      if (this.anims.exists(`${lk}-work`)) continue;
+      dirs.forEach((dir, row) => {
+        const base = row * FRAMES_PER_ROW;
+        this.anims.create({
+          key: `${lk}-walk-${dir}`,
+          frames: this.anims.generateFrameNumbers(lk, {
+            frames: [base, base + 1, base + 2, base + 3, base + 4, base + 5],
+          }),
+          frameRate: 10,
+          repeat: -1,
+        });
+        const breathFrames = Array(24).fill(base + 6);
+        breathFrames.push(base + 7);
+        breathFrames.push(base + 6);
+        this.anims.create({
+          key: `${lk}-idle-${dir}`,
+          frames: this.anims.generateFrameNumbers(lk, {
+            frames: breathFrames,
+          }),
+          frameRate: 10,
+          repeat: -1,
+          repeatDelay: Math.random() * 2,
+        });
+      });
+      this.anims.create({
+        key: `${lk}-work`,
+        frames: this.anims.generateFrameNumbers(lk, { frames: [6, 7] }),
+        frameRate: 2.5,
+        repeat: -1,
+      });
+    }
+  }
+
+  /** Ensure all game animations exist — called on create() to handle scene restarts. */
+  private ensureAllAnimations(): void {
+    const creatureNames = ["slime", "wolf", "skeleton", "imp", "wraith", "fire-elemental"];
+    for (const name of creatureNames) {
+      const key = `creature-${name}`;
+      if (this.anims.exists(`${key}-idle`)) continue;
+      this.anims.create({ key: `${key}-idle`, frames: this.anims.generateFrameNumbers(key, { frames: [0, 1, 0, 2] }), frameRate: 3, repeat: -1 });
+      this.anims.create({ key: `${key}-walk`, frames: this.anims.generateFrameNumbers(key, { frames: [1, 2, 1, 2] }), frameRate: 8, repeat: -1 });
+      this.anims.create({ key: `${key}-attack`, frames: this.anims.generateFrameNumbers(key, { frames: [3, 0] }), frameRate: 6, repeat: 0 });
+    }
+
+    const beastNames = ["groveheart", "stone-colossus", "ash-wyrm", "void-leviathan", "infernal-sovereign"];
+    for (const name of beastNames) {
+      const key = `beast-${name}`;
+      if (this.anims.exists(`${key}-idle`)) continue;
+      this.anims.create({ key: `${key}-idle`, frames: this.anims.generateFrameNumbers(key, { frames: [0, 1, 0, 2] }), frameRate: 2, repeat: -1 });
+      this.anims.create({ key: `${key}-move`, frames: this.anims.generateFrameNumbers(key, { frames: [1, 2, 1, 2] }), frameRate: 5, repeat: -1 });
+      this.anims.create({ key: `${key}-attack`, frames: this.anims.generateFrameNumbers(key, { frames: [3, 0] }), frameRate: 4, repeat: 0 });
+    }
+
+    const friendlyNames = ["unicorn", "fairy-bunny", "baby-dragon", "crystal-fox"];
+    for (const name of friendlyNames) {
+      const key = `friendly-${name}`;
+      if (this.anims.exists(`${key}-idle`)) continue;
+      this.anims.create({ key: `${key}-idle`, frames: this.anims.generateFrameNumbers(key, { frames: [0, 1, 0, 2] }), frameRate: 3, repeat: -1 });
+      this.anims.create({ key: `${key}-walk`, frames: this.anims.generateFrameNumbers(key, { frames: [1, 2, 1, 2] }), frameRate: 6, repeat: -1 });
+      this.anims.create({ key: `${key}-hop`, frames: this.anims.generateFrameNumbers(key, { frames: [3, 1, 0] }), frameRate: 5, repeat: 0 });
+    }
+
+    const sheets = ["char-office-manager", "char-hermes", ...Array.from({ length: 8 }, (_, i) => `char-${i}`)];
+    const dirs: Dir[] = ["down", "left", "right", "up"];
+    for (const key of sheets) {
+      if (this.anims.exists(`${key}-work`)) continue;
+      dirs.forEach((dir, row) => {
+        const base = row * CHAR_FRAMES_PER_ROW;
+        this.anims.create({ key: `${key}-walk-${dir}`, frames: this.anims.generateFrameNumbers(key, { frames: [base, base + 1, base + 2, base + 3, base + 4, base + 5] }), frameRate: 10, repeat: -1 });
+        const breathFrames = Array(24).fill(base + 6);
+        breathFrames.push(base + 7);
+        breathFrames.push(base + 6);
+        this.anims.create({ key: `${key}-idle-${dir}`, frames: this.anims.generateFrameNumbers(key, { frames: breathFrames }), frameRate: 10, repeat: -1, repeatDelay: Math.random() * 2 });
+      });
+      this.anims.create({ key: `${key}-work`, frames: this.anims.generateFrameNumbers(key, { frames: [6, 7] }), frameRate: 2.5, repeat: -1 });
+    }
+
+    if (!this.anims.exists("water-anim")) {
+      this.anims.create({ key: "water-anim", frames: this.anims.generateFrameNumbers("world-tiles", { frames: [21, 22, 23] }), frameRate: 4, repeat: -1 });
+    }
+
+    if (!this.anims.exists("fountain-anim")) {
+      this.anims.create({ key: "fountain-anim", frames: this.anims.generateFrameNumbers("fountain-sheet", { frames: [0, 1, 2, 3] }), frameRate: 6, repeat: -1 });
+    }
+  }
+
+/** Generate or refresh the boss texture from the player's appearance.
+   * Returns true if the texture was regenerated (caller should refresh the sprite). */
+  private refreshBossTexture(): boolean {
+    const ap = this.store.player?.appearance;
+    if (ap) {
+      const key = "boss-custom";
+      // Only regenerate if the texture doesn't exist yet or appearance changed
+      const existing = this.textures.get(key);
+      if (!existing || (this as any)._lastBossAp !== ap) {
+        (this as any)._lastBossAp = ap;
+        generateCharTexture(this, key, ap);
+        this.ensureCharAnimations(key);
+        this.playerTexKey = key;
+        return true;
+      }
+      this.playerTexKey = key;
+      return false;
+    } else {
+      const key = "boss-default";
+      if (!this.textures.exists(key)) {
+        generateCharTexture(this, key, DEFAULT_APPEARANCE);
+        this.ensureCharAnimations(key);
+      }
+      this.playerTexKey = key;
+      return false;
+    }
+  }
+
+  /** Resolve an agent's deskIndex to their seat tile. */
+  private getSeatForAgentId(agentId: string): Tile | null {
+    const info = this.store.agents.get(agentId);
+    if (!info) return null;
+    const overflow = info.deskIndex - this.seats.length;
+    return this.seats[info.deskIndex]
+      ?? this.extraSpots[overflow % Math.max(this.extraSpots.length, 1)]
+      ?? this.spawnTile
+      ?? null;
+  }
+
+  private syncAgents(): void {
+    for (const [id, info] of this.store.agents) {
+      // Find the card assigned to this agent to get its V-model phase
+      const agentCard = [...this.store.board.values()].find(c => c.assignedAgentId === id && c.status === "in_progress");
+      const phase = agentCard?.phase ?? null;
+      if (id === OFFICE_MANAGER_ID) {
+        if (info.appearance) {
+          const key = agentTextureKey(info);
+          if (!this.textures.exists(key)) {
+            generateCharTexture(this, key, info.appearance);
+            this.ensureCharAnimations(key);
+          }
+        }
+        this.officeManager?.sync(info);
+        continue;
+      }
+      if (id === HERMES_ID) {
+        if (info.appearance) {
+          const key = agentTextureKey(info);
+          if (!this.textures.exists(key)) {
+            generateCharTexture(this, key, info.appearance);
+            this.ensureCharAnimations(key);
+          }
+        }
+        this.hermes?.sync(info);
+        continue;
+      }
+      if (id === WIZARD_ID) {
+        if (info.appearance) {
+          const key = agentTextureKey(info);
+          if (!this.textures.exists(key)) generateCharTexture(this, key, info.appearance);
+          this.ensureCharAnimations(key);
+        }
+        this.wizard?.sync(info);
+        continue;
+      }
+      const existing = this.npcs.get(id);
+      if (existing) {
+        existing.sync(info, phase);
+      } else {
+        // If the helicopter cinematic is still playing, defer NPC creation
+        // until the agent walks out of the elevator. The agent is already
+        // in the sidebar and interactable — they just shouldn't appear in
+        // the office until the animation completes.
+        if (this.heliActive) {
+          if (!this.pendingHeliAgents.includes(id)) {
+            this.pendingHeliAgents.push(id);
+          }
+          continue;
+        }
+        // Generate custom texture if agent has an appearance
+        if (info.appearance) {
+          const key = agentTextureKey(info);
+          generateCharTexture(this, key, info.appearance);
+          this.ensureCharAnimations(key);
+        }
+        const overflow = info.deskIndex - this.seats.length;
+        const seat =
+          this.seats[info.deskIndex] ??
+          this.extraSpots[overflow % Math.max(this.extraSpots.length, 1)] ??
+          this.spawnTile;
+        // On initial page load, spawn agents at their desk so they don't all
+        // walk in from the door.
+        const spawnTile = !this.initialSyncDone ? seat
+          : this.doorTile;
+        const npc = new AgentNPC(this, this.grid, info, spawnTile, seat, (clicked) =>
+          this.walkToAgent(clicked),
+          (agentId) => this.getSeatForAgentId(agentId),
+        );
+        this.npcs.set(id, npc);
+      }
+    }
+    for (const [id, npc] of this.npcs) {
+      if (!this.store.agents.has(id)) {
+        npc.destroy();
+        this.npcs.delete(id);
+      }
+    }
+    this.initialSyncDone = true;
+    // Build deskIndex→agent map once for monitor + chair loops
+    const deskAgentMap = new Map<number, AgentInfo>();
+    for (const a of this.store.agents.values()) {
+      if (a.deskIndex >= 0) deskAgentMap.set(a.deskIndex, a);
+    }
+    // monitors glow whenever someone's at the desk — working or just typing;
+    // they only go dark during the post-task break (done/error linger)
+    this.monitors.forEach((m, i) => {
+      const agent = deskAgentMap.get(i);
+      if (!agent) {
+        // Unassigned desk — black screen
+        m?.setFrame("2").clearTint();
+      } else if (agent.status === "idle" || agent.status === "waiting") {
+        // Assigned but idle (or waiting at another desk) — code editor look
+        m?.setFrame("0").clearTint();
+      } else {
+        // Working — lit with status color (matrix overlay drawn in update)
+        m?.setFrame("1");
+        m?.setTint(getThemeStatusColors(this.worldTheme)[agent.status]);
+      }
+    });
+
+    // chairs: face up (toward desk) if assigned, face down if unassigned
+    this.chairs.forEach((chair, i) => {
+      if (!chair) return;
+      const agent = deskAgentMap.get(i);
+      if (agent) {
+        chair.setTexture(resolveChairTex(this, CHAIR_TEX_UP));
+      } else {
+        chair.setTexture(resolveChairTex(this, CHAIR_TEX_DOWN));
+      }
+    });
+
+    // Office Manager's monitor — always on since she's always at her desk
+    if (this.officeManagerMonitor) {
+      const officeManagerInfo = this.store.agents.get(OFFICE_MANAGER_ID);
+      if (officeManagerInfo && officeManagerInfo.status !== "idle") {
+        this.officeManagerMonitor.setFrame("1");
+        this.officeManagerMonitor.setTint(getThemeStatusColors(this.worldTheme)[officeManagerInfo.status]);
+      } else {
+        this.officeManagerMonitor.setFrame("0");
+        this.officeManagerMonitor.clearTint();
+      }
+    }
+
+    // Hermes's monitor — always on
+    if (this.hermesMonitor) {
+      this.hermesMonitor.setFrame("1");
+    }
+  }
+
+  /** Toggle chimney smoke based on whether any devops agent is actively working. */
+  private lastChimneyState = false;
+  private updateChimneySmoke(): void {
+    if (this.chimneyPositions.length === 0) return;
+    const devopsWorking = [...this.store.agents.values()].some(
+      (a) => a.role === "devops" && (a.status === "working" || a.status === "thinking"),
+    );
+    if (devopsWorking === this.lastChimneyState) return;
+    this.lastChimneyState = devopsWorking;
+    if (devopsWorking) {
+      this.world.vfx.startSmoke(this.chimneyPositions);
+    } else {
+      this.world.vfx.stopSmoke();
+    }
+  }
+
+  update(time: number, dt: number): void {
+    if (!this.ready) return;
+    // cap dt so a lag spike (chunk gen, GC, tab switch) doesn't cause a
+    // teleport-length step that tunnels through collision
+    dt = Math.min(dt, 50);
+
+    // Sky gradient + cloud drift — world-space, follows camera view
+    this.updateSky(dt);
+
+    // typing in a HUD field? the game keyboard is yours, not the boss's
+    const active = document.activeElement?.tagName;
+    const typing = active === "INPUT" || active === "TEXTAREA" || active === "SELECT";
+    if (typing) {
+      this.player.play(`${this.playerTexKey}-idle-${this.playerDir}`, true);
+      for (const npc of this.npcs.values()) npc.update(time, dt, this.store.settings.game.idleWander, this.player.x, this.player.y);
+      const myRoleTyping = this._myUserId ? this.store.roomPlayers.get(this._myUserId)?.role : undefined;
+      const isVisitorTyping = (myRoleTyping === "member" || myRoleTyping === "guest") && this.store.roomId !== "hq2";
+      if (!isVisitorTyping) {
+        this.officeManager?.update(time, dt, false, this.player.x, this.player.y);
+        this.hermes?.update(time, dt);
+        this.wizard?.update(time, dt);
+      }
+      const sel = this.store.selectedId ? this.npcs.get(this.store.selectedId) : null;
+      const selOfficeManager = this.store.selectedId === OFFICE_MANAGER_ID ? this.officeManager : null;
+      const selHermes = this.store.selectedId === HERMES_ID ? this.hermes : null;
+      const selWizard = this.store.selectedId === WIZARD_ID ? this.wizard : null;
+      this.selectRing.setVisible(!!(sel || selOfficeManager || selHermes || selWizard));
+      if (sel) this.selectRing.setPosition(sel.container.x, sel.container.y + 1);
+      else if (selOfficeManager) this.selectRing.setPosition(selOfficeManager.container.x, selOfficeManager.container.y + 1);
+      else if (selHermes) this.selectRing.setPosition(selHermes.container.x, selHermes.container.y + 1);
+      else if (selWizard) this.selectRing.setPosition(selWizard.container.x, selWizard.container.y + 1);
+      return;
+    }
+
+    // --- player movement ---
+    let vx = 0;
+    let vy = 0;
+    const outside = this.world.isOutside(this.player.x, this.player.y);
+    // If broadcasting from phone booth, lock player in place
+    if (this.inPhoneBooth) {
+      const boothPx = { x: this.phoneBoothTile.x * TILE_PX + 32, y: this.phoneBoothTile.y * TILE_PX + 32 };
+      this.player.setPosition(boothPx.x, boothPx.y);
+      this.player.setVisible(false);
+      this.player.play(`${this.playerTexKey}-idle-${this.playerDir}`, true);
+      this.playerVx = 0;
+      this.playerVy = 0;
+      // skip movement but still update NPCs and other systems
+    } else {
+    const left = this.cursors.left.isDown || this.keys.A.isDown;
+    const right = this.cursors.right.isDown || this.keys.D.isDown;
+    const up = this.cursors.up.isDown || this.keys.W.isDown;
+    const down = this.cursors.down.isDown || this.keys.S.isDown;
+    vx = (right ? 1 : 0) - (left ? 1 : 0);
+    vy = (down ? 1 : 0) - (up ? 1 : 0);
+
+    // Touch joystick input — analog values from -1 to 1
+    if (touchInput.moveX !== 0 || touchInput.moveY !== 0) {
+      vx = touchInput.moveX;
+      vy = touchInput.moveY;
+      // Joystick input cancels any active tap-to-walk path
+      this.playerPath = [];
+      this.playerTargetPx = null;
+      this.pendingOutdoorTargetPx = null;
+      this.pendingInteract = false;
+      this.pendingAgentId = null;
+      this.clearPathMarker();
+    }
+
+    // Tap-to-walk: follow A* path (indoor or outdoor)
+    if (this.playerPath.length > 0) {
+      // Look-ahead: aim 2 tiles ahead for smoother curves through diagonal shortcuts
+      const lookAheadIdx = Math.min(2, this.playerPath.length - 1);
+      const next = this.playerPath[lookAheadIdx];
+      const targetPx = this.playerPathOutdoor
+        ? this.world.worldTileToPixel(next.x, next.y)
+        : { x: next.x * TILE_PX + TILE_PX / 2, y: next.y * TILE_PX + TILE_PX / 2 };
+      const dx = targetPx.x - this.player.x;
+      const dy = targetPx.y - this.player.y;
+      const dist = Math.hypot(dx, dy);
+      // Check proximity to all tiles up to the look-ahead index for advancement.
+      // Only checking the first tile caused spinning: the player aims at the
+      // look-ahead tile (2 ahead) but may pass near tile 0 without getting
+      // within 14px, so the path never advanced and the player circled endlessly.
+      let advanceCount = 0;
+      for (let pi = 0; pi <= lookAheadIdx; pi++) {
+        const tp = this.playerPath[pi];
+        const tpx = this.playerPathOutdoor
+          ? this.world.worldTileToPixel(tp.x, tp.y)
+          : { x: tp.x * TILE_PX + TILE_PX / 2, y: tp.y * TILE_PX + TILE_PX / 2 };
+        if (Math.hypot(tpx.x - this.player.x, tpx.y - this.player.y) < 14) {
+          advanceCount = pi + 1;
+        }
+      }
+      if (advanceCount > 0) {
+        // Advance past all tiles we were close to
+        this.playerPath.splice(0, advanceCount);
+        if (this.playerPath.length === 0) {
+          // Path complete — check if we have a pending outdoor target to continue toward
+          if (this.pendingOutdoorTargetPx) {
+            this.playerTargetPx = this.pendingOutdoorTargetPx;
+            this.pendingOutdoorTargetPx = null;
+            // Don't clear path marker — straight-line phase will handle it
+          } else {
+            this.clearPathMarker();
+            if (this.pendingAgentId) {
+              const aid = this.pendingAgentId;
+              this.pendingAgentId = null;
+              this.selectAgent(aid);
+            } else if (this.pendingInteract) {
+              this.pendingInteract = false;
+              // Simulate E press via touchInput so the full ePressed block runs next frame
+              touchInput.action = "interact";
+            }
+          }
+        }
+      } else if (dist > 0) {
+        vx = dx / dist;
+        vy = dy / dist;
+      }
+    } else if (this.playerTargetPx) {
+      // Outside: straight-line movement to target
+      const dx = this.playerTargetPx.x - this.player.x;
+      const dy = this.playerTargetPx.y - this.player.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < 12) {
+        this.playerTargetPx = null;
+        this.clearPathMarker();
+        if (this.pendingAgentId) {
+          const aid = this.pendingAgentId;
+          this.pendingAgentId = null;
+          this.selectAgent(aid);
+        } else if (this.pendingInteract) {
+          this.pendingInteract = false;
+          touchInput.action = "interact";
+        }
+      } else {
+        vx = dx / dist;
+        vy = dy / dist;
+      }
+    }
+
+    // Keyboard input cancels tap-to-walk
+    if (left || right || up || down) {
+      this.playerPath = [];
+      this.playerTargetPx = null;
+      this.pendingOutdoorTargetPx = null;
+      this.pendingInteract = false;
+      this.pendingAgentId = null;
+      this.clearPathMarker();
+    }
+
+    // Normalize diagonal movement for all input sources (keyboard, touch, tap-to-walk)
+    if (vx !== 0 && vy !== 0) {
+      const len = Math.hypot(vx, vy);
+      vx /= len;
+      vy /= len;
+    }
+
+    // --- Hijacked vehicle driving ---
+    if (this.world.hijackedVehicle) {
+      const hv = this.world.hijackedVehicle;
+      // Hide player sprite, follow vehicle
+      this.player.setVisible(false);
+      this.playerLabel.setVisible(false);
+      // Drive the vehicle using input velocity
+      hv.drive(vx, vy, dt);
+      // Snap player position to vehicle for camera/minimap
+      this.player.x = hv.container.x;
+      this.player.y = hv.container.y;
+      // Skip normal movement — vehicle handles it
+      this.playerVx = 0;
+      this.playerVy = 0;
+      return;
+    } else {
+      this.player.setVisible(true);
+      this.playerLabel.setVisible(true);
+    }
+
+    // Smooth acceleration/deceleration toward target velocity (framerate-independent)
+    const accelT = 1 - Math.exp(-ACCEL_RATE * dt / 1000);
+    this.playerVx += (vx - this.playerVx) * accelT;
+    this.playerVy += (vy - this.playerVy) * accelT;
+    // Deadzone snap to prevent micro-drift
+    if (Math.abs(this.playerVx) < 0.02) this.playerVx = 0;
+    if (Math.abs(this.playerVy) < 0.02) this.playerVy = 0;
+
+    const tileSpeedMult = outside ? this.world.getTileSpeedAt(this.player.x, this.player.y) : 1;
+    const speed = (time < this.coffeeUntil ? PLAYER_SPEED * 2 : time < this.sofaUntil ? PLAYER_SPEED * 1.5 : PLAYER_SPEED) * tileSpeedMult;
+
+    // always use manual movement for consistent feel
+    const stepX = this.playerVx * speed * (dt / 1000);
+    const stepY = this.playerVy * speed * (dt / 1000);
+
+    // Sub-step movement to prevent tunneling through walls on large frames.
+    // Collision checks only verify the endpoint, so a single big step can
+    // skip past walls entirely. Break it into sub-steps of at most half a tile.
+    const maxStep = TILE_PX * 0.5;
+    const subSteps = Math.max(1, Math.ceil(Math.max(Math.abs(stepX), Math.abs(stepY)) / maxStep));
+    const subX = stepX / subSteps;
+    const subY = stepY / subSteps;
+    for (let i = 0; i < subSteps; i++) {
+      const outNow = this.world.isOutside(this.player.x, this.player.y);
+      if (outNow) {
+        if (subX !== 0 && this.world.canWalk(this.player.x + subX, this.player.y)) {
+          this.player.x += subX;
+        }
+        if (subY !== 0 && this.world.canWalk(this.player.x, this.player.y + subY)) {
+          this.player.y += subY;
+        }
+      } else {
+        if (subX !== 0 && this.canWalkOffice(this.player.x + subX, this.player.y)) {
+          this.player.x += subX;
+        }
+        if (subY !== 0 && this.canWalkOffice(this.player.x, this.player.y + subY)) {
+          this.player.y += subY;
+        }
+      }
+    }
+
+    // Rescue: if a chunk loaded under the player and they're stuck in a wall,
+    // push them to the nearest walkable tile
+    if (this.world.isOutside(this.player.x, this.player.y)) {
+      const rescue = this.world.rescuePlayer(this.player.x, this.player.y);
+      if (rescue) this.player.setPosition(rescue.x, rescue.y);
+    }
+
+    if (this.playerVx !== 0 || this.playerVy !== 0) {
+      this.playerDir =
+        Math.abs(this.playerVx) > Math.abs(this.playerVy) ? (this.playerVx > 0 ? "right" : "left") : this.playerVy > 0 ? "down" : "up";
+      this.player.play(`${this.playerTexKey}-walk-${this.playerDir}`, true);
+    } else {
+      this.player.play(`${this.playerTexKey}-idle-${this.playerDir}`, true);
+    }
+    this.player.setDepth(10 + this.player.y);
+    const playerName = (this.store.player?.name ?? "BOSS").toUpperCase();
+    if (this.playerLabel.text !== playerName) {
+      this.playerLabel.setText(playerName);
+    }
+    const accentColor = time < this.coffeeUntil ? 0xb0741f : time < this.sofaUntil ? 0x9a7acb : 0x3a8cd4;
+    const nameBgKey = `${accentColor}|${playerName}`;
+    if (nameBgKey !== this.lastPlayerNameBgKey) {
+      this.lastPlayerNameBgKey = nameBgKey;
+      this.drawPlayerNameBg(accentColor);
+    }
+    this.playerLabel
+      .setPosition(this.player.x, this.player.y - 108)
+      .setDepth(10 + this.player.y);
+    this.playerNameBg
+      .setPosition(this.player.x, this.player.y - 108)
+      .setDepth(10 + this.player.y - 0.1);
+    } // end else (not in phone booth)
+
+    // E: grab coffee, talk to the nearest agent, open the task board, or recruit a ghost
+    let ePressed = Phaser.Input.Keyboard.JustDown(this.keys.E);
+    if (touchInput.action === "interact") {
+      ePressed = true;
+      touchInput.action = null;
+    }
+    if (ePressed) {
+      // trophy case check — before other interactables
+      const trophyPx = { x: this.trophyTile.x * TILE_PX + 32, y: this.trophyTile.y * TILE_PX + 40 };
+      const trophyDist = Phaser.Math.Distance.Between(this.player.x, this.player.y, trophyPx.x, trophyPx.y);
+      // hall of fame bulletin board — west wall, above trophy case
+      const hofPx = { x: this.hallOfFameTile.x * TILE_PX + 10, y: this.hallOfFameTile.y * TILE_PX + 32 };
+      const hofDist = Phaser.Math.Distance.Between(this.player.x, this.player.y, hofPx.x, hofPx.y);
+      if (trophyDist < 120) {
+        // Crown placement sequence: if Sovereign is killed but crown not yet placed
+        if (achievements.isUnlocked("infernal_sovereign_kill") && !achievements.isUnlocked("from_cubicle_to_conqueror")) {
+          this.triggerCrownPlacementSequence();
+        } else {
+          this.store.toggleAchievements();
+        }
+      } else if (hofDist < 120) {
+        this.store.toggleHallOfFame();
+      } else
+      // platform mailboxes — check before server racks since they overlap in the mail room
+      if (this.tryPlatformMailboxInteract()) {
+        // handled
+      } else
+      // server rack — opens the worlds panel (sandboxed themes, no Railway/GitHub)
+      if (this.nearestTile(this.serverRackTiles, 150)) {
+        this.store.toggleWorldsPanel();
+      } else
+      // try new office interactables first
+      if (this.tryOfficeInteract(time)) {
+        // handled by a new interactable
+      } else {
+      // check the coffee machine
+      const coffeePx = { x: this.coffeeTile.x * TILE_PX + 32, y: this.coffeeTile.y * TILE_PX + 32 };
+      const coffeeDist = Phaser.Math.Distance.Between(
+        this.player.x,
+        this.player.y,
+        coffeePx.x,
+        coffeePx.y,
+      );
+      if (coffeeDist < 144) {
+        this.coffeeUntil = time + 15000;
+        this.store.toast("Coffee boost! 2x speed for 15s.");
+        this.world.vfx.sparkBurst(coffeePx.x, coffeePx.y, 0xb0741f, 12, 80);
+        this.world.vfx.celebrate(coffeePx.x, coffeePx.y);
+        this.world.audio.coffee();
+        if (achievements.incStat("coffee") >= 10) achievements.unlock("coffee_addict");
+        if (time < this.sofaUntil) achievements.unlock("speed_demon");
+      } else {
+        // check the board — it's a big target on the wall
+        const boardPx = { x: this.boardTile.x * TILE_PX + 32, y: this.boardTile.y * TILE_PX + 52 };
+        const boardDist = Phaser.Math.Distance.Between(
+          this.player.x,
+          this.player.y,
+          boardPx.x,
+          boardPx.y,
+        );
+        if (boardDist < 160) {
+          this.store.toggleBoard();
+        } else {
+          // check the Gantt chart display
+          const ganttPx = { x: this.ganttTile.x * TILE_PX + 32, y: this.ganttTile.y * TILE_PX + 52 };
+          const ganttDist = Phaser.Math.Distance.Between(
+            this.player.x,
+            this.player.y,
+            ganttPx.x,
+            ganttPx.y,
+          );
+          if (ganttDist < 160) {
+            this.store.toggleGantt();
+          } else {
+          let best: { id: string; d: number } | null = null;
+          for (const [id, npc] of this.npcs) {
+            const d = Phaser.Math.Distance.Between(
+              this.player.x,
+              this.player.y,
+              npc.container.x,
+              npc.container.y,
+            );
+            if (d < 144 && (!best || d < best.d)) best = { id, d };
+          }
+          // also check the Office Manager
+          if (this.officeManager) {
+            const d = Phaser.Math.Distance.Between(
+              this.player.x,
+              this.player.y,
+              this.officeManager.container.x,
+              this.officeManager.container.y,
+            );
+            if (d < 144 && (!best || d < best.d)) best = { id: OFFICE_MANAGER_ID, d };
+          }
+          // also check Hermes
+          if (this.hermes) {
+            const d = Phaser.Math.Distance.Between(
+              this.player.x,
+              this.player.y,
+              this.hermes.container.x,
+              this.hermes.container.y,
+            );
+            if (d < 144 && (!best || d < best.d)) best = { id: HERMES_ID, d };
+          }
+          this.store.select(best ? best.id : null);
+          if (best) {
+            if (best.id === OFFICE_MANAGER_ID) achievements.unlock("office-manager_visit");
+            // defer focus so this keypress doesn't type "e" into the chat box
+            setTimeout(() => {
+              (document.getElementById("d-chat") as HTMLInputElement | null)?.focus();
+            }, 0);
+          }
+          }
+        }
+      }
+    }
+    }
+
+    // --- helicopter rotor ---
+    this.updateHelicopter(time);
+
+    // --- projector screen video overlay (deferred to postupdate for accurate camera position) ---
+
+    // --- agents ---
+    for (const npc of this.npcs.values()) npc.update(time, dt, this.store.settings.game.idleWander, this.player.x, this.player.y);
+    // Run Office Manager/Hermes state machine unless we're a visitor in someone else's private office
+    const myRole = this._myUserId ? this.store.roomPlayers.get(this._myUserId)?.role : undefined;
+    const isVisitor = (myRole === "member" || myRole === "guest") && this.store.roomId !== "hq2";
+    if (!isVisitor) {
+      this.officeManager?.update(time, dt, false, this.player.x, this.player.y);
+      this.hermes?.update(time, dt);
+      this.wizard?.update(time, dt);
+    }
+
+    // NPC speech bubbles — update positions, check proximity triggers
+    this.updateNpcSpeechBubbles(time);
+    this.checkNpcProximity(time);
+
+    // selection ring
+    const sel = this.store.selectedId ? this.npcs.get(this.store.selectedId) : null;
+    const selOfficeManager = this.store.selectedId === OFFICE_MANAGER_ID ? this.officeManager : null;
+    const selHermes = this.store.selectedId === HERMES_ID ? this.hermes : null;
+    const selWizard = this.store.selectedId === WIZARD_ID ? this.wizard : null;
+    this.selectRing.setVisible(!!(sel || selOfficeManager || selHermes || selWizard));
+    if (sel) this.selectRing.setPosition(sel.container.x, sel.container.y + 1);
+    else if (selOfficeManager) this.selectRing.setPosition(selOfficeManager.container.x, selOfficeManager.container.y + 1);
+    else if (selHermes) this.selectRing.setPosition(selHermes.container.x, selHermes.container.y + 1);
+    else if (selWizard) this.selectRing.setPosition(selWizard.container.x, selWizard.container.y + 1);
+
+    // --- lighting ---
+    this.updateLighting(time);
+
+    // --- world layer: chunks, ghosts, compass, recruit ---
+    this.registry.set("playerPos", { x: this.player.x, y: this.player.y });
+    const spacePressed = Phaser.Input.Keyboard.JustDown(this.keys.SPACE);
+    this.world.update(time, dt, this.player.x, this.player.y, ePressed, this.playerVx, this.playerVy, this.playerDir, spacePressed);
+    this.world.vfx.updateSmoke();
+
+    // Q: teleport back to office when outside
+    let qPressed = Phaser.Input.Keyboard.JustDown(this.keys.Q);
+    if (touchInput.action === "teleport") {
+      qPressed = true;
+      touchInput.action = null;
+    }
+    if (outside && qPressed) {
+      const spawn = feetOf(this.spawnTile);
+      this.cameras.main.fadeOut(200, 10, 10, 30);
+      this.cameras.main.once("camerafadeoutcomplete", () => {
+        this.player.setPosition(spawn.x, spawn.y);
+        this.cameras.main.fadeIn(300, 10, 10, 30);
+      });
+    }
+
+    // R: deploy next captured ally (when outside)
+    const rPressed = Phaser.Input.Keyboard.JustDown(this.keys.R);
+    if (outside && rPressed) {
+      const roster = this.world.getRoster();
+      if (roster.length === 0) {
+        this.store.toast("No captured creatures to deploy. Weaken and capture some first!");
+      } else {
+        // Deploy first roster entry not already deployed
+        const deployed = this.world.getDeployedIds();
+        const next = roster.find((e) => !deployed.has(e.id));
+        if (next) {
+          this.world.deployAlly(next, this.player.x, this.player.y);
+        } else {
+          // All deployed — recall them
+          this.world.recallAllies();
+          this.store.toast("All allies recalled.");
+        }
+      }
+    }
+
+    // T: swap weapon (cycle owned weapons)
+    const tPressed = Phaser.Input.Keyboard.JustDown(this.keys.T);
+    if (tPressed) {
+      this.world.swapWeapon();
+    }
+
+    // M: toggle presenter management panel
+    const mPressed = Phaser.Input.Keyboard.JustDown(this.keys.M);
+    if (mPressed && this.presenterPanel) {
+      this.presenterPanel.toggle();
+      if (this.presenterPanel.isOpen()) {
+        this.presenterPanel.setPresenters(this.presenters);
+        this.presenterPanel.setSharing(!!this.screenShare?.sharing);
+        this.presenterPanel.setBroadcasting(!!this.webcam?.broadcasting);
+        this.presenterPanel.setFocus(this.focusedPresenterKey);
+        this.presenterPanel.setMuted(this.mutedPresenterKeys);
+      }
+    }
+
+    // check for death teleport from world layer
+    const teleportTo = this.registry.get("teleportTo") as { x: number; y: number } | undefined;
+    if (teleportTo) {
+      this.registry.remove("teleportTo"); // remove immediately so it doesn't re-trigger next frame
+      this.cameras.main.fadeOut(300, 10, 10, 30);
+      this.cameras.main.once("camerafadeoutcomplete", () => {
+        this.player.setPosition(teleportTo.x, teleportTo.y);
+        // Reload door chunks and paint synchronously so grass is visible
+        // through the doorway immediately after death teleport.
+        const doorChunks = this.world.getDoorChunkList();
+        for (let i = 0; i < Math.min(3, doorChunks.length); i++) {
+          this.world.loadSingleChunk(doorChunks[i].cx, doorChunks[i].cy);
+        }
+        this.world.processRenderJobsNow();
+        this.cameras.main.fadeIn(400, 10, 10, 30);
+        this.world.clearDeath(); // re-enable damage now that player is safe
+      });
+      this.store.toast("You were knocked out and dragged back to the office!");
+    }
+
+    // office proximity hints — show the interactable that E will actually trigger
+    if (!outside) {
+      if (time - this.lastHintUpdate > 50) {
+        this.lastHintUpdate = time;
+        this.updateAllHints(time);
+      }
+    } else {
+      for (const h of this.allHints) h.setVisible(false);
+    }
+
+    // mailbox: new mail arrives on timer
+    if (!this.mailboxHasMail && time >= this.mailboxNextMail) {
+      this.mailboxHasMail = true;
+      this.drawMailbox();
+    }
+
+    // --- achievements: exploration ---
+    if (outside) {
+      achievements.unlock("step_outside");
+      // Snapshot state when first going outside
+      if (!this.wasOutside) {
+        this.wasOutside = true;
+        this.outsideSnapshot = {
+          achievements: achievements.getUnlockedIds(),
+          weapons: [...this.world.ownedWeaponsList],
+          creaturesKilled: achievements.getStat("creaturesKilled"),
+          bossesSlain: achievements.getStat("bossesSlain"),
+        };
+      }
+      const hostility = this.world.getHostilityAt(this.player.x, this.player.y);
+      if (hostility >= 0) achievements.unlock("meadow_explorer");
+      if (hostility >= 1) achievements.unlock("forest_explorer");
+      if (hostility >= 2) achievements.unlock("ruins_explorer");
+      if (hostility >= 3) achievements.unlock("wasteland_explorer");
+      if (hostility >= 4) achievements.unlock("void_explorer");
+      if (hostility >= 5) achievements.unlock("infernal_explorer");
+      const chunkDist = this.world.chunkDistance(this.player.x, this.player.y);
+      if (chunkDist >= 10) achievements.unlock("deep_diver");
+      if (chunkDist >= 18) achievements.unlock("marathoner");
+      const df = this.world.distanceFactor(this.player.x, this.player.y);
+      if (df >= 1.0) achievements.unlock("night_walker");
+      if (this.world.playerHp < 10) achievements.incStat("lowHpOutside", 0); // just touch the stat
+    } else {
+      // returned to office — check close_call
+      if (this.world.playerHp > 0 && this.world.playerHp < 10) {
+        achievements.unlock("close_call");
+      }
+      // Return-from-outside-world reaction: detect transition and post agent reaction
+      if (this.wasOutside && this.outsideSnapshot) {
+        this.wasOutside = false;
+        const snap = this.outsideSnapshot;
+        this.outsideSnapshot = null;
+        this.triggerReturnReaction(snap);
+      }
+    }
+
+    // insomniac: 60 min in one session
+    if ((time - this.sceneStart) >= 3600000) achievements.unlock("insomniac");
+
+    // trophy case — update display only when achievement count changes
+    const achCount = achievements.getUnlockedCount();
+    if (!outside && achCount !== this.trophyAchCount) {
+      this.trophyAchCount = achCount;
+      this.updateTrophyCase();
+    }
+    // weapon rack — update when owned weapons change
+    if (!outside) {
+      this.updateWeaponRack();
+    }
+    // trophy case & hall of fame proximity hints — handled by updateAllHints above
+
+    // ── Multiplayer: send boss position to server (adaptive 10Hz/2Hz) ───
+    const now = time;
+    const dx = Math.abs(this.player.x - this.lastSentX);
+    const dy = Math.abs(this.player.y - this.lastSentY);
+    const isMovingNow = dx > 2 || dy > 2 || this.playerDir !== this._lastSentDir;
+    // 50ms when moving (20Hz), 500ms when idle (2Hz)
+    const sendInterval = isMovingNow ? 50 : 500;
+    if (now - this.lastPosSent > sendInterval) {
+      if (isMovingNow) {
+        this.net?.send({ type: "player_move", x: this.player.x, y: this.player.y, dir: this.playerDir });
+        this.lastSentX = this.player.x;
+        this.lastSentY = this.player.y;
+        this._lastSentDir = this.playerDir;
+      }
+      this.lastPosSent = now;
+    }
+
+    // ── Multiplayer: sync remote player sprites from store ──────────────
+    // Also run when remotePlayers map is non-empty so departing sprites get
+    // cleaned up even when the last remote player leaves (roomPlayers drops to 1).
+    if (this.store.roomPlayers.size > 1 || this.remotePlayers.size > 0) {
+      this.syncRemotePlayers();
+    }
+
+    // ── Voice chat: update per-peer volumes and speaking indicators ──────
+    if (this.voice && (this.voice.active || this.voice.listening) && this.player) {
+      const isOutdoor = this.world.isOutside(this.player.x, this.player.y);
+      this.voice.updateVolumes(this.player.x, this.player.y, this.store.roomPlayers, isOutdoor);
+      // Throttle speaking indicator checks to ~15Hz (every 66ms)
+      if (now - this.lastSpeakingCheck > 66) {
+        this.lastSpeakingCheck = now;
+        const speaking = this.voice.getSpeakingPeers();
+        for (const [userId, icon] of this.speakingIcons) {
+          icon.setVisible(speaking.has(userId));
+        }
+      }
+    }
+
+    // ── Multiplayer: broadcast NPC state (owner only, private rooms only, 5Hz) ──
+    const myRoleForNpc = this._myUserId ? this.store.roomPlayers.get(this._myUserId)?.role : undefined;
+    const isOwnerForNpc = myRoleForNpc === "owner" && this.store.roomId !== "hq2";
+    if (isOwnerForNpc && now - this.lastNpcSyncSent > 200) {
+      this.lastNpcSyncSent = now;
+      this.sendNpcStateIfChanged(this.officeManager, OFFICE_MANAGER_ID);
+      this.sendNpcStateIfChanged(this.hermes, HERMES_ID);
+      this.sendNpcStateIfChanged(this.wizard, WIZARD_ID);
+    }
+  }
+
+  private _lastSentDir: Dir = "down";
+  private lastNpcSyncSent = 0;
+  private lastNpcStates = new Map<string, string>();
+
+  private sendNpcStateIfChanged(npc: { getState(): { x: number; y: number; dir: Dir; state: string } } | null, npcId: string): void {
+    if (!npc || !this.net) return;
+    const s = npc.getState();
+    const key = `${s.x},${s.y},${s.dir},${s.state}`;
+    if (this.lastNpcStates.get(npcId) === key) return;
+    this.lastNpcStates.set(npcId, key);
+    this.net.send({ type: "npc_update", npcId, ...s });
+  }
+
+  private syncRemotePlayers(): void {
+    const storePlayers = this.store.roomPlayers;
+    const seen = new Set<string>();
+
+    for (const [userId, p] of storePlayers) {
+      // Don't render ourselves
+      if (userId === this._myUserId) continue;
+      seen.add(userId);
+
+      let entry = this.remotePlayers.get(userId);
+
+      // If the sprite was destroyed (e.g. scene restart), drop the stale entry
+      if (entry && !entry.sprite.active) {
+        this.remotePlayers.delete(userId);
+        entry = undefined;
+      }
+
+      // Determine the correct texture key for this player
+      let texKey = "boss-default";
+      if (p.appearance) {
+        texKey = `remote-${userId}`;
+      }
+
+      // If appearance changed, regenerate the texture (compare cached key, not JSON.stringify per frame)
+      if (entry && p.appearance) {
+        const apKey = `${p.appearance.skin}-${p.appearance.hairStyle}-${p.appearance.hair}-${p.appearance.shirt}-${p.appearance.pants}-${p.appearance.accessory}-${p.appearance.accent}-${p.appearance.beard}-${p.appearance.eyeColor}-${p.appearance.headFeature}-${p.appearance.bodyType ?? 'normal'}`;
+        if (entry.appearanceKey !== apKey) {
+          generateCharTexture(this, texKey, p.appearance);
+          this.ensureCharAnimations(texKey);
+          entry.appearance = p.appearance;
+          entry.appearanceKey = apKey;
+          entry.texKey = texKey;
+          entry.sprite.setTexture(texKey, 0);
+        }
+      }
+
+      if (!entry) {
+        // Generate custom texture if player has an appearance
+        if (p.appearance) {
+          generateCharTexture(this, texKey, p.appearance);
+          this.ensureCharAnimations(texKey);
+        } else if (!this.textures.exists("boss-default")) {
+          generateCharTexture(this, "boss-default", DEFAULT_APPEARANCE);
+          this.ensureCharAnimations("boss-default");
+        }
+        const sprite = this.add.sprite(p.x, p.y - 200, texKey, 0)
+          .setOrigin(0.5, 1)
+          .setScale(1)
+          .setAlpha(0)
+          .setDepth(10 + p.y);
+        const nameBg = this.add.graphics().setAlpha(0);
+        const label = this.add
+          .text(0, 0, p.name.toUpperCase(), {
+            fontFamily: "'M PLUS Rounded 1c', sans-serif",
+            fontSize: "18px",
+            color: "#ffffff",
+            stroke: "#0d1018",
+            strokeThickness: 4,
+          })
+          .setResolution(4)
+          .setOrigin(0.5, 1)
+          .setScale(0.75)
+          .setAlpha(0)
+          .setDepth(10 + p.y + 0.1);
+        const apKey = p.appearance ? `${p.appearance.skin}-${p.appearance.hairStyle}-${p.appearance.hair}-${p.appearance.shirt}-${p.appearance.pants}-${p.appearance.accessory}-${p.appearance.accent}-${p.appearance.beard}-${p.appearance.eyeColor}-${p.appearance.headFeature}-${p.appearance.bodyType ?? 'normal'}` : '';
+        entry = { sprite, label, nameBg, intro: true, texKey, appearance: p.appearance ?? null, appearanceKey: apKey, labelX: 0, labelY: 0, lastStoreX: p.x, lastStoreY: p.y, storeVx: 0, storeVy: 0 };
+        this.remotePlayers.set(userId, entry);
+
+        // Speaking indicator (hidden by default, shown when peer is talking)
+        const speakIcon = this.add
+          .text(0, 0, "🔊", { fontSize: "20px" })
+          .setOrigin(0.5, 1)
+          .setScale(0.7)
+          .setVisible(false)
+          .setDepth(10 + p.y + 0.2);
+        this.speakingIcons.set(userId, speakIcon);
+
+        // Intro animation: descend from above while cycling through
+        // directional profile views (front → side left → back → side right → front)
+        // to simulate a 3D spin during the landing.
+        const spinDirs: Dir[] = ["down", "left", "up", "right", "down"];
+        const introDuration = 1200;
+        const stepMs = introDuration / spinDirs.length;
+        spinDirs.forEach((dir, i) => {
+          this.time.delayedCall(stepMs * i, () => {
+            if (entry!.intro) sprite.play(`${texKey}-idle-${dir}`, true);
+          });
+        });
+        // Fade in name label/bg shortly after descent begins
+        this.tweens.add({
+          targets: [label, nameBg],
+          alpha: { from: 0, to: 1 },
+          duration: 400,
+          delay: 400,
+        });
+        // Descend + fade in the sprite
+        this.tweens.add({
+          targets: sprite,
+          y: p.y,
+          alpha: { from: 0, to: 1 },
+          duration: introDuration,
+          ease: "Cubic.out",
+          onComplete: () => {
+            entry!.intro = false;
+          },
+        });
+      }
+
+      // Smoothly interpolate remote player position (skip during intro)
+      const target = entry.sprite;
+      if (!entry.intro) {
+        // Detect store position change and compute velocity for dead reckoning
+        const storeMoved = p.x !== entry.lastStoreX || p.y !== entry.lastStoreY;
+        if (storeMoved) {
+          entry.storeVx = (p.x - entry.lastStoreX) * 10; // convert per-update delta to per-second velocity
+          entry.storeVy = (p.y - entry.lastStoreY) * 10;
+          entry.lastStoreX = p.x;
+          entry.lastStoreY = p.y;
+        } else {
+          // Decay velocity when no new update arrives (player likely stopped)
+          entry.storeVx *= 0.85;
+          entry.storeVy *= 0.85;
+        }
+
+        // Dead reckoning: extrapolate target position using last known velocity
+        const frameDt = this.game.loop.delta / 1000;
+        const predictedX = p.x + entry.storeVx * frameDt;
+        const predictedY = p.y + entry.storeVy * frameDt;
+
+        const lerp = 1 - Math.exp(-15 * frameDt);
+        target.x += (predictedX - target.x) * lerp;
+        target.y += (predictedY - target.y) * lerp;
+        target.setDepth(10 + target.y);
+
+        // Play walk/idle based on whether the sprite is still meaningfully moving
+        const distToTarget = Math.hypot(predictedX - target.x, predictedY - target.y);
+        const isMoving = distToTarget > 1.5 || Math.hypot(entry.storeVx, entry.storeVy) > 15;
+        const animKey = `${entry.texKey}-${isMoving ? "walk" : "idle"}-${p.dir}`;
+        if (target.anims.currentAnim?.key !== animKey) {
+          target.play(animKey, true);
+        }
+      }
+
+      // Update name label — only redraw graphics when position changed meaningfully
+      const labelX = target.x;
+      const labelY = target.y - 108;
+      entry.label.setPosition(labelX, labelY).setDepth(10 + target.y + 0.1);
+      const dx = Math.abs(labelX - entry.labelX);
+      const dy = Math.abs(labelY - entry.labelY);
+      if (dx > 1 || dy > 1 || entry.labelX === 0) {
+        entry.labelX = labelX;
+        entry.labelY = labelY;
+        entry.nameBg
+          .clear()
+          .setPosition(labelX, labelY)
+          .setDepth(10 + target.y);
+        const w = entry.label.displayWidth + 22;
+        const h = 22;
+        const r = 5;
+        const x = -w / 2;
+        const y = -18;
+        entry.nameBg.fillStyle(0x0d1018, 0.78);
+        entry.nameBg.fillRoundedRect(x, y, w, h, r);
+        entry.nameBg.fillStyle(0x4cb866, 0.85);
+        entry.nameBg.fillRect(x + 2, y + 3, 3, h - 6);
+        entry.nameBg.lineStyle(1, 0xffffff, 0.18);
+        entry.nameBg.strokeRoundedRect(x, y, w, h, r);
+      } else {
+        entry.nameBg.setDepth(10 + target.y);
+      }
+
+      // Update speaking indicator position
+      const speakIcon = this.speakingIcons.get(userId);
+      if (speakIcon) {
+        speakIcon.setPosition(target.x, target.y - 128).setDepth(10 + target.y + 0.2);
+      }
+    }
+
+    // Remove sprites for players who left — play exit animation first
+    for (const [userId, entry] of this.remotePlayers) {
+      if (!seen.has(userId)) {
+        this.remotePlayers.delete(userId);
+        const { sprite, label, nameBg } = entry;
+        // Clean up speaking icon
+        const speakIcon = this.speakingIcons.get(userId);
+        if (speakIcon) { speakIcon.destroy(); this.speakingIcons.delete(userId); }
+        // Disable label/nameBg, fade them out quickly
+        this.tweens.add({ targets: [label, nameBg], alpha: 0, duration: 300 });
+        // Spin + levitate + fade out
+        this.tweens.add({
+          targets: sprite,
+          y: sprite.y - 200,
+          rotation: Math.PI * 6,
+          alpha: 0,
+          scaleX: 0.3,
+          scaleY: 0.3,
+          duration: 1200,
+          ease: "Quad.in",
+          onComplete: () => {
+            sprite.destroy();
+            label.destroy();
+            nameBg.destroy();
+          },
+        });
+      }
+    }
+  }
+
+  private _myUserId: string | null = null;
+  private net: import("../net").Net | null = null;
+
+  // ── Agent screen viewing + projector broadcast ──────────────────────
+
+  /** Open a modal showing a live screenshot feed from an agent's browser. */
+  private openAgentViewModal(agentId: string): void {
+    const agent = this.store.agents.get(agentId);
+    if (!agent) return;
+    this.agentViewAgentId = agent.id;
+    this.agentViewTab = "screen";
+    this.agentFsPath = ".";
+    this.agentViewCleanup = [];
+    this.agentLastFrame = null;
+    this.agentLastFrameUrl = null;
+
+    // Request screenshot stream from server
+    if (this.net) {
+      this.net.send({ type: "agent_view_start", agentId: agent.id });
+    }
+
+    // Build modal DOM
+    const existing = document.getElementById("agent-view-modal");
+    if (existing) existing.remove();
+
+    const isNarrow = Math.min(window.innerWidth, window.innerHeight) < 480;
+    const modal = document.createElement("div");
+    modal.id = "agent-view-modal";
+    modal.style.cssText = `
+      position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+      background: rgba(20,50,100,0.4); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); z-index: 1000;
+      display: flex; align-items: center; justify-content: center;
+    `;
+    const modalMaxW = isNarrow ? '100vw' : '90vw';
+    const modalMaxH = isNarrow ? '100vh' : '90vh';
+    const modalRadius = isNarrow ? '0' : '14px';
+    const contentW = '100%';
+    modal.innerHTML = `
+      <div style="background: linear-gradient(to bottom, rgba(235,245,255,0.95), rgba(200,225,250,0.9)); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.6); border-radius: ${modalRadius}; padding: 0; max-width: ${modalMaxW}; max-height: ${modalMaxH}; width: ${isNarrow ? '100vw' : '900px'}; height: ${isNarrow ? '100vh' : '70vh'}; position: relative; display:flex; flex-direction:column; box-shadow: 0 12px 48px rgba(0,80,180,0.2), inset 0 1px 0 rgba(255,255,255,0.8); overflow: hidden;">
+        <div style="display: flex; align-items: center; justify-content: space-between; padding: ${isNarrow ? '6px 10px' : '8px 16px'}; background: linear-gradient(to bottom, rgba(120,180,240,0.7), rgba(80,140,220,0.5)); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); border-radius: ${isNarrow ? '0' : '13px 13px 0 0'}; border-bottom: 1px solid rgba(255,255,255,0.4);${isNarrow ? 'flex-wrap:wrap;gap:4px;' : ''}">
+          <div style="${isNarrow ? 'flex:1;min-width:0;' : ''}">
+            <span style="color: #ffffff; font-weight: bold; font-size: ${isNarrow ? '0.9rem' : '1.1rem'}; text-shadow: 0 1px 3px rgba(0,60,140,0.4);">${agent.name}</span>
+            <span style="color: rgba(255,255,255,0.8); font-size: 0.8rem; margin-left: 8px; text-shadow: 0 1px 2px rgba(0,60,140,0.3);">${agent.status.toUpperCase()}</span>
+          </div>
+          <div style="display: flex; gap: 6px;${isNarrow ? 'flex-shrink:0;' : ''}">
+            <button id="agent-view-broadcast" style="padding: ${isNarrow ? '4px 10px' : '5px 14px'}; border: 1px solid rgba(255,255,255,0.4); border-radius: 16px; background: linear-gradient(to bottom, rgba(140,200,255,0.8), rgba(80,150,230,0.6)); color: #fff; font-size: ${isNarrow ? '0.7rem' : '0.8rem'}; cursor: pointer; text-shadow: 0 1px 2px rgba(0,60,140,0.3); box-shadow: inset 0 1px 0 rgba(255,255,255,0.5);">${isNarrow ? 'Broadcast' : 'Broadcast to Projector'}</button>
+            <button id="agent-view-close" style="padding: ${isNarrow ? '4px 10px' : '5px 14px'}; border: 1px solid rgba(255,180,180,0.5); border-radius: 16px; background: linear-gradient(to bottom, rgba(255,150,150,0.7), rgba(230,100,100,0.5)); color: #fff; font-size: ${isNarrow ? '0.7rem' : '0.8rem'}; cursor: pointer; text-shadow: 0 1px 2px rgba(140,30,30,0.3); box-shadow: inset 0 1px 0 rgba(255,255,255,0.4);">Close</button>
+          </div>
+        </div>
+        <div id="agent-view-tabs" style="display:flex;gap:2px;padding:4px 10px;background:linear-gradient(to bottom,rgba(220,235,250,0.6),rgba(200,220,245,0.4));border-bottom:1px solid rgba(255,255,255,0.3);${isNarrow ? 'overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;' : ''}">
+          <button class="av-tab" data-tab="screen" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 4px;border:1px solid rgba(255,255,255,0.5);border-bottom:none;border-radius:10px 10px 0 0;background:linear-gradient(to bottom,rgba(255,255,255,0.9),rgba(220,240,255,0.7));color:#1a6bb0;font-size:0.78rem;cursor:pointer;font-weight:bold;text-shadow:0 1px 0 rgba(255,255,255,0.8);box-shadow:inset 0 1px 0 rgba(255,255,255,0.6);"><svg width="14" height="14" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tg-sc" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7ec8ee"/><stop offset="1" stop-color="#2a8cd4"/></linearGradient><linearGradient id="tg-sb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f0f0f0"/><stop offset="1" stop-color="#b0b0b0"/></linearGradient></defs><rect x="1" y="1" width="14" height="10" rx="1.5" fill="url(#tg-sb)" stroke="#888" stroke-width="0.5"/><rect x="2.5" y="2.5" width="11" height="7" rx="0.5" fill="url(#tg-sc)"/><rect x="2.5" y="2.5" width="11" height="2.5" rx="0.5" fill="rgba(255,255,255,0.35)"/><rect x="5.5" y="11.5" width="5" height="1.5" rx="0.3" fill="#aaa"/><rect x="3.5" y="13.5" width="9" height="1.2" rx="0.4" fill="#999"/></svg> Screen</button>
+          <button class="av-tab" data-tab="files" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 4px;border:1px solid rgba(180,200,225,0.4);border-bottom:none;border-radius:10px 10px 0 0;background:linear-gradient(to bottom,rgba(200,220,245,0.5),rgba(180,205,235,0.3));color:#4a7a9a;font-size:0.78rem;cursor:pointer;"><svg width="14" height="14" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tg-fl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffe9a8"/><stop offset="0.5" stop-color="#f5cc60"/><stop offset="1" stop-color="#d8a830"/></linearGradient></defs><path d="M1 4 Q1 3 2 3 L5.5 3 Q6 3 6.5 3.5 L8 5 L14 5 Q15 5 15 6 L15 13 Q15 14 14 14 L2 14 Q1 14 1 13 Z" fill="url(#tg-fl)" stroke="#c08820" stroke-width="0.5"/><rect x="1" y="6" width="14" height="0.8" fill="rgba(255,255,255,0.5)"/><path d="M1 7 L15 7 L15 13 Q15 14 14 14 L2 14 Q1 14 1 13 Z" fill="url(#tg-fl)" opacity="0.7"/></svg> Files</button>
+          <button class="av-tab" data-tab="terminal" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 4px;border:1px solid rgba(180,200,225,0.4);border-bottom:none;border-radius:10px 10px 0 0;background:linear-gradient(to bottom,rgba(200,220,245,0.5),rgba(180,205,235,0.3));color:#4a7a9a;font-size:0.78rem;cursor:pointer;"><svg width="14" height="14" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tg-tt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#e8e8e8"/><stop offset="1" stop-color="#b8b8b8"/></linearGradient><linearGradient id="tg-ts" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1a2a3a"/><stop offset="1" stop-color="#0a1525"/></linearGradient></defs><rect x="1" y="1" width="14" height="11" rx="1.5" fill="url(#tg-tt)" stroke="#888" stroke-width="0.5"/><rect x="1" y="1" width="14" height="3" rx="1.5" fill="#c8c8c8"/><circle cx="3" cy="2.5" r="0.8" fill="#ff6058"/><circle cx="5" cy="2.5" r="0.8" fill="#ffbd2e"/><circle cx="7" cy="2.5" r="0.8" fill="#28ca42"/><rect x="2.5" y="5" width="11" height="6" rx="0.5" fill="url(#tg-ts)"/><path d="M3.5 7 L5 8.5 L3.5 10" stroke="#5dd55d" stroke-width="0.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/><rect x="5.5" y="9.5" width="4" height="0.8" fill="#5dd55d" rx="0.2"/></svg> Terminal</button>
+          <button class="av-tab" data-tab="tasks" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 4px;border:1px solid rgba(180,200,225,0.4);border-bottom:none;border-radius:10px 10px 0 0;background:linear-gradient(to bottom,rgba(200,220,245,0.5),rgba(180,205,235,0.3));color:#4a7a9a;font-size:0.78rem;cursor:pointer;"><svg width="14" height="14" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tg-tk" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f8f8f8"/><stop offset="1" stop-color="#d0d0d0"/></linearGradient><linearGradient id="tg-tc" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5dd55d"/><stop offset="1" stop-color="#2a8c2a"/></linearGradient></defs><rect x="3" y="2" width="10" height="12" rx="1" fill="url(#tg-tk)" stroke="#999" stroke-width="0.5"/><rect x="5" y="1" width="6" height="2.5" rx="1" fill="#888"/><rect x="4.5" y="5" width="7" height="0.8" fill="#ccc" rx="0.2"/><path d="M4.5 9 L6 10.5 L8.5 7.5" stroke="url(#tg-tc)" stroke-width="1.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/><rect x="4.5" y="11.5" width="7" height="0.8" fill="#ccc" rx="0.2"/></svg> Tasks</button>
+          <button class="av-tab" data-tab="chat" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 4px;border:1px solid rgba(180,200,225,0.4);border-bottom:none;border-radius:10px 10px 0 0;background:linear-gradient(to bottom,rgba(200,220,245,0.5),rgba(180,205,235,0.3));color:#4a7a9a;font-size:0.78rem;cursor:pointer;"><svg width="14" height="14" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tg-ch" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#b8e0f8"/><stop offset="1" stop-color="#5fb8e8"/></linearGradient></defs><path d="M2 2 L14 2 Q15 2 15 3 L15 10 Q15 11 14 11 L6 11 L3 14 L3 11 L2 11 Q1 11 1 10 L1 3 Q1 2 2 2 Z" fill="url(#tg-ch)" stroke="#2a8cd4" stroke-width="0.5"/><circle cx="5" cy="6.5" r="1" fill="#fff"/><circle cx="8" cy="6.5" r="1" fill="#fff"/><circle cx="11" cy="6.5" r="1" fill="#fff"/></svg> Chat</button>
+          <button class="av-tab" data-tab="memory" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 4px;border:1px solid rgba(180,200,225,0.4);border-bottom:none;border-radius:10px 10px 0 0;background:linear-gradient(to bottom,rgba(200,220,245,0.5),rgba(180,205,235,0.3));color:#4a7a9a;font-size:0.78rem;cursor:pointer;"><svg width="14" height="14" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tg-mc" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#a8c8e8"/><stop offset="0.5" stop-color="#78a8d0"/><stop offset="1" stop-color="#5088b8"/></linearGradient></defs><rect x="2" y="3" width="12" height="8" rx="1" fill="url(#tg-mc)" stroke="#406890" stroke-width="0.5"/><rect x="3.5" y="4.5" width="9" height="5" rx="0.5" fill="#2a5878" opacity="0.6"/><rect x="3" y="11" width="1" height="2.5" fill="#888"/><rect x="5.5" y="11" width="1" height="2.5" fill="#888"/><rect x="8" y="11" width="1" height="2.5" fill="#888"/><rect x="10.5" y="11" width="1" height="2.5" fill="#888"/><rect x="4.5" y="5.5" width="2" height="1" fill="#5dd55d" rx="0.2"/><rect x="7.5" y="5.5" width="2" height="1" fill="#ffcc44" rx="0.2"/><rect x="4.5" y="7.5" width="2" height="1" fill="#5dd5ff" rx="0.2"/><rect x="7.5" y="7.5" width="2" height="1" fill="#ff8844" rx="0.2"/></svg> Memory</button>
+          <button class="av-tab" data-tab="stats" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 4px;border:1px solid rgba(180,200,225,0.4);border-bottom:none;border-radius:10px 10px 0 0;background:linear-gradient(to bottom,rgba(200,220,245,0.5),rgba(180,205,235,0.3));color:#4a7a9a;font-size:0.78rem;cursor:pointer;"><svg width="14" height="14" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tg-s1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7ec8ee"/><stop offset="1" stop-color="#2a8cd4"/></linearGradient><linearGradient id="tg-s2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5dd55d"/><stop offset="1" stop-color="#2a8c2a"/></linearGradient><linearGradient id="tg-s3" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffcc88"/><stop offset="1" stop-color="#e8a830"/></linearGradient></defs><rect x="2" y="9" width="3" height="5" rx="0.5" fill="url(#tg-s1)" stroke="#2a8cd4" stroke-width="0.3"/><rect x="6.5" y="6" width="3" height="8" rx="0.5" fill="url(#tg-s2)" stroke="#2a8c2a" stroke-width="0.3"/><rect x="11" y="3" width="3" height="11" rx="0.5" fill="url(#tg-s3)" stroke="#e8a830" stroke-width="0.3"/><rect x="2" y="9" width="3" height="1.5" fill="rgba(255,255,255,0.35)" rx="0.3"/><rect x="6.5" y="6" width="3" height="1.5" fill="rgba(255,255,255,0.35)" rx="0.3"/><rect x="11" y="3" width="3" height="1.5" fill="rgba(255,255,255,0.35)" rx="0.3"/></svg> Stats</button>
+          ${(agent.cdpSolana || agent.crossmintWallet) ? `<button class="av-tab" data-tab="wallet" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 4px;border:1px solid rgba(180,200,225,0.4);border-bottom:none;border-radius:10px 10px 0 0;background:linear-gradient(to bottom,rgba(200,220,245,0.5),rgba(180,205,235,0.3));color:#4a7a9a;font-size:0.78rem;cursor:pointer;"><svg width="14" height="14" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tg-wl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#e8d0ff"/><stop offset="1" stop-color="#a060d0"/></linearGradient></defs><rect x="2" y="3" width="12" height="10" rx="1.5" fill="url(#tg-wl)" stroke="#7040a0" stroke-width="0.5"/><rect x="2" y="3" width="12" height="3" rx="1.5" fill="rgba(255,255,255,0.3)"/><circle cx="11" cy="8" r="1.5" fill="#fff" opacity="0.9"/><rect x="4" y="7" width="4" height="1" fill="#fff" opacity="0.7" rx="0.3"/><rect x="4" y="9" width="3" height="1" fill="#fff" opacity="0.5" rx="0.3"/></svg> Wallet</button>` : ""}
+        </div>
+        ${agent.task ? `<div style="color: #4a7a9a; font-size: 0.75rem; padding: 6px 14px; text-shadow: 0 1px 0 rgba(255,255,255,0.5); white-space: pre-line; word-break: break-word; max-height: 60px; overflow-y: auto; overflow-x: hidden; flex-shrink: 0; min-width: 0; width: 100%; box-sizing: border-box; border-top: 1px solid rgba(180,200,225,0.3); background: rgba(240,248,255,0.6);">Task: ${agent.task}</div>` : ""}
+        <div id="agent-view-content" style="width: ${contentW}; flex: 1; min-height: 0; max-width: 100%; background: linear-gradient(to bottom, rgba(255,255,255,0.95), rgba(240,248,255,0.9)); border-radius: 0 0 ${isNarrow ? '0' : '12px'} 12px; overflow: hidden;">
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+
+    // Wire close button
+    document.getElementById("agent-view-close")!.addEventListener("click", () => {
+      this.closeAgentViewModal();
+    });
+
+    // Wire broadcast button
+    const broadcastBtn = document.getElementById("agent-view-broadcast")!;
+    broadcastBtn.addEventListener("click", () => {
+      if (this.agentBroadcastAgentId === agent.id) {
+        if (this.net) this.net.send({ type: "agent_broadcast_stop" });
+        broadcastBtn.textContent = "Broadcast to Projector";
+        (broadcastBtn as HTMLButtonElement).style.background = "linear-gradient(to bottom, rgba(140,200,255,0.8), rgba(80,150,230,0.6))";
+      } else {
+        if (this.net) this.net.send({ type: "agent_broadcast_start", agentId: agent.id });
+        broadcastBtn.textContent = "Stop Broadcast";
+        (broadcastBtn as HTMLButtonElement).style.background = "linear-gradient(to bottom, rgba(255,150,150,0.7), rgba(230,100,100,0.5))";
+      }
+    });
+
+    if (this.agentBroadcastAgentId === agent.id) {
+      broadcastBtn.textContent = "Stop Broadcast";
+      (broadcastBtn as HTMLButtonElement).style.background = "linear-gradient(to bottom, rgba(255,150,150,0.7), rgba(230,100,100,0.5))";
+    }
+
+    // Wire tab buttons
+    modal.querySelectorAll(".av-tab").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const tab = (btn as HTMLElement).dataset.tab as "screen" | "files" | "terminal" | "tasks" | "chat" | "memory" | "stats" | "wallet";
+        this.switchAgentViewTab(tab, agent.id);
+      });
+    });
+
+    // Click outside to close
+    modal.addEventListener("click", (e) => {
+      if (e.target === modal) this.closeAgentViewModal();
+    });
+
+    // Render initial tab (screen)
+    this.renderAgentViewTab(agent.id);
+  }
+
+  /** Switch to a different tab in the agent monitor. */
+  private switchAgentViewTab(tab: "screen" | "files" | "terminal" | "tasks" | "chat" | "memory" | "stats" | "wallet", agentId: string): void {
+    this.agentViewTab = tab;
+    // Update tab button styles
+    const modal = document.getElementById("agent-view-modal");
+    if (modal) {
+      modal.querySelectorAll(".av-tab").forEach(btn => {
+        const isActive = (btn as HTMLElement).dataset.tab === tab;
+        const svg = btn.querySelector('svg');
+        if (isActive) {
+          (btn as HTMLElement).style.background = "linear-gradient(to bottom,rgba(255,255,255,0.9),rgba(220,240,255,0.7))";
+          (btn as HTMLElement).style.color = "#1a6bb0";
+          (btn as HTMLElement).style.fontWeight = "bold";
+          (btn as HTMLElement).style.textShadow = "0 1px 0 rgba(255,255,255,0.8)";
+          if (svg) (svg as SVGElement).style.opacity = "1";
+        } else {
+          (btn as HTMLElement).style.background = "linear-gradient(to bottom,rgba(200,220,245,0.5),rgba(180,205,235,0.3))";
+          (btn as HTMLElement).style.color = "#4a7a9a";
+          (btn as HTMLElement).style.fontWeight = "normal";
+          (btn as HTMLElement).style.textShadow = "";
+          if (svg) (svg as SVGElement).style.opacity = "0.5";
+        }
+      });
+    }
+    // Clean up previous tab listeners
+    for (const cleanup of this.agentViewCleanup) cleanup();
+    this.agentViewCleanup = [];
+
+    // Handle log subscription lifecycle
+    if (tab === "terminal") {
+      if (this.net) this.net.send({ type: "agent_log_subscribe", agentId });
+    } else {
+      if (this.net) this.net.send({ type: "agent_log_unsubscribe", agentId });
+    }
+
+    this.renderAgentViewTab(agentId);
+  }
+
+  /** Render the current tab content. */
+  private renderAgentViewTab(agentId: string): void {
+    const content = document.getElementById("agent-view-content");
+    if (!content) return;
+    const agent = this.store.agents.get(agentId);
+    if (!agent) return;
+
+    if (this.agentViewTab === "screen") {
+      content.innerHTML = this.renderAgentScreenTab(agent);
+    } else if (this.agentViewTab === "files") {
+      this.renderFilesTab(agentId, content);
+    } else if (this.agentViewTab === "terminal") {
+      this.renderTerminalTab(agentId, content);
+    } else if (this.agentViewTab === "tasks") {
+      this.renderTasksTab(agentId, content);
+    } else if (this.agentViewTab === "chat") {
+      this.renderChatTab(agentId, content);
+    } else if (this.agentViewTab === "memory") {
+      this.renderMemoryTab(agentId, content);
+    } else if (this.agentViewTab === "stats") {
+      this.renderStatsTab(agentId, content);
+    } else if (this.agentViewTab === "wallet") {
+      this.renderWalletTab(agentId, content);
+    }
+  }
+
+  /** Render the Files tab — file browser with upload/download/delete. */
+  private renderFilesTab(agentId: string, content: HTMLElement): void {
+    content.innerHTML = `
+      <div style="width:100%;height:100%;display:flex;flex-direction:column;font-family:'Segoe UI',Tahoma,sans-serif;color:#1a3a5a;font-size:0.8rem;">
+        <div style="display:flex;align-items:center;gap:8px;padding:8px 14px;background:linear-gradient(to bottom,rgba(255,255,255,0.6),rgba(220,240,255,0.4));backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border-bottom:1px solid rgba(255,255,255,0.4);">
+          <span style="color:#4a7a9a;font-size:0.7rem;">Path:</span>
+          <span id="av-fs-path" style="color:#1a6bb0;flex:1;font-weight:bold;text-shadow:0 1px 0 rgba(255,255,255,0.5);">${this.agentFsPath}</span>
+          <button id="av-fs-up" style="padding:3px 12px;border:1px solid rgba(255,255,255,0.5);border-radius:14px;background:linear-gradient(to bottom,rgba(255,255,255,0.8),rgba(220,240,255,0.5));color:#1a6bb0;font-size:0.7rem;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.6);">Up</button>
+          <label style="padding:3px 12px;border:1px solid rgba(255,255,255,0.4);border-radius:14px;background:linear-gradient(to bottom,rgba(120,180,240,0.7),rgba(80,150,220,0.5));color:#fff;font-size:0.7rem;cursor:pointer;text-shadow:0 1px 2px rgba(0,60,140,0.3);box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);">
+            Upload
+            <input id="av-fs-upload-input" type="file" style="display:none;" />
+          </label>
+        </div>
+        <div id="av-fs-listing" style="flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:4px 0;background:linear-gradient(to bottom,rgba(255,255,255,0.9),rgba(245,250,255,0.8));"></div>
+        <div id="av-fs-viewer" style="display:none;flex:1;overflow:hidden;border-top:1px solid rgba(255,255,255,0.4);flex-direction:column;">
+          <div style="display:flex;align-items:center;gap:6px;padding:6px 14px;background:linear-gradient(to bottom,rgba(255,255,255,0.6),rgba(220,240,255,0.4));backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);flex-wrap:wrap;">
+            <span id="av-fs-filename" style="color:#1a6bb0;font-size:0.75rem;flex:1;min-width:120px;font-weight:bold;text-shadow:0 1px 0 rgba(255,255,255,0.5);"></span>
+            <button id="av-fs-edit" style="padding:3px 12px;border:1px solid rgba(255,255,255,0.4);border-radius:14px;background:linear-gradient(to bottom,rgba(120,220,120,0.7),rgba(60,180,80,0.5));color:#fff;font-size:0.7rem;cursor:pointer;text-shadow:0 1px 2px rgba(20,100,30,0.3);box-shadow:inset 0 1px 0 rgba(255,255,255,0.4);">Edit</button>
+            <button id="av-fs-save" style="display:none;padding:3px 12px;border:1px solid rgba(255,255,255,0.4);border-radius:14px;background:linear-gradient(to bottom,rgba(120,220,120,0.7),rgba(60,180,80,0.5));color:#fff;font-size:0.7rem;cursor:pointer;text-shadow:0 1px 2px rgba(20,100,30,0.3);box-shadow:inset 0 1px 0 rgba(255,255,255,0.4);">Save</button>
+            <button id="av-fs-cancel-edit" style="display:none;padding:3px 12px;border:1px solid rgba(255,255,255,0.5);border-radius:14px;background:linear-gradient(to bottom,rgba(255,255,255,0.8),rgba(220,240,255,0.5));color:#4a7a9a;font-size:0.7rem;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.6);">Cancel</button>
+            <button id="av-fs-download" style="padding:3px 12px;border:1px solid rgba(255,255,255,0.4);border-radius:14px;background:linear-gradient(to bottom,rgba(120,180,240,0.7),rgba(80,150,220,0.5));color:#fff;font-size:0.7rem;cursor:pointer;text-shadow:0 1px 2px rgba(0,60,140,0.3);box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);">Download</button>
+            <button id="av-fs-broadcast-html" style="display:none;padding:3px 12px;border:1px solid rgba(255,255,255,0.4);border-radius:14px;background:linear-gradient(to bottom,rgba(140,200,255,0.8),rgba(80,150,230,0.6));color:#fff;font-size:0.7rem;cursor:pointer;text-shadow:0 1px 2px rgba(0,60,140,0.3);box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);">Broadcast to Screen</button>
+            <button id="av-fs-delete" style="padding:3px 12px;border:1px solid rgba(255,180,180,0.5);border-radius:14px;background:linear-gradient(to bottom,rgba(255,150,150,0.7),rgba(230,100,100,0.5));color:#fff;font-size:0.7rem;cursor:pointer;text-shadow:0 1px 2px rgba(140,30,30,0.3);box-shadow:inset 0 1px 0 rgba(255,255,255,0.4);">Delete</button>
+            <button id="av-fs-close-viewer" style="padding:3px 12px;border:1px solid rgba(255,255,255,0.5);border-radius:14px;background:linear-gradient(to bottom,rgba(255,255,255,0.8),rgba(220,240,255,0.5));color:#4a7a9a;font-size:0.7rem;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.6);">Back</button>
+          </div>
+          <pre id="av-fs-content" style="flex:1;overflow:auto;margin:0;padding:14px;background:rgba(255,255,255,0.85);color:#1a3a5a;font-size:0.75rem;line-height:1.4;white-space:pre-wrap;word-break:break-all;"></pre>
+          <textarea id="av-fs-editor" style="display:none;flex:1;margin:0;padding:14px;background:rgba(255,255,255,0.9);color:#1a3a5a;font-size:0.75rem;line-height:1.4;border:none;border-top:1px solid rgba(255,255,255,0.4);font-family:'Consolas',monospace;resize:none;outline:none;" spellcheck="false"></textarea>
+        </div>
+      </div>
+    `;
+
+    // Request listing
+    if (this.net) this.net.send({ type: "agent_fs_list", agentId, path: this.agentFsPath });
+
+    // Listen for listing responses
+    const onListing = (respAgentId: string, path: string, entries: { name: string; isDir: boolean; size: number; mtime: number }[]) => {
+      if (respAgentId !== agentId || path !== this.agentFsPath) return;
+      const listingEl = document.getElementById("av-fs-listing");
+      if (!listingEl) return;
+      if (entries.length === 0) {
+        listingEl.innerHTML = `<div style="padding:16px;color:#7aaac0;text-align:center;">Empty directory</div>`;
+        return;
+      }
+      listingEl.innerHTML = entries.map(e => {
+        const icon = e.isDir ? "📁" : "📄";
+        const sizeStr = e.isDir ? "" : this.formatFileSize(e.size);
+        const timeStr = new Date(e.mtime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        return `<div class="av-fs-item" data-name="${e.name}" data-dir="${e.isDir}" style="display:flex;align-items:center;gap:8px;padding:5px 14px;cursor:pointer;border-bottom:1px solid rgba(220,235,250,0.5);transition:background 0.15s;">
+          <span style="font-size:0.9rem;filter:drop-shadow(0 1px 2px rgba(0,80,160,0.15));">${icon}</span>
+          <span style="flex:1;color:${e.isDir ? "#1a6bb0" : "#1a3a5a"};text-shadow:0 1px 0 rgba(255,255,255,0.5);">${e.name}</span>
+          <span style="color:#7aaac0;font-size:0.65rem;">${sizeStr}</span>
+          <span style="color:#a0c0d8;font-size:0.65rem;">${timeStr}</span>
+        </div>`;
+      }).join("");
+
+      // Wire item clicks
+      listingEl.querySelectorAll(".av-fs-item").forEach(item => {
+        item.addEventListener("click", () => {
+          const name = (item as HTMLElement).dataset.name!;
+          const isDir = (item as HTMLElement).dataset.dir === "true";
+          const newPath = this.agentFsPath === "." ? name : `${this.agentFsPath}/${name}`;
+          if (isDir) {
+            this.agentFsPath = newPath;
+            if (this.net) this.net.send({ type: "agent_fs_list", agentId, path: newPath });
+            const pathEl = document.getElementById("av-fs-path");
+            if (pathEl) pathEl.textContent = newPath;
+          } else {
+            // Read file
+            if (this.net) this.net.send({ type: "agent_fs_read", agentId, path: newPath });
+            this.agentFsCurrentFile = newPath;
+          }
+        });
+      });
+    };
+    this.store.onAgentFsListing(onListing);
+    this.agentViewCleanup.push(() => this.store.offAgentFsListing(onListing));
+
+    // Listen for file content
+    const onContent = (respAgentId: string, path: string, fileContent: string, error?: string) => {
+      if (respAgentId !== agentId) return;
+      const viewer = document.getElementById("av-fs-viewer");
+      const filenameEl = document.getElementById("av-fs-filename");
+      const contentEl = document.getElementById("av-fs-content");
+      const listingEl = document.getElementById("av-fs-listing");
+      if (!viewer || !filenameEl || !contentEl) return;
+      viewer.style.display = "flex";
+      if (listingEl) listingEl.style.display = "none";
+      filenameEl.textContent = path;
+      if (error) {
+        contentEl.textContent = `Error: ${error}`;
+        contentEl.style.color = "#c62828";
+      } else {
+        this.agentFsRawContent = fileContent;
+        if (path.endsWith(".md")) {
+          contentEl.innerHTML = md(fileContent);
+          contentEl.style.color = "#1a3a5a";
+        } else {
+          contentEl.textContent = fileContent;
+          contentEl.style.color = "#1a3a5a";
+        }
+      }
+      // Show Broadcast to Screen button for HTML files
+      const broadcastHtmlBtn = document.getElementById("av-fs-broadcast-html");
+      if (broadcastHtmlBtn) {
+        if (path.endsWith(".html") || path.endsWith(".htm")) {
+          broadcastHtmlBtn.style.display = "inline-block";
+          if (this.agentBroadcastHtmlAgentId === agentId) {
+            broadcastHtmlBtn.textContent = "Stop Broadcast";
+            (broadcastHtmlBtn as HTMLButtonElement).style.background = "linear-gradient(to bottom, rgba(255,150,150,0.7), rgba(230,100,100,0.5))";
+          } else {
+            broadcastHtmlBtn.textContent = "Broadcast to Screen";
+            (broadcastHtmlBtn as HTMLButtonElement).style.background = "linear-gradient(to bottom, rgba(140,200,255,0.8), rgba(80,150,230,0.6))";
+          }
+        } else {
+          broadcastHtmlBtn.style.display = "none";
+        }
+      }
+    };
+    this.store.onAgentFsContent(onContent);
+    this.agentViewCleanup.push(() => this.store.offAgentFsContent(onContent));
+
+    // Listen for FS results (write/delete/upload)
+    const onResult = (respAgentId: string, _path: string, action: string, success: boolean, error?: string) => {
+      if (respAgentId !== agentId) return;
+      if (success) {
+        // Refresh listing
+        if (this.net) this.net.send({ type: "agent_fs_list", agentId, path: this.agentFsPath });
+        this.store.toast(`File ${action} successful`);
+      } else {
+        this.store.toast(`File ${action} failed: ${error ?? "unknown error"}`);
+      }
+    };
+    this.store.onAgentFsResult(onResult);
+    this.agentViewCleanup.push(() => this.store.offAgentFsResult(onResult));
+
+    // Wire Up button
+    document.getElementById("av-fs-up")?.addEventListener("click", () => {
+      if (this.agentFsPath === ".") return;
+      const parts = this.agentFsPath.split("/");
+      parts.pop();
+      this.agentFsPath = parts.join("/") || ".";
+      if (this.net) this.net.send({ type: "agent_fs_list", agentId, path: this.agentFsPath });
+      const pathEl = document.getElementById("av-fs-path");
+      if (pathEl) pathEl.textContent = this.agentFsPath;
+    });
+
+    // Wire upload
+    const uploadInput = document.getElementById("av-fs-upload-input") as HTMLInputElement | null;
+    uploadInput?.addEventListener("change", () => {
+      const file = uploadInput.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        const base64 = result.split(",")[1] ?? "";
+        const uploadPath = this.agentFsPath === "." ? file.name : `${this.agentFsPath}/${file.name}`;
+        if (this.net) this.net.send({ type: "agent_fs_upload", agentId, path: uploadPath, content: base64, encoding: "base64" });
+      };
+      reader.readAsDataURL(file);
+    });
+
+    // Wire viewer buttons
+    document.getElementById("av-fs-close-viewer")?.addEventListener("click", () => {
+      const viewer = document.getElementById("av-fs-viewer");
+      const listingEl = document.getElementById("av-fs-listing");
+      if (viewer) viewer.style.display = "none";
+      if (listingEl) listingEl.style.display = "block";
+    });
+
+    document.getElementById("av-fs-download")?.addEventListener("click", () => {
+      const filename = this.agentFsCurrentFile?.split("/").pop() ?? "download";
+      const contentEl = document.getElementById("av-fs-content");
+      if (!contentEl) return;
+      const blob = new Blob([this.agentFsRawContent], { type: "text/plain" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    // Wire Broadcast to Screen button for HTML files
+    document.getElementById("av-fs-broadcast-html")?.addEventListener("click", () => {
+      if (!this.agentFsCurrentFile) return;
+      const btn = document.getElementById("av-fs-broadcast-html") as HTMLButtonElement | null;
+      if (!btn) return;
+      if (this.agentBroadcastHtmlAgentId === agentId) {
+        if (this.net) this.net.send({ type: "agent_broadcast_stop" });
+        btn.textContent = "Broadcast to Screen";
+        btn.style.background = "linear-gradient(to bottom, rgba(140,200,255,0.8), rgba(80,150,230,0.6))";
+      } else {
+        if (this.net) this.net.send({ type: "agent_broadcast_html", agentId, filePath: this.agentFsCurrentFile });
+        btn.textContent = "Stop Broadcast";
+        btn.style.background = "linear-gradient(to bottom, rgba(255,150,150,0.7), rgba(230,100,100,0.5))";
+      }
+    });
+
+    document.getElementById("av-fs-delete")?.addEventListener("click", () => {
+      if (!this.agentFsCurrentFile) return;
+      if (!confirm(`Delete ${this.agentFsCurrentFile}?`)) return;
+      if (this.net) this.net.send({ type: "agent_fs_delete", agentId, path: this.agentFsCurrentFile });
+      const viewer = document.getElementById("av-fs-viewer");
+      const listingEl = document.getElementById("av-fs-listing");
+      if (viewer) viewer.style.display = "none";
+      if (listingEl) listingEl.style.display = "block";
+    });
+
+    // Wire edit/save/cancel
+    document.getElementById("av-fs-edit")?.addEventListener("click", () => {
+      const contentEl = document.getElementById("av-fs-content") as HTMLPreElement | null;
+      const editorEl = document.getElementById("av-fs-editor") as HTMLTextAreaElement | null;
+      const editBtn = document.getElementById("av-fs-edit");
+      const saveBtn = document.getElementById("av-fs-save");
+      const cancelBtn = document.getElementById("av-fs-cancel-edit");
+      if (!contentEl || !editorEl) return;
+      editorEl.value = this.agentFsRawContent;
+      contentEl.style.display = "none";
+      editorEl.style.display = "block";
+      if (editBtn) editBtn.style.display = "none";
+      if (saveBtn) saveBtn.style.display = "inline-block";
+      if (cancelBtn) cancelBtn.style.display = "inline-block";
+      editorEl.focus();
+    });
+
+    document.getElementById("av-fs-save")?.addEventListener("click", () => {
+      if (!this.agentFsCurrentFile) return;
+      const editorEl = document.getElementById("av-fs-editor") as HTMLTextAreaElement | null;
+      const contentEl = document.getElementById("av-fs-content") as HTMLPreElement | null;
+      const editBtn = document.getElementById("av-fs-edit");
+      const saveBtn = document.getElementById("av-fs-save");
+      const cancelBtn = document.getElementById("av-fs-cancel-edit");
+      if (!editorEl || !contentEl) return;
+      const newContent = editorEl.value;
+      if (this.net) this.net.send({ type: "agent_fs_write", agentId, path: this.agentFsCurrentFile, content: newContent });
+      this.agentFsRawContent = newContent;
+      if (this.agentFsCurrentFile?.endsWith(".md")) {
+        contentEl.innerHTML = md(newContent);
+      } else {
+        contentEl.textContent = newContent;
+      }
+      contentEl.style.display = "block";
+      editorEl.style.display = "none";
+      if (editBtn) editBtn.style.display = "inline-block";
+      if (saveBtn) saveBtn.style.display = "none";
+      if (cancelBtn) cancelBtn.style.display = "none";
+    });
+
+    document.getElementById("av-fs-cancel-edit")?.addEventListener("click", () => {
+      const contentEl = document.getElementById("av-fs-content") as HTMLPreElement | null;
+      const editorEl = document.getElementById("av-fs-editor") as HTMLTextAreaElement | null;
+      const editBtn = document.getElementById("av-fs-edit");
+      const saveBtn = document.getElementById("av-fs-save");
+      const cancelBtn = document.getElementById("av-fs-cancel-edit");
+      if (contentEl) contentEl.style.display = "block";
+      if (editorEl) editorEl.style.display = "none";
+      if (editBtn) editBtn.style.display = "inline-block";
+      if (saveBtn) saveBtn.style.display = "none";
+      if (cancelBtn) cancelBtn.style.display = "none";
+    });
+  }
+
+  /** Current file being viewed in the file browser. */
+  private agentFsCurrentFile: string | null = null;
+  /** Raw content of the currently viewed file (before markdown rendering). */
+  private agentFsRawContent = "";
+
+  /** Render the Terminal tab — live log stream. */
+  private renderTerminalTab(agentId: string, content: HTMLElement): void {
+    content.innerHTML = `
+      <div style="width:100%;height:100%;display:flex;flex-direction:column;font-family:'Courier New',monospace;color:#c0d0e0;font-size:0.78rem;">
+        <div style="display:flex;align-items:center;gap:8px;padding:6px 14px;background:linear-gradient(to bottom,rgba(255,255,255,0.6),rgba(220,240,255,0.4));backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border-bottom:1px solid rgba(255,255,255,0.4);flex-wrap:wrap;">
+          <span style="color:#4a7a9a;font-size:0.7rem;">Live Log Stream</span>
+          <span id="av-term-status" style="color:#3aaa3a;font-size:0.65rem;text-shadow:0 0 4px rgba(60,200,60,0.3);">● connected</span>
+          <div style="display:flex;gap:4px;margin-left:8px;">
+            <label style="display:flex;align-items:center;gap:2px;color:#4a7a9a;font-size:0.65rem;cursor:pointer;"><input class="av-term-filter" type="checkbox" value="status" checked /> status</label>
+            <label style="display:flex;align-items:center;gap:2px;color:#4a7a9a;font-size:0.65rem;cursor:pointer;"><input class="av-term-filter" type="checkbox" value="text" checked /> text</label>
+            <label style="display:flex;align-items:center;gap:2px;color:#4a7a9a;font-size:0.65rem;cursor:pointer;"><input class="av-term-filter" type="checkbox" value="tool" checked /> tool</label>
+            <label style="display:flex;align-items:center;gap:2px;color:#4a7a9a;font-size:0.65rem;cursor:pointer;"><input class="av-term-filter" type="checkbox" value="result" checked /> result</label>
+            <label style="display:flex;align-items:center;gap:2px;color:#4a7a9a;font-size:0.65rem;cursor:pointer;"><input class="av-term-filter" type="checkbox" value="error" checked /> error</label>
+            <label style="display:flex;align-items:center;gap:2px;color:#4a7a9a;font-size:0.65rem;cursor:pointer;"><input class="av-term-filter" type="checkbox" value="boss" checked /> boss</label>
+          </div>
+          <button id="av-term-clear" style="margin-left:auto;padding:3px 12px;border:1px solid rgba(255,255,255,0.5);border-radius:14px;background:linear-gradient(to bottom,rgba(255,255,255,0.8),rgba(220,240,255,0.5));color:#4a7a9a;font-size:0.7rem;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.6);">Clear</button>
+          <label style="display:flex;align-items:center;gap:4px;color:#4a7a9a;font-size:0.7rem;cursor:pointer;">
+            <input id="av-term-autoscroll" type="checkbox" checked /> Auto-scroll
+          </label>
+        </div>
+        <div id="av-terminal-log" style="flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:8px 14px;background:linear-gradient(to bottom,#0a1525,#0d1a30);"></div>
+      </div>
+    `;
+
+    const logEl = document.getElementById("av-terminal-log")!;
+
+    const getActiveFilters = (): Set<string> => {
+      const filters = new Set<string>();
+      document.querySelectorAll(".av-term-filter").forEach((cb: Element) => {
+        const input = cb as HTMLInputElement;
+        if (input.checked) filters.add(input.value);
+      });
+      return filters;
+    };
+
+    // Listen for log history
+    const onHistory = (respAgentId: string, entries: LogEntry[]) => {
+      if (respAgentId !== agentId) return;
+      const filters = getActiveFilters();
+      logEl.innerHTML = entries.filter(e => filters.has(e.kind)).map(e => this.formatLogEntry(e)).join("");
+      this.scrollToTerminalBottom();
+    };
+    this.store.onAgentLogHistory(onHistory);
+    this.agentViewCleanup.push(() => this.store.offAgentLogHistory(onHistory));
+
+    // Listen for live log entries
+    const onLog = (respAgentId: string, entry: LogEntry) => {
+      if (respAgentId !== agentId) return;
+      const filters = getActiveFilters();
+      if (!filters.has(entry.kind)) return;
+      logEl.insertAdjacentHTML("beforeend", this.formatLogEntry(entry));
+      this.scrollToTerminalBottom();
+    };
+    this.store.onAgentLog(onLog);
+    this.agentViewCleanup.push(() => this.store.offAgentLog(onLog));
+
+    // Wire filter changes — re-render from stored logs
+    document.querySelectorAll(".av-term-filter").forEach(cb => {
+      cb.addEventListener("change", () => {
+        const filters = getActiveFilters();
+        const allLogs = this.store.logs.get(agentId) ?? [];
+        logEl.innerHTML = allLogs.filter(e => filters.has(e.kind)).map(e => this.formatLogEntry(e)).join("");
+        this.scrollToTerminalBottom();
+      });
+    });
+
+    // Wire clear button
+    document.getElementById("av-term-clear")?.addEventListener("click", () => {
+      logEl.innerHTML = "";
+    });
+  }
+
+  /** Format a log entry as HTML for the terminal. */
+  private formatLogEntry(entry: LogEntry): string {
+    const colors: Record<string, string> = {
+      status: "#888",
+      text: "#e0e0e0",
+      tool: "#4a8cd4",
+      result: "#44cc66",
+      error: "#cc4444",
+      boss: "#cc8844",
+    };
+    const color = colors[entry.kind] ?? "#c0c0d0";
+    const time = new Date(entry.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    const prefix: Record<string, string> = {
+      status: "STATUS",
+      text: "TEXT",
+      tool: "TOOL",
+      result: "RESULT",
+      error: "ERROR",
+      boss: "BOSS",
+    };
+    const tag = prefix[entry.kind] ?? entry.kind.toUpperCase();
+    return `<div style="padding:1px 0;"><span style="color:#444;">[${time}]</span> <span style="color:${color};font-weight:bold;">${tag}</span> <span style="color:${color};">${this.escapeHtml(entry.text)}</span></div>`;
+  }
+
+  /** Scroll terminal to bottom if auto-scroll is enabled. */
+  private scrollToTerminalBottom(): void {
+    const autoScroll = document.getElementById("av-term-autoscroll") as HTMLInputElement | null;
+    if (autoScroll && !autoScroll.checked) return;
+    const logEl = document.getElementById("av-terminal-log");
+    if (logEl) logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  /** Escape HTML special characters. */
+  private escapeHtml(text: string): string {
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  /** Format file size for display. */
+  private formatFileSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes}B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+  }
+
+  /** Render the Tasks tab — current task, queue, history, and inject controls. */
+  private renderTasksTab(agentId: string, content: HTMLElement): void {
+    content.innerHTML = `
+      <div style="width:100%;height:100%;display:flex;flex-direction:column;font-family:'Segoe UI',Tahoma,sans-serif;color:#1a3a5a;font-size:0.8rem;">
+        <!-- Task injection bar -->
+        <div style="display:flex;align-items:center;gap:8px;padding:8px 14px;background:linear-gradient(to bottom,rgba(255,255,255,0.6),rgba(220,240,255,0.4));backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border-bottom:1px solid rgba(255,255,255,0.4);">
+          <input id="av-task-input" type="text" placeholder="Inject a task..." style="flex:1;padding:6px 12px;border:1px solid rgba(255,255,255,0.5);border-radius:8px;background:rgba(255,255,255,0.7);color:#1a3a5a;font-size:0.8rem;font-family:'Segoe UI',Tahoma,sans-serif;box-shadow:inset 0 1px 2px rgba(0,60,140,0.1);" />
+          <button id="av-task-send" style="padding:5px 16px;border:1px solid rgba(255,255,255,0.4);border-radius:16px;background:linear-gradient(to bottom,rgba(120,180,240,0.7),rgba(80,150,220,0.5));color:#fff;font-size:0.8rem;cursor:pointer;text-shadow:0 1px 2px rgba(0,60,140,0.3);box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);">Assign</button>
+          <button id="av-task-stop" style="padding:5px 16px;border:1px solid rgba(255,180,180,0.5);border-radius:16px;background:linear-gradient(to bottom,rgba(255,150,150,0.7),rgba(230,100,100,0.5));color:#fff;font-size:0.8rem;cursor:pointer;text-shadow:0 1px 2px rgba(140,30,30,0.3);box-shadow:inset 0 1px 0 rgba(255,255,255,0.4);">Stop</button>
+        </div>
+        <!-- Task info display -->
+        <div id="av-task-info" style="flex:1;overflow-y:auto;padding:14px;background:linear-gradient(to bottom,rgba(255,255,255,0.9),rgba(245,250,255,0.8));"></div>
+      </div>
+    `;
+
+    const infoEl = document.getElementById("av-task-info")!;
+
+    // Request task info from server
+    // We'll use the agent_inject_task handler's response, but also need a way to just get info.
+    // For now, render from the local store's AgentInfo (which has current task) and listen for agent_task_info.
+    const agent = this.store.agents.get(agentId);
+    if (agent) {
+      this.renderTaskInfoContent(infoEl, agent.task, [], []);
+    }
+
+    // Listen for task info responses
+    const onTaskInfo = (respAgentId: string, currentTask: string | null, queue: { task: string; handoffTo: string | null }[], history: { task: string; success: boolean; ts: number; durationMs: number }[]) => {
+      if (respAgentId !== agentId) return;
+      this.renderTaskInfoContent(infoEl, currentTask, queue, history);
+    };
+    this.store.onAgentTaskInfo(onTaskInfo);
+    this.agentViewCleanup.push(() => this.store.offAgentTaskInfo(onTaskInfo));
+
+    // Wire task input
+    const taskInput = document.getElementById("av-task-input") as HTMLInputElement;
+    const sendTask = () => {
+      const task = taskInput.value.trim();
+      if (!task) return;
+      if (this.net) this.net.send({ type: "agent_inject_task", agentId, task });
+      taskInput.value = "";
+    };
+    document.getElementById("av-task-send")?.addEventListener("click", sendTask);
+    taskInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") sendTask();
+    });
+
+    // Wire stop button
+    document.getElementById("av-task-stop")?.addEventListener("click", () => {
+      if (this.net) this.net.send({ type: "stop", agentId });
+    });
+  }
+
+  /** Render the task info content (current task, queue, history). */
+  private renderTaskInfoContent(el: HTMLElement, currentTask: string | null, queue: { task: string; handoffTo: string | null }[], history: { task: string; success: boolean; ts: number; durationMs: number }[]): void {
+    const queueHtml = queue.length > 0
+      ? queue.map((q, i) => `<div style="padding:8px 14px;background:rgba(220,240,255,0.5);border-left:3px solid #1a6bb0;margin-bottom:6px;border-radius:0 8px 8px 0;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);"><span style="color:#7aaac0;font-size:0.65rem;">#${i + 1}</span> <span style="color:#1a3a5a;text-shadow:0 1px 0 rgba(255,255,255,0.5);">${this.escapeHtml(q.task)}</span>${q.handoffTo ? ` <span style="color:#4a7a9a;font-size:0.65rem;">→ ${q.handoffTo}</span>` : ""}</div>`).join("")
+      : `<div style="color:#7aaac0;font-size:0.7rem;padding:8px 0;">No queued tasks</div>`;
+
+    const historyHtml = history.length > 0
+      ? history.slice(0, 10).map(h => {
+          const status = h.success ? "✓" : "✗";
+          const color = h.success ? "#3aaa3a" : "#e04848";
+          const duration = h.durationMs < 1000 ? `${h.durationMs}ms` : `${(h.durationMs / 1000).toFixed(1)}s`;
+          const time = new Date(h.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          return `<div style="padding:5px 14px;border-bottom:1px solid rgba(220,235,250,0.5);"><span style="color:${color};text-shadow:0 0 4px ${color}55;">${status}</span> <span style="color:#7aaac0;font-size:0.65rem;">[${time}]</span> <span style="color:#1a3a5a;text-shadow:0 1px 0 rgba(255,255,255,0.5);">${this.escapeHtml(h.task.slice(0, 80))}${h.task.length > 80 ? "…" : ""}</span> <span style="color:#a0c0d8;font-size:0.65rem;">${duration}</span></div>`;
+        }).join("")
+      : `<div style="color:#7aaac0;font-size:0.7rem;padding:8px 0;">No task history yet</div>`;
+
+    el.innerHTML = `
+      <div style="margin-bottom:16px;">
+        <div style="color:#4a7a9a;font-size:0.65rem;text-transform:uppercase;margin-bottom:6px;text-shadow:0 1px 0 rgba(255,255,255,0.5);">Current Task</div>
+        <div style="background:rgba(220,240,255,0.5);padding:14px;border-radius:8px;color:#1a3a5a;font-size:0.8rem;line-height:1.4;border:1px solid rgba(255,255,255,0.4);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);">
+          ${currentTask ? this.escapeHtml(currentTask) : '<span style="color:#7aaac0;">No active task — agent is idle</span>'}
+        </div>
+      </div>
+      <div style="margin-bottom:16px;">
+        <div style="color:#4a7a9a;font-size:0.65rem;text-transform:uppercase;margin-bottom:6px;text-shadow:0 1px 0 rgba(255,255,255,0.5);">Task Queue (${queue.length})</div>
+        ${queueHtml}
+      </div>
+      <div>
+        <div style="color:#4a7a9a;font-size:0.65rem;text-transform:uppercase;margin-bottom:6px;text-shadow:0 1px 0 rgba(255,255,255,0.5);">Recent History</div>
+        ${historyHtml}
+      </div>
+    `;
+  }
+
+  /** Render the Chat tab — boss-to-agent chat using existing chat message + log entries. */
+  private renderChatTab(agentId: string, content: HTMLElement): void {
+    content.innerHTML = `
+      <div style="width:100%;height:100%;display:flex;flex-direction:column;font-family:'Segoe UI',Tahoma,sans-serif;color:#1a3a5a;font-size:0.8rem;">
+        <div id="av-chat-log" style="flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:14px;display:flex;flex-direction:column;gap:10px;background:linear-gradient(to bottom,rgba(255,255,255,0.9),rgba(245,250,255,0.8));"></div>
+        <div style="display:flex;align-items:center;gap:8px;padding:8px 14px;background:linear-gradient(to bottom,rgba(255,255,255,0.6),rgba(220,240,255,0.4));backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border-top:1px solid rgba(255,255,255,0.4);">
+          <input id="av-chat-input" type="text" placeholder="Say something to the agent..." style="flex:1;padding:8px 14px;border:1px solid rgba(255,255,255,0.5);border-radius:20px;background:rgba(255,255,255,0.7);color:#1a3a5a;font-size:0.8rem;font-family:'Segoe UI',Tahoma,sans-serif;box-shadow:inset 0 1px 2px rgba(0,60,140,0.1);" />
+          <button id="av-chat-send" style="padding:8px 18px;border:1px solid rgba(255,255,255,0.4);border-radius:18px;background:linear-gradient(to bottom,rgba(120,180,240,0.7),rgba(80,150,220,0.5));color:#fff;font-size:0.8rem;cursor:pointer;text-shadow:0 1px 2px rgba(0,60,140,0.3);box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);">Send</button>
+        </div>
+      </div>
+    `;
+
+    const chatLogEl = document.getElementById("av-chat-log")!;
+    const agent = this.store.agents.get(agentId);
+
+    // Render existing chat history from store logs (boss + text entries)
+    const renderChatHistory = () => {
+      const logs = this.store.logs.get(agentId) ?? [];
+      const chatEntries = logs.filter(e => e.kind === "boss" || e.kind === "text");
+      chatLogEl.innerHTML = chatEntries.map(e => {
+        const isBoss = e.kind === "boss";
+        const time = new Date(e.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        const name = isBoss ? (this.store.player?.name ?? "Boss") : (agent?.name ?? "Agent");
+        const align = isBoss ? "flex-end" : "flex-start";
+        const bg = isBoss ? "rgba(180,220,250,0.6)" : "rgba(200,240,200,0.5)";
+        const color = isBoss ? "#1a6bb0" : "#2a8a3a";
+        return `<div style="align-self:${align};max-width:75%;display:flex;flex-direction:column;gap:2px;">
+          <span style="color:#7aaac0;font-size:0.6rem;padding:0 10px;">${name} · ${time}</span>
+          <div style="background:${bg};padding:10px 14px;border-radius:14px;color:${color};font-size:0.8rem;line-height:1.4;border:1px solid rgba(255,255,255,0.4);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);text-shadow:0 1px 0 rgba(255,255,255,0.3);">${this.escapeHtml(e.text)}</div>
+        </div>`;
+      }).join("");
+      chatLogEl.scrollTop = chatLogEl.scrollHeight;
+    };
+    renderChatHistory();
+
+    // Listen for new log entries to update chat
+    const onLog = (respAgentId: string, entry: LogEntry) => {
+      if (respAgentId !== agentId) return;
+      if (entry.kind !== "boss" && entry.kind !== "text") return;
+      const isBoss = entry.kind === "boss";
+      const time = new Date(entry.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      const name = isBoss ? (this.store.player?.name ?? "Boss") : (agent?.name ?? "Agent");
+      const align = isBoss ? "flex-end" : "flex-start";
+      const bg = isBoss ? "rgba(180,220,250,0.6)" : "rgba(200,240,200,0.5)";
+      const color = isBoss ? "#1a6bb0" : "#2a8a3a";
+      chatLogEl.insertAdjacentHTML("beforeend", `<div style="align-self:${align};max-width:75%;display:flex;flex-direction:column;gap:2px;">
+        <span style="color:#7aaac0;font-size:0.6rem;padding:0 10px;">${name} · ${time}</span>
+        <div style="background:${bg};padding:10px 14px;border-radius:14px;color:${color};font-size:0.8rem;line-height:1.4;border:1px solid rgba(255,255,255,0.4);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);text-shadow:0 1px 0 rgba(255,255,255,0.3);">${this.escapeHtml(entry.text)}</div>
+      </div>`);
+      chatLogEl.scrollTop = chatLogEl.scrollHeight;
+    };
+    this.store.onAgentLog(onLog);
+    this.agentViewCleanup.push(() => this.store.offAgentLog(onLog));
+
+    // Wire send
+    const chatInput = document.getElementById("av-chat-input") as HTMLInputElement;
+    const sendChat = () => {
+      const text = chatInput.value.trim();
+      if (!text) return;
+      if (this.net) this.net.send({ type: "chat", agentId, text });
+      chatInput.value = "";
+    };
+    document.getElementById("av-chat-send")?.addEventListener("click", sendChat);
+    chatInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") sendChat();
+    });
+  }
+
+  /** Render the Memory tab — view agent's conversation history with the LLM. */
+  private renderMemoryTab(agentId: string, content: HTMLElement): void {
+    content.innerHTML = `
+      <div style="width:100%;height:100%;display:flex;flex-direction:column;font-family:'Segoe UI',Tahoma,sans-serif;color:#1a3a5a;font-size:0.78rem;">
+        <div style="display:flex;align-items:center;gap:8px;padding:6px 14px;background:linear-gradient(to bottom,rgba(255,255,255,0.6),rgba(220,240,255,0.4));backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border-bottom:1px solid rgba(255,255,255,0.4);">
+          <span style="color:#4a7a9a;font-size:0.7rem;">Conversation Memory</span>
+          <span id="av-mem-count" style="color:#7aaac0;font-size:0.65rem;"></span>
+          <button id="av-mem-refresh" style="margin-left:auto;padding:3px 12px;border:1px solid rgba(255,255,255,0.5);border-radius:14px;background:linear-gradient(to bottom,rgba(255,255,255,0.8),rgba(220,240,255,0.5));color:#4a7a9a;font-size:0.7rem;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.6);">Refresh</button>
+        </div>
+        <div id="av-mem-list" style="flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:10px 14px;display:flex;flex-direction:column;gap:8px;background:linear-gradient(to bottom,rgba(255,255,255,0.9),rgba(245,250,255,0.8));">
+          <div style="color:#7aaac0;font-size:0.7rem;padding:20px;text-align:center;">Loading conversation history...</div>
+        </div>
+      </div>
+    `;
+
+    const listEl = document.getElementById("av-mem-list")!;
+    const countEl = document.getElementById("av-mem-count")!;
+
+    // Request memory from server
+    if (this.net) this.net.send({ type: "agent_memory_request", agentId });
+
+    // Listen for memory response
+    const onMemory = (respAgentId: string, messages: { role: string; content: string }[]) => {
+      if (respAgentId !== agentId) return;
+      countEl.textContent = `${messages.length} messages`;
+
+      if (messages.length === 0) {
+        listEl.innerHTML = `<div style="color:#7aaac0;font-size:0.7rem;padding:20px;text-align:center;">No conversation history. The agent hasn't been given any tasks yet.</div>`;
+        return;
+      }
+
+      const roleColors: Record<string, string> = {
+        system: "#7aaac0",
+        user: "#1a6bb0",
+        assistant: "#2a8a3a",
+        tool: "#cc8844",
+        unknown: "#a0c0d8",
+      };
+      const roleLabels: Record<string, string> = {
+        system: "SYSTEM",
+        user: "USER",
+        assistant: "ASSISTANT",
+        tool: "TOOL",
+        unknown: "???",
+      };
+
+      listEl.innerHTML = messages.map(m => {
+        const color = roleColors[m.role] ?? "#888";
+        const label = roleLabels[m.role] ?? m.role.toUpperCase();
+        const isLong = m.content.length > 500;
+        const displayContent = isLong ? m.content.slice(0, 500) + "..." : m.content;
+        return `<div style="background:rgba(220,240,255,0.4);border-left:3px solid ${color};padding:10px 14px;border-radius:0 8px 8px 0;border:1px solid rgba(255,255,255,0.3);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);">
+          <div style="color:${color};font-size:0.6rem;font-weight:bold;margin-bottom:4px;text-shadow:0 1px 0 rgba(255,255,255,0.5);">${label}</div>
+          <div style="color:#1a3a5a;font-size:0.75rem;line-height:1.4;white-space:pre-wrap;word-break:break-word;text-shadow:0 1px 0 rgba(255,255,255,0.3);">${this.escapeHtml(displayContent)}</div>
+        </div>`;
+      }).join("");
+    };
+    this.store.onAgentMemory(onMemory);
+    this.agentViewCleanup.push(() => this.store.offAgentMemory(onMemory));
+
+    // Wire refresh button
+    document.getElementById("av-mem-refresh")?.addEventListener("click", () => {
+      if (this.net) this.net.send({ type: "agent_memory_request", agentId });
+    });
+  }
+
+  /** Render the Stats tab — agent info dashboard with editable system prompt. */
+  private renderStatsTab(agentId: string, content: HTMLElement): void {
+    const agent = this.store.agents.get(agentId);
+    if (!agent) return;
+    content.innerHTML = this.renderAgentDashboard(agent);
+
+    // Wire up system prompt editing
+    const isBuiltIn = agent.id === OFFICE_MANAGER_ID || agent.id === HERMES_ID;
+    const editBtn = document.getElementById("av-stats-prompt-edit");
+    const saveBtn = document.getElementById("av-stats-prompt-save");
+    const cancelBtn = document.getElementById("av-stats-prompt-cancel");
+    const display = document.getElementById("av-stats-prompt-display");
+    const editor = document.getElementById("av-stats-prompt-editor") as HTMLTextAreaElement | null;
+
+    if (isBuiltIn) {
+      editBtn?.setAttribute("style", "display:none;");
+    }
+
+    editBtn?.addEventListener("click", () => {
+      if (display) display.style.display = "none";
+      if (editor) {
+        editor.style.display = "block";
+        editor.value = agent.systemPrompt || "";
+        editor.focus();
+      }
+      editBtn.style.display = "none";
+      if (saveBtn) saveBtn.style.display = "inline-block";
+      if (cancelBtn) cancelBtn.style.display = "inline-block";
+    });
+
+    saveBtn?.addEventListener("click", () => {
+      if (editor && this.net) {
+        this.net.send({ type: "update_agent", agentId, systemPrompt: editor.value });
+      }
+      if (display) {
+        const newText = editor?.value || "";
+        display.textContent = newText || "No custom system prompt set.";
+        display.style.color = newText ? "#4a7a9a" : "#a0c0d8";
+        display.style.display = "block";
+      }
+      if (editor) editor.style.display = "none";
+      editBtn!.style.display = "inline-block";
+      if (saveBtn) saveBtn.style.display = "none";
+      if (cancelBtn) cancelBtn.style.display = "none";
+    });
+
+    cancelBtn?.addEventListener("click", () => {
+      if (display) display.style.display = "block";
+      if (editor) editor.style.display = "none";
+      editBtn!.style.display = "inline-block";
+      if (saveBtn) saveBtn.style.display = "none";
+      if (cancelBtn) cancelBtn.style.display = "none";
+    });
+  }
+
+  /** Render the Wallet tab — CDP Solana / Crossmint wallet + DeFi dashboard. */
+  private renderWalletTab(agentId: string, content: HTMLElement): void {
+    const agent = this.store.agents.get(agentId);
+    if (!agent) return;
+    const isCdp = !!agent.cdpSolana;
+    const isCrossmint = !!agent.crossmintWallet;
+
+    content.innerHTML = `
+      <div style="width:100%;height:100%;display:flex;flex-direction:column;font-family:'Segoe UI',Tahoma,sans-serif;color:#1a3a5a;font-size:0.8rem;overflow-y:auto;-webkit-overflow-scrolling:touch;">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 14px;background:linear-gradient(to bottom,rgba(255,255,255,0.6),rgba(220,240,255,0.4));border-bottom:1px solid rgba(255,255,255,0.4);">
+          <span style="font-weight:bold;color:#1a6bb0;font-size:0.85rem;">${isCdp ? "◎ CDP Solana Wallet" : "🔗 Crossmint Wallet"}</span>
+          <button id="av-wallet-refresh" style="padding:3px 12px;border:1px solid rgba(255,255,255,0.5);border-radius:14px;background:linear-gradient(to bottom,rgba(255,255,255,0.8),rgba(220,240,255,0.5));color:#1a6bb0;font-size:0.7rem;cursor:pointer;">↻ Refresh</button>
+        </div>
+        <div id="av-wallet-content" style="flex:1;padding:10px 14px;overflow-y:auto;">
+          <div style="color:#4a7a9a;text-align:center;padding:20px;">Loading wallet data…</div>
+        </div>
+      </div>
+    `;
+
+    const walletContent = document.getElementById("av-wallet-content")!;
+    const refreshBtn = document.getElementById("av-wallet-refresh")!;
+
+    const pendingData: { policy?: any; txHistory?: any; lpPositions?: any } = {};
+
+    const fetchWalletData = () => {
+      if (isCdp) {
+        this.net?.send({ type: "get_cdp_wallet", agentId });
+        this.net?.send({ type: "get_cdp_policy", agentId });
+        this.net?.send({ type: "get_cdp_tx_history", agentId });
+        this.net?.send({ type: "get_cdp_lp_positions", agentId });
+      } else if (isCrossmint) {
+        this.net?.send({ type: "get_crossmint_wallet", agentId });
+        this.net?.send({ type: "get_crossmint_policy", agentId });
+        this.net?.send({ type: "get_crossmint_tx_history", agentId });
+      }
+    };
+
+    const renderCdpWallet = (data: { address: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; totalUsdValue?: string; error?: string }) => {
+      if (data.error) {
+        const infoEl = document.getElementById("av-wallet-info");
+        if (infoEl) {
+          infoEl.innerHTML = `<div style="color:#c44;padding:10px;background:rgba(255,200,200,0.3);border-radius:8px;">⚠ ${data.error}</div>`;
+        } else {
+          walletContent.innerHTML = `<div style="color:#c44;padding:10px;background:rgba(255,200,200,0.3);border-radius:8px;">⚠ ${data.error}</div>`;
+        }
+        return;
+      }
+      const addr = data.address ?? "—";
+      const totalUsdLine = data.totalUsdValue ? `<div style="margin-bottom:8px;padding:6px 10px;background:linear-gradient(135deg,rgba(45,170,80,0.15),rgba(45,170,80,0.05));border-radius:8px;border:1px solid rgba(45,170,80,0.3);"><span style="font-size:0.7rem;color:#888;">Total Portfolio Value</span><br><span style="font-size:1.1rem;font-weight:bold;color:#2a8c2a;">$${data.totalUsdValue}</span></div>` : "";
+      const balances = (data.balances ?? []).map(b => `<div style="display:flex;justify-content:space-between;padding:3px 0;"><span style="color:#4a7a9a;">${b.symbol}</span><span style="font-weight:bold;color:#1a6bb0;">${b.amount}${b.usdValue ? ` <span style="color:#888;font-size:0.72rem;">($${b.usdValue})</span>` : ""}</span></div>`).join("");
+      const explorerUrl = `https://explorer.solana.com/address/${addr}?cluster=devnet`;
+      const infoHtml = `
+        <div style="margin-bottom:12px;">
+          <div style="color:#888;font-size:0.7rem;margin-bottom:3px;">Address</div>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span style="font-family:monospace;font-size:0.75rem;color:#1a6bb0;word-break:break-all;">${addr}</span>
+            <button id="av-wallet-copy" style="padding:2px 8px;border:1px solid rgba(255,255,255,0.5);border-radius:10px;background:rgba(255,255,255,0.6);color:#4a7a9a;font-size:0.65rem;cursor:pointer;">⧉</button>
+          </div>
+          <a href="${explorerUrl}" target="_blank" style="color:#2a8cd4;font-size:0.7rem;text-decoration:none;">View on Solana Explorer →</a>
+        </div>
+        ${totalUsdLine}
+        <div style="margin-bottom:12px;">
+          <div style="color:#888;font-size:0.7rem;margin-bottom:3px;">Balances</div>
+          ${balances || '<div style="color:#888;">No balances</div>'}
+        </div>
+      `;
+      const infoEl = document.getElementById("av-wallet-info");
+      if (infoEl) {
+        infoEl.innerHTML = infoHtml;
+      } else {
+        walletContent.innerHTML = `
+          <div id="av-wallet-info">${infoHtml}</div>
+          <div id="av-wallet-lp-section"></div>
+          <div id="av-wallet-policy-section"></div>
+          <div id="av-wallet-tx-section"></div>
+        `;
+      }
+      // Flush any buffered data that arrived before the scaffold existed
+      if (pendingData.lpPositions) renderCdpLpPositions(pendingData.lpPositions);
+      if (pendingData.policy) renderCdpPolicy(pendingData.policy);
+      if (pendingData.txHistory) renderCdpTxHistory(pendingData.txHistory);
+      const copyBtn = document.getElementById("av-wallet-copy");
+      copyBtn?.addEventListener("click", () => {
+        navigator.clipboard?.writeText(addr);
+        (copyBtn as HTMLElement).textContent = "✓";
+        setTimeout(() => { (copyBtn as HTMLElement).textContent = "⧉"; }, 1500);
+      });
+    };
+
+    const renderCdpPolicy = (data: { policyId: string | null; maxSolPerTransfer: number | null; allowedRecipients: string[] | null; blockedRecipients: string[] | null; allowedTokenMints: string[] | null; blockedTokenMints: string[] | null; network: string; error?: string }) => {
+      const section = document.getElementById("av-wallet-policy-section");
+      if (!section) { pendingData.policy = data; return; }
+      if (data.error) { section.innerHTML = ""; return; }
+      section.innerHTML = `
+        <div style="margin-bottom:12px;">
+          <div class="av-wallet-toggle" data-target="av-wallet-policy-body" style="color:#888;font-size:0.7rem;margin-bottom:4px;cursor:pointer;user-select:none;"><span class="av-chevron" style="display:inline-block;transition:transform 0.2s;transform:rotate(-90deg);">▾</span> ⚙ Spending Policy</div>
+          <div id="av-wallet-policy-body" style="display:none;padding:8px;background:rgba(255,255,255,0.4);border-radius:8px;border:1px solid rgba(255,255,255,0.5);">
+            <div style="font-size:0.75rem;color:#4a7a9a;">
+              <div>Max SOL/transfer: <b style="color:#1a6bb0;">${data.maxSolPerTransfer ?? "unlimited"}</b></div>
+              <div>Network: <b style="color:#1a6bb0;">${data.network}</b></div>
+            </div>
+          </div>
+        </div>
+      `;
+      const polToggle = section.querySelector(".av-wallet-toggle");
+      const polBody = section.querySelector("#av-wallet-policy-body") as HTMLElement | null;
+      if (polToggle && polBody) {
+        polToggle.addEventListener("click", () => {
+          const isHidden = polBody.style.display === "none";
+          polBody.style.display = isHidden ? "block" : "none";
+          const ch = polToggle.querySelector(".av-chevron") as HTMLElement | null;
+          if (ch) ch.style.transform = isHidden ? "" : "rotate(-90deg)";
+        });
+      }
+    };
+
+    const renderCdpTxHistory = (data: { transactions: { signature: string; slot: number; blockTime: number | null; err: boolean | null; memo: string | null }[] | null; error?: string }) => {
+      const section = document.getElementById("av-wallet-tx-section");
+      if (!section) { pendingData.txHistory = data; return; }
+      if (data.error || !data.transactions) { section.innerHTML = ""; return; }
+      const txs = data.transactions.slice(0, 10).map(tx => {
+        const time = tx.blockTime ? new Date(tx.blockTime * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
+        const sig = tx.signature.slice(0, 8) + "…" + tx.signature.slice(-4);
+        const status = tx.err ? "✗" : "✓";
+        const statusColor = tx.err ? "#c44" : "#2a8c2a";
+        return `<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:0.72rem;"><span style="color:${statusColor};">${status}</span><span style="color:#888;">${time}</span><span style="font-family:monospace;color:#4a7a9a;">${sig}</span></div>`;
+      }).join("");
+      section.innerHTML = `
+        <div style="margin-bottom:12px;">
+          <div class="av-wallet-toggle" data-target="av-wallet-tx-body" style="color:#888;font-size:0.7rem;margin-bottom:4px;cursor:pointer;user-select:none;"><span class="av-chevron" style="display:inline-block;transition:transform 0.2s;transform:rotate(-90deg);">▾</span> 📜 Recent Transactions</div>
+          <div id="av-wallet-tx-body" style="display:none;max-height:120px;overflow-y:auto;-webkit-overflow-scrolling:touch;">
+            ${txs || '<div style="color:#888;font-size:0.72rem;">No transactions</div>'}
+          </div>
+        </div>
+      `;
+      const txToggle = section.querySelector(".av-wallet-toggle");
+      const txBody = section.querySelector("#av-wallet-tx-body") as HTMLElement | null;
+      if (txToggle && txBody) {
+        txToggle.addEventListener("click", () => {
+          const isHidden = txBody.style.display === "none";
+          txBody.style.display = isHidden ? "block" : "none";
+          const ch = txToggle.querySelector(".av-chevron") as HTMLElement | null;
+          if (ch) ch.style.transform = isHidden ? "" : "rotate(-90deg)";
+        });
+      }
+    };
+
+    const renderCdpLpPositions = (data: { positions: { nftMint: string; poolId: string; liquidity: string; tickLower: number; tickUpper: number; tickCurrent: number; inRange: boolean; explorerUrl: string; symbolA: string; symbolB: string; mintA: string; mintB: string; decimalsA: number; decimalsB: number; priceLower: string; priceUpper: string; priceCurrent: string; amountA: string; amountB: string; feeTier: string; uncollectedFeeA: string; uncollectedFeeB: string; usdValueA?: string; usdValueB?: string; totalUsdValue?: string }[] | null; error?: string }) => {
+      const section = document.getElementById("av-wallet-lp-section");
+      if (!section) { pendingData.lpPositions = data; return; }
+      if (data.error || !data.positions || data.positions.length === 0) {
+        section.innerHTML = `
+          <div style="margin-bottom:8px;">
+            <div style="color:#888;font-size:0.7rem;margin-bottom:4px;">💧 LP Positions</div>
+            <div style="color:#888;font-size:0.72rem;padding:6px;background:rgba(255,255,255,0.3);border-radius:6px;">
+              ${data.error ? data.error : "No LP positions yet. Ask the agent to create a CLMM pool and open a position."}
+            </div>
+          </div>
+        `;
+        return;
+      }
+      const positions = data.positions.map(pos => {
+        const range = pos.tickUpper - pos.tickLower;
+        const currentPct = range > 0 ? Math.max(0, Math.min(100, ((pos.tickCurrent - pos.tickLower) / range) * 100)) : 50;
+        const statusColor = pos.inRange ? "#2a8c2a" : "#c44";
+        const statusText = pos.inRange ? "In Range" : "Out of Range";
+        const shortMint = pos.nftMint.slice(0, 6) + "…" + pos.nftMint.slice(-4);
+        const pair = `${pos.symbolA} / ${pos.symbolB}`;
+        const hasFees = Number(pos.uncollectedFeeA) > 0 || Number(pos.uncollectedFeeB) > 0;
+        const usdLine = pos.totalUsdValue ? `<div style="font-size:0.72rem;color:#2a8c2a;font-weight:bold;margin-bottom:4px;">Position Value: $${pos.totalUsdValue}</div>` : "";
+        return `
+          <div style="padding:8px;background:rgba(255,255,255,0.4);border-radius:8px;border:1px solid rgba(255,255,255,0.5);margin-bottom:6px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+              <span style="font-size:0.78rem;font-weight:bold;color:#1a6bb0;">${pair}</span>
+              <span style="font-size:0.68rem;color:${statusColor};font-weight:bold;">● ${statusText}</span>
+            </div>
+            ${usdLine}
+            <div style="font-size:0.68rem;color:#4a7a9a;margin-bottom:4px;">
+              Fee tier: <b>${pos.feeTier}</b> · Price: <b>${pos.priceLower} — ${pos.priceUpper}</b> <span style="color:#2a8cd4;">(now: ${pos.priceCurrent})</span>
+            </div>
+            <div style="margin-bottom:6px;">
+              <div style="position:relative;height:8px;background:rgba(200,200,200,0.4);border-radius:4px;overflow:hidden;">
+                <div style="position:absolute;left:0;top:0;height:100%;width:${currentPct}%;background:linear-gradient(to right,#5dd55d,#2a8cd4);border-radius:4px;"></div>
+                <div style="position:absolute;left:${currentPct}%;top:-2px;width:2px;height:12px;background:#1a6bb0;"></div>
+              </div>
+            </div>
+            <div style="font-size:0.7rem;color:#4a7a9a;margin-bottom:4px;">
+              Deposited: <b>${pos.amountA} ${pos.symbolA}</b>${pos.usdValueA ? ` <span style="color:#2a8c2a;">($${pos.usdValueA})</span>` : ""} + <b>${pos.amountB} ${pos.symbolB}</b>${pos.usdValueB ? ` <span style="color:#2a8c2a;">($${pos.usdValueB})</span>` : ""}
+            </div>
+            ${hasFees ? `<div style="font-size:0.65rem;color:#2a8c2a;margin-bottom:4px;">Uncollected fees: ${pos.uncollectedFeeA} ${pos.symbolA} + ${pos.uncollectedFeeB} ${pos.symbolB}</div>` : ""}
+            <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;">
+              <button class="av-lp-action" data-action="collect-fees" data-pool="${pos.poolId}" data-mint="${pos.nftMint}" style="padding:3px 8px;border:1px solid rgba(255,255,255,0.5);border-radius:10px;background:linear-gradient(to bottom,rgba(120,200,120,0.6),rgba(80,160,80,0.4));color:#fff;font-size:0.65rem;cursor:pointer;">Collect Fees</button>
+              <button class="av-lp-action" data-action="decrease-liquidity" data-pool="${pos.poolId}" data-mint="${pos.nftMint}" style="padding:3px 8px;border:1px solid rgba(255,255,255,0.5);border-radius:10px;background:linear-gradient(to bottom,rgba(255,180,80,0.6),rgba(220,140,40,0.4));color:#fff;font-size:0.65rem;cursor:pointer;">Decrease Liquidity</button>
+              <button class="av-lp-action" data-action="close-position" data-pool="${pos.poolId}" data-mint="${pos.nftMint}" style="padding:3px 8px;border:1px solid rgba(255,255,255,0.5);border-radius:10px;background:linear-gradient(to bottom,rgba(255,120,120,0.6),rgba(220,80,80,0.4));color:#fff;font-size:0.65rem;cursor:pointer;">Close Position</button>
+              <a href="${pos.explorerUrl}" target="_blank" style="padding:3px 8px;border:1px solid rgba(255,255,255,0.5);border-radius:10px;background:rgba(255,255,255,0.5);color:#4a7a9a;font-size:0.65rem;text-decoration:none;">Explorer →</a>
+              <span style="font-size:0.58rem;color:#888;font-family:monospace;margin-left:auto;">${shortMint}</span>
+            </div>
+          </div>
+        `;
+      }).join("");
+      section.innerHTML = `
+        <div style="margin-bottom:8px;">
+          <div class="av-wallet-toggle" data-target="av-wallet-lp-body" style="color:#888;font-size:0.7rem;margin-bottom:4px;cursor:pointer;user-select:none;"><span class="av-chevron" style="display:inline-block;transition:transform 0.2s;">▾</span> 💧 LP Positions (${data.positions.length})</div>
+          <div id="av-wallet-lp-body">${positions}</div>
+        </div>
+      `;
+      const lpToggle = section.querySelector(".av-wallet-toggle");
+      const lpBody = section.querySelector("#av-wallet-lp-body") as HTMLElement | null;
+      if (lpToggle && lpBody) {
+        lpToggle.addEventListener("click", () => {
+          const isHidden = lpBody.style.display === "none";
+          lpBody.style.display = isHidden ? "block" : "none";
+          const ch = lpToggle.querySelector(".av-chevron") as HTMLElement | null;
+          if (ch) ch.style.transform = isHidden ? "" : "rotate(-90deg)";
+        });
+      }
+      // Wire LP action buttons — send a chat message to the agent
+      section.querySelectorAll(".av-lp-action").forEach(btn => {
+        const el = btn as HTMLElement;
+        el.addEventListener("click", () => {
+          const action = el.dataset.action;
+          const pool = el.dataset.pool;
+          const mint = el.dataset.mint;
+          let msg = "";
+          if (action === "collect-fees") msg = `Collect all accrued fees from my LP position (NFT mint: ${mint}, pool: ${pool}).`;
+          else if (action === "decrease-liquidity") msg = `Decrease liquidity by 50% for my LP position (NFT mint: ${mint}, pool: ${pool}).`;
+          else if (action === "close-position") msg = `Close my LP position (NFT mint: ${mint}, pool: ${pool}) and withdraw all funds.`;
+          if (msg && this.net) {
+            this.net.send({ type: "assign", agentId, task: msg });
+            this.store.toast(`Sent instruction to ${agent.name}`);
+          }
+        });
+      });
+    };
+
+    const renderCrossmintWallet = (data: { address: string | null; chain: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; error?: string }) => {
+      if (data.error) {
+        const infoEl = document.getElementById("av-wallet-info");
+        if (infoEl) {
+          infoEl.innerHTML = `<div style="color:#c44;padding:10px;background:rgba(255,200,200,0.3);border-radius:8px;">⚠ ${data.error}</div>`;
+        } else {
+          walletContent.innerHTML = `<div style="color:#c44;padding:10px;background:rgba(255,200,200,0.3);border-radius:8px;">⚠ ${data.error}</div>`;
+        }
+        return;
+      }
+      const addr = data.address ?? "—";
+      const chain = data.chain ?? "—";
+      const balances = (data.balances ?? []).map(b => `<div style="display:flex;justify-content:space-between;padding:3px 0;"><span style="color:#4a7a9a;">${b.symbol}</span><span style="font-weight:bold;color:#1a6bb0;">${b.amount}${b.usdValue ? ` <span style="color:#888;font-size:0.72rem;">($${b.usdValue})</span>` : ""}</span></div>`).join("");
+      const infoHtml = `
+        <div style="margin-bottom:12px;">
+          <div style="color:#888;font-size:0.7rem;margin-bottom:3px;">Address (${chain})</div>
+          <span style="font-family:monospace;font-size:0.75rem;color:#1a6bb0;word-break:break-all;">${addr}</span>
+        </div>
+        <div style="margin-bottom:12px;">
+          <div style="color:#888;font-size:0.7rem;margin-bottom:3px;">Balances</div>
+          ${balances || '<div style="color:#888;">No balances</div>'}
+        </div>
+      `;
+      const infoEl = document.getElementById("av-wallet-info");
+      if (infoEl) {
+        infoEl.innerHTML = infoHtml;
+      } else {
+        walletContent.innerHTML = `
+          <div id="av-wallet-info">${infoHtml}</div>
+          <div id="av-wallet-policy-section"></div>
+          <div id="av-wallet-tx-section"></div>
+        `;
+      }
+      // Flush any buffered data that arrived before the scaffold existed
+      if (pendingData.policy) renderCdpPolicy(pendingData.policy);
+      if (pendingData.txHistory) renderCdpTxHistory(pendingData.txHistory);
+    };
+
+    // Register listeners
+    if (isCdp) {
+      const onWallet = (msg: any) => { if (msg.agentId === agentId) renderCdpWallet(msg); };
+      const onPolicy = (msg: any) => { if (msg.agentId === agentId) renderCdpPolicy(msg); };
+      const onTxHistory = (msg: any) => { if (msg.agentId === agentId) renderCdpTxHistory(msg); };
+      const onLpPositions = (msg: any) => { if (msg.agentId === agentId) renderCdpLpPositions(msg); };
+      this.store.cdpWalletListeners.push(onWallet);
+      this.store.cdpPolicyListeners.push(onPolicy);
+      this.store.cdpTxHistoryListeners.push(onTxHistory);
+      this.store.cdpLpPositionsListeners.push(onLpPositions);
+      this.agentViewCleanup.push(() => {
+        this.store.cdpWalletListeners = this.store.cdpWalletListeners.filter(f => f !== onWallet);
+        this.store.cdpPolicyListeners = this.store.cdpPolicyListeners.filter(f => f !== onPolicy);
+        this.store.cdpTxHistoryListeners = this.store.cdpTxHistoryListeners.filter(f => f !== onTxHistory);
+        this.store.cdpLpPositionsListeners = this.store.cdpLpPositionsListeners.filter(f => f !== onLpPositions);
+      });
+    } else if (isCrossmint) {
+      const onWallet = (msg: any) => { if (msg.agentId === agentId) renderCrossmintWallet(msg); };
+      this.store.crossmintWalletListeners.push(onWallet);
+      this.agentViewCleanup.push(() => {
+        this.store.crossmintWalletListeners = this.store.crossmintWalletListeners.filter(f => f !== onWallet);
+      });
+    }
+
+    refreshBtn.addEventListener("click", fetchWalletData);
+    this.agentViewCleanup.push(() => {
+      refreshBtn.removeEventListener("click", fetchWalletData);
+    });
+
+    // Initial fetch
+    fetchWalletData();
+  }
+
+  /** Render the Screen tab — live browser screenshot with dashboard fallback. */
+  private renderAgentScreenTab(agent: AgentInfo): string {
+    const serverOrigin = window.location.origin;
+    const authToken = getToken();
+    const tokenParam = authToken ? `&token=${encodeURIComponent(authToken)}` : "";
+    const cachedFrame = this.agentLastFrame;
+    const cachedUrl = this.agentLastFrameUrl ?? "—";
+    const imgSrc = cachedFrame
+      ? `data:image/jpeg;base64,${cachedFrame}`
+      : `${serverOrigin}/api/agent-screenshot/${agent.id}?t=${Date.now()}${tokenParam}`;
+    const imgDisplay = cachedFrame ? "block" : "none";
+    const placeholderDisplay = cachedFrame ? "none" : "flex";
+    return `
+      <div style="width:100%;height:100%;display:flex;flex-direction:column;font-family:'Segoe UI',Tahoma,sans-serif;color:#1a3a5a;font-size:0.8rem;min-height:0;">
+        <div style="flex:1;position:relative;background:linear-gradient(to bottom,#b8e0f8,#7ec8ee,#5fb8e8);overflow:hidden;min-height:0;">
+          <img id="agent-view-screen-img" src="${imgSrc}"
+            style="display:${imgDisplay};width:100%;height:100%;object-fit:contain;image-rendering:auto;"
+            onerror="this.style.display='none';document.getElementById('agent-view-screen-placeholder').style.display='flex';"
+            onload="this.style.display='block';document.getElementById('agent-view-screen-placeholder').style.display='none';"
+          />
+          <div id="agent-view-screen-placeholder" style="position:absolute;inset:0;display:${placeholderDisplay};flex-direction:column;align-items:center;justify-content:center;color:#1a6bb0;gap:10px;text-shadow:0 1px 2px rgba(255,255,255,0.6);">
+            <div style="font-size:2.5rem;filter:drop-shadow(0 2px 4px rgba(0,80,160,0.2));">🖥️</div>
+            <div style="font-size:0.85rem;color:#1a6bb0;">Waiting for ${agent.name} to open a browser…</div>
+            <div style="font-size:0.7rem;color:#3a8cb8;">The agent can use the <code style="color:#1a6bb0;background:rgba(255,255,255,0.5);padding:2px 6px;border-radius:4px;border:1px solid rgba(255,255,255,0.6);">browse_url</code> tool to navigate to websites.</div>
+          </div>
+        </div>
+        <div style="flex-shrink:0;padding:6px 14px;background:linear-gradient(to bottom,rgba(255,255,255,0.6),rgba(220,240,255,0.4));backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border-top:1px solid rgba(255,255,255,0.4);display:flex;align-items:center;gap:8px;">
+          <span style="color:#4a7a9a;font-size:0.7rem;">URL:</span>
+          <span id="agent-view-url" style="color:#1a6bb0;font-size:0.7rem;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${cachedUrl}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  /** Render an HTML dashboard for an agent — shown when no live screenshot is available. */
+  private renderAgentDashboard(agent: AgentInfo): string {
+    const statusColor: Record<string, string> = {
+      idle: "#888",
+      thinking: "#4a8cd4",
+      working: "#44cc66",
+      done: "#66aa44",
+      error: "#cc4444",
+    };
+    const sc = statusColor[agent.status] ?? "#888";
+    const mcpCount = agent.mcpServers?.length ?? 0;
+    const moodEmoji: Record<string, string> = {
+      content: "😊",
+      focused: "🤓",
+      bored: "😐",
+      frustrated: "😤",
+      excited: "🤩",
+      anxious: "😰",
+      proud: "😎",
+    };
+    const mood = agent.mood ? (moodEmoji[agent.mood] ?? "🤖") : "🤖";
+
+    // Resolve sprite image for the dashboard header
+    let spriteImg: string;
+    if (agent.appearance) {
+      spriteImg = generateCharPreviewDataURL(agent.appearance, 3);
+    } else if (agent.id === OFFICE_MANAGER_ID) {
+      spriteImg = "assets/characters/char-office-manager.png";
+    } else if (agent.id === HERMES_ID) {
+      spriteImg = "assets/characters/char-hermes.png";
+    } else {
+      spriteImg = `assets/characters/char-${agent.sprite}.png`;
+    }
+
+    // Resolve MCP server icons (from config or catalog fallback)
+    const mcpBadges = (agent.mcpServers ?? []).map(s => {
+      const icon = s.icon ?? (s.url ? getServerByUrl(s.url)?.icon : undefined);
+      const name = s.name ?? s.command ?? "unknown";
+      let iconHtml: string;
+      if (icon && icon.startsWith("<svg")) {
+        iconHtml = `<span style="width:14px;height:14px;display:inline-flex;align-items:center;justify-content:center;">${icon.replace(/<svg/, '<svg width="14" height="14"')}</span>`;
+      } else if (icon && icon.startsWith("http")) {
+        const letter = name.charAt(0).toUpperCase();
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14"><rect width="14" height="14" rx="2" fill="#1a2a3a"/><text x="7" y="10" text-anchor="middle" font-family="sans-serif" font-size="9" font-weight="bold" fill="#6aaadf">${letter}</text></svg>`;
+        const fallback = `data:image/svg+xml,${encodeURIComponent(svg)}`;
+        iconHtml = `<img src="${icon}" style="width:14px;height:14px;object-fit:contain;" onerror="this.onerror=null;this.src='${fallback}'" />`;
+      } else {
+        iconHtml = `<span style="font-size:0.6rem;">🔌</span>`;
+      }
+      return `<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(180,220,250,0.4);padding:3px 10px;border-radius:12px;color:#1a6bb0;font-size:0.7rem;border:1px solid rgba(255,255,255,0.4);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);">${iconHtml}${name}</span>`;
+    }).join("");
+
+    return `
+      <div style="width:100%;height:100%;display:flex;flex-direction:column;font-family:'Segoe UI',Tahoma,sans-serif;color:#1a3a5a;font-size:0.8rem;">
+        <!-- Header bar -->
+        <div style="display:flex;align-items:center;gap:12px;padding:12px 16px;background:linear-gradient(to bottom,rgba(120,180,240,0.5),rgba(80,150,220,0.3));backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border-bottom:1px solid rgba(255,255,255,0.4);">
+          <div style="position:relative;width:48px;height:48px;flex-shrink:0;filter:drop-shadow(0 2px 4px rgba(0,80,160,0.2));">
+            <img src="${spriteImg}" style="width:48px;height:48px;object-fit:contain;image-rendering:pixelated;" />
+            <div style="position:absolute;bottom:-2px;right:-2px;font-size:1rem;">${mood}</div>
+          </div>
+          <div>
+            <div style="color:${agent.accent};font-size:1.1rem;font-weight:bold;text-shadow:0 1px 2px rgba(255,255,255,0.5);">${agent.name}</div>
+          </div>
+          <div style="margin-left:auto;display:flex;align-items:center;gap:6px;">
+            <div style="width:8px;height:8px;border-radius:50%;background:${sc};box-shadow:0 0 8px ${sc};"></div>
+            <span style="color:${sc};font-size:0.75rem;text-transform:uppercase;text-shadow:0 1px 2px rgba(255,255,255,0.3);">${agent.status}</span>
+          </div>
+        </div>
+
+        <!-- Body -->
+        <div style="flex:1;display:flex;gap:1px;background:rgba(180,210,240,0.3);">
+          <!-- Left panel: stats -->
+          <div style="flex:1;padding:16px;background:linear-gradient(to bottom,rgba(255,255,255,0.85),rgba(245,250,255,0.75));">
+            <div style="color:#4a7a9a;font-size:0.65rem;text-transform:uppercase;margin-bottom:8px;text-shadow:0 1px 0 rgba(255,255,255,0.5);">Performance</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+              <div style="background:rgba(220,240,255,0.5);padding:12px;border-radius:8px;border:1px solid rgba(255,255,255,0.4);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);">
+                <div style="color:#7aaac0;font-size:0.65rem;">Tasks Done</div>
+                <div style="color:#3aaa3a;font-size:1.4rem;font-weight:bold;text-shadow:0 1px 0 rgba(255,255,255,0.5);">${agent.tasksDone}</div>
+              </div>
+              <div style="background:rgba(220,240,255,0.5);padding:12px;border-radius:8px;border:1px solid rgba(255,255,255,0.4);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);">
+                <div style="color:#7aaac0;font-size:0.65rem;">Role</div>
+                <div style="color:#8855cc;font-size:1rem;font-weight:bold;text-transform:capitalize;text-shadow:0 1px 0 rgba(255,255,255,0.5);">${agent.role}</div>
+              </div>
+              <div style="background:rgba(220,240,255,0.5);padding:12px;border-radius:8px;border:1px solid rgba(255,255,255,0.4);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);">
+                <div style="color:#7aaac0;font-size:0.65rem;">Desk</div>
+                <div style="color:#1a3a5a;font-size:1rem;">#${agent.deskIndex}</div>
+              </div>
+              <div style="background:rgba(220,240,255,0.5);padding:12px;border-radius:8px;border:1px solid rgba(255,255,255,0.4);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);">
+                <div style="color:#7aaac0;font-size:0.65rem;">Mood</div>
+                <div style="color:#1a3a5a;font-size:1rem;text-transform:capitalize;">${agent.mood ?? "neutral"}</div>
+              </div>
+            </div>
+
+            <div style="color:#4a7a9a;font-size:0.65rem;text-transform:uppercase;margin:16px 0 8px;text-shadow:0 1px 0 rgba(255,255,255,0.5);">MCP Servers (${mcpCount})</div>
+            <div style="display:flex;flex-wrap:wrap;gap:4px;">
+              ${mcpCount > 0
+                ? mcpBadges
+                : `<span style="color:#7aaac0;font-size:0.7rem;">No MCP servers configured</span>`}
+            </div>
+
+            ${agent.personality ? `
+            <div style="color:#4a7a9a;font-size:0.65rem;text-transform:uppercase;margin:16px 0 8px;text-shadow:0 1px 0 rgba(255,255,255,0.5);">Personality</div>
+            <div style="display:flex;flex-direction:column;gap:5px;">
+              ${[
+                ["Openness", agent.personality.openness],
+                ["Conscientiousness", agent.personality.conscientiousness],
+                ["Extraversion", agent.personality.extraversion],
+                ["Agreeableness", agent.personality.agreeableness],
+                ["Neuroticism", agent.personality.neuroticism],
+              ].map(([label, val]) => `
+                <div style="display:flex;align-items:center;gap:8px;">
+                  <span style="color:#7aaac0;font-size:0.65rem;width:110px;">${label}</span>
+                  <div style="flex:1;height:8px;background:rgba(220,235,250,0.5);border-radius:4px;overflow:hidden;border:1px solid rgba(255,255,255,0.3);box-shadow:inset 0 1px 2px rgba(0,60,140,0.1);">
+                    <div style="width:${Math.round((val as number) * 100)}%;height:100%;background:linear-gradient(to right,${agent.accent},rgba(120,180,240,0.8));border-radius:4px;box-shadow:0 0 4px ${agent.accent}55;"></div>
+                  </div>
+                </div>
+              `).join("")}
+            </div>` : ""}
+          </div>
+
+          <!-- Right panel: current task + system prompt -->
+          <div style="flex:1;padding:16px;background:linear-gradient(to bottom,rgba(255,255,255,0.85),rgba(245,250,255,0.75));display:flex;flex-direction:column;">
+            <div style="color:#4a7a9a;font-size:0.65rem;text-transform:uppercase;margin-bottom:8px;text-shadow:0 1px 0 rgba(255,255,255,0.5);">Current Task</div>
+            <div style="background:rgba(220,240,255,0.5);padding:14px;border-radius:8px;flex:1;overflow-y:auto;color:#1a3a5a;font-size:0.8rem;line-height:1.4;border:1px solid rgba(255,255,255,0.4);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);text-shadow:0 1px 0 rgba(255,255,255,0.3);">
+              ${agent.task ? agent.task : `<span style="color:#7aaac0;">No active task — agent is idle and ready for work.</span>`}
+            </div>
+
+            <div style="color:#4a7a9a;font-size:0.65rem;text-transform:uppercase;margin:12px 0 8px;text-shadow:0 1px 0 rgba(255,255,255,0.5);display:flex;align-items:center;justify-content:space-between;">
+              <span>System Prompt</span>
+              <div style="display:flex;gap:4px;">
+                <button id="av-stats-prompt-edit" style="padding:2px 10px;border:1px solid rgba(255,255,255,0.5);border-radius:12px;background:linear-gradient(to bottom,rgba(255,255,255,0.8),rgba(220,240,255,0.5));color:#1a6bb0;font-size:0.65rem;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.6);">Edit</button>
+                <button id="av-stats-prompt-save" style="display:none;padding:2px 10px;border:1px solid rgba(255,255,255,0.4);border-radius:12px;background:linear-gradient(to bottom,rgba(120,220,120,0.7),rgba(60,180,80,0.5));color:#fff;font-size:0.65rem;cursor:pointer;text-shadow:0 1px 2px rgba(20,100,30,0.3);box-shadow:inset 0 1px 0 rgba(255,255,255,0.4);">Save</button>
+                <button id="av-stats-prompt-cancel" style="display:none;padding:2px 10px;border:1px solid rgba(255,255,255,0.5);border-radius:12px;background:linear-gradient(to bottom,rgba(255,255,255,0.8),rgba(220,240,255,0.5));color:#4a7a9a;font-size:0.65rem;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.6);">Cancel</button>
+              </div>
+            </div>
+            <div id="av-stats-prompt-display" style="background:rgba(220,240,255,0.5);padding:14px;border-radius:8px;max-height:120px;overflow-y:auto;color:#4a7a9a;font-size:0.7rem;line-height:1.4;border:1px solid rgba(255,255,255,0.4);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);">
+              ${agent.systemPrompt ? agent.systemPrompt.slice(0, 500) + (agent.systemPrompt.length > 500 ? "…" : "") : `<span style="color:#a0c0d8;">No custom system prompt set.</span>`}
+            </div>
+            <textarea id="av-stats-prompt-editor" style="display:none;max-height:120px;min-height:80px;padding:14px;background:rgba(255,255,255,0.9);color:#1a3a5a;font-size:0.7rem;line-height:1.4;border:1px solid rgba(255,255,255,0.4);border-radius:8px;font-family:'Segoe UI',Tahoma,sans-serif;resize:vertical;outline:none;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);" spellcheck="false" placeholder="Standing instructions for this agent, e.g. 'You are a senior TypeScript reviewer. Always write tests first.'"></textarea>
+          </div>
+        </div>
+
+        <!-- Footer -->
+        <div style="padding:8px 16px;background:linear-gradient(to bottom,rgba(255,255,255,0.6),rgba(220,240,255,0.4));backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border-top:1px solid rgba(255,255,255,0.4);display:flex;justify-content:space-between;align-items:center;">
+          <span style="color:#7aaac0;font-size:0.65rem;">Agent ID: ${agent.id.slice(0, 8)}…</span>
+          <span style="color:#7aaac0;font-size:0.65rem;">Live browser feed will appear here when available</span>
+        </div>
+      </div>
+    `;
+  }
+
+  /** Close the agent view modal and stop the screenshot stream. */
+  private closeAgentViewModal(): void {
+    if (this.agentViewAgentId && this.net) {
+      this.net.send({ type: "agent_view_stop", agentId: this.agentViewAgentId });
+      this.net.send({ type: "agent_log_unsubscribe", agentId: this.agentViewAgentId });
+    }
+    // Clean up tab listeners
+    for (const cleanup of this.agentViewCleanup) cleanup();
+    this.agentViewCleanup = [];
+    this.agentViewAgentId = null;
+    this.agentFsCurrentFile = null;
+    document.getElementById("agent-view-modal")?.remove();
+  }
+
+  /** Render an agent screenshot frame onto the projector canvas. */
+  private updateProjectorAgentFrame(frame: string): void {
+    // Hide YouTube iframe and HTML iframe if visible
+    if (this.projectorIframe) this.projectorIframe.style.display = "none";
+    this.hideProjectorHtmlIframe();
+
+    const img = new Image();
+    img.onload = () => {
+      // Create or update texture
+      if (!this.textures.exists(this.projectorAgentTextureKey)) {
+        const tex = this.textures.createCanvas(this.projectorAgentTextureKey, 480, 288);
+        if (!tex) return;
+      }
+      const tex = this.textures.get(this.projectorAgentTextureKey) as Phaser.Textures.CanvasTexture;
+      const canvas = tex.getSourceImage() as HTMLCanvasElement;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.clearRect(0, 0, 480, 288);
+      // Draw screenshot scaled to projector size
+      const scale = Math.min(480 / img.width, 288 / img.height);
+      const dw = img.width * scale;
+      const dh = img.height * scale;
+      const dx = (480 - dw) / 2;
+      const dy = (288 - dh) / 2;
+      ctx.drawImage(img, dx, dy, dw, dh);
+      tex.refresh();
+
+      // Draw or update the image on the projector
+      if (!this.projectorAgentImage) {
+        const px = this.projectorTile.x * TILE_PX + 32;
+        const py = this.projectorTile.y * TILE_PX - 100;
+        this.projectorAgentImage = this.add.image(px, py, this.projectorAgentTextureKey).setDepth(3);
+      }
+      this.projectorAgentImage.setVisible(true);
+    };
+    img.src = `data:image/jpeg;base64,${frame}`;
+  }
+
+  /** Hide the agent frame on the projector. */
+  private hideProjectorAgentFrame(): void {
+    if (this.projectorAgentImage) this.projectorAgentImage.setVisible(false);
+  }
+
+  /** Show an agent's HTML file on the projector as an interactive iframe. */
+  private showProjectorHtmlIframe(relativePath: string): void {
+    // Hide YouTube iframe and agent canvas frame
+    if (this.projectorIframe) this.projectorIframe.style.display = "none";
+    this.hideProjectorAgentFrame();
+
+    // Build full URL with auth token
+    const token = getToken();
+    const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
+    const fullUrl = `${window.location.origin}${relativePath}${tokenParam}`;
+
+    if (!this.projectorHtmlIframe) {
+      this.projectorHtmlIframe = document.createElement("iframe");
+      this.projectorHtmlIframe.style.cssText = `
+        position: fixed;
+        border: none;
+        pointer-events: auto;
+        z-index: 5;
+        border-radius: 3px;
+        display: none;
+      `;
+      this.projectorHtmlIframe.setAttribute("frameborder", "0");
+      this.projectorHtmlIframe.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms");
+      document.body.appendChild(this.projectorHtmlIframe);
+    }
+
+    this.projectorHtmlIframe.src = fullUrl;
+
+    // Position over the projector screen
+    const px = this.projectorTile.x * TILE_PX + 32;
+    const py = this.projectorTile.y * TILE_PX - 100;
+    const sw = 480;
+    const sh = 288;
+    const rect = this.worldRectToScreen(px - sw / 2, py - sh / 2, sw, sh);
+    this.projectorHtmlIframe.style.left = `${rect.x}px`;
+    this.projectorHtmlIframe.style.top = `${rect.y}px`;
+    this.projectorHtmlIframe.style.width = `${rect.w}px`;
+    this.projectorHtmlIframe.style.height = `${rect.h}px`;
+    this.projectorHtmlIframe.style.display = "block";
+  }
+
+  /** Hide the agent HTML iframe on the projector. */
+  private hideProjectorHtmlIframe(): void {
+    if (this.projectorHtmlIframe) {
+      this.projectorHtmlIframe.src = "about:blank";
+      this.projectorHtmlIframe.style.display = "none";
+    }
+  }
+
+  // ── Phone booth + webcam/screen share video overlay ──────────────────
+
+  /** Draw a wall-mounted screen share station next to the projector. */
+  private drawScreenShareStation(): void {
+    const px = this.screenShareTile.x * TILE_PX + 32;
+    const py = this.screenShareTile.y * TILE_PX + 32;
+    this.screenShareGfx = this.add.graphics().setDepth(3);
+
+    // mounting plate — dark anodized
+    this.screenShareGfx.fillStyle(0x12121a, 1);
+    this.screenShareGfx.fillRoundedRect(px - 21, py - 17, 42, 34, 5);
+    this.screenShareGfx.fillStyle(0x2a2a36, 1);
+    this.screenShareGfx.fillRoundedRect(px - 19, py - 15, 38, 30, 4);
+    // metallic trim
+    this.screenShareGfx.lineStyle(0.8, 0x4a4a56, 0.4);
+    this.screenShareGfx.strokeRoundedRect(px - 19, py - 15, 38, 30, 4);
+
+    // small screen display — dark with blue tint
+    this.screenShareGfx.fillStyle(0x0a0a14, 1);
+    this.screenShareGfx.fillRoundedRect(px - 15, py - 11, 30, 13, 2);
+    // screen glow
+    this.screenShareGfx.fillStyle(0x4a8cd4, 0.08);
+    this.screenShareGfx.fillRoundedRect(px - 15, py - 11, 30, 13, 2);
+    // monitor icon (screen with arrow) — modern flat
+    this.screenShareGfx.fillStyle(0x4a8cd4, 1);
+    this.screenShareGfx.fillRoundedRect(px - 9, py - 8, 12, 7, 1);
+    this.screenShareGfx.fillStyle(0x2a4868, 1);
+    this.screenShareGfx.fillRect(px - 7, py - 6, 8, 2);
+    // share arrow indicator
+    this.screenShareGfx.fillStyle(0x88ccff, 0.6);
+    this.screenShareGfx.fillRect(px + 4, py - 7, 2, 3);
+    this.screenShareGfx.fillRect(px + 3, py - 6, 4, 1);
+
+    // share button (green when sharing, gray when not) — with depth
+    this.screenShareGfx.fillStyle(0x444444, 1);
+    this.screenShareGfx.fillRoundedRect(px - 13, py + 4, 26, 9, 2);
+    this.screenShareGfx.fillStyle(0x666666, 1);
+    this.screenShareGfx.fillRoundedRect(px - 13, py + 4, 26, 7, 2);
+    this.screenShareGfx.fillStyle(0xffffff, 0.1);
+    this.screenShareGfx.fillRoundedRect(px - 13, py + 4, 26, 1.5, 2);
+
+    // screws — brushed
+    this.screenShareGfx.fillStyle(0x666670, 1);
+    this.screenShareGfx.fillCircle(px - 16, py - 13, 1.5);
+    this.screenShareGfx.fillCircle(px + 16, py - 13, 1.5);
+    this.screenShareGfx.fillCircle(px - 16, py + 13, 1.5);
+    this.screenShareGfx.fillCircle(px + 16, py + 13, 1.5);
+    this.screenShareGfx.fillStyle(0xaaaab4, 0.5);
+    this.screenShareGfx.fillCircle(px - 16.5, py - 13.5, 0.7);
+    this.screenShareGfx.fillCircle(px + 15.5, py - 13.5, 0.7);
+    this.screenShareGfx.fillCircle(px - 16.5, py + 12.5, 0.7);
+    this.screenShareGfx.fillCircle(px + 15.5, py + 12.5, 0.7);
+  }
+
+  /** Draw the phone booth near the projector in the top-left corner. */
+  private drawPhoneBooth(): void {
+    const px = this.phoneBoothTile.x * TILE_PX + 32;
+    const py = this.phoneBoothTile.y * TILE_PX + 32;
+    this.phoneBoothGfx = this.add.graphics().setDepth(2);
+
+    // contact shadow
+    this.phoneBoothGfx.fillStyle(0x000000, 0.25);
+    this.phoneBoothGfx.fillEllipse(px, py + 28, 46, 10);
+
+    // booth body (back panel) — dark modern
+    this.phoneBoothGfx.fillStyle(0x0a0a12, 1);
+    this.phoneBoothGfx.fillRoundedRect(px - 23, py - 31, 46, 62, 5);
+    this.phoneBoothGfx.fillStyle(0x1a1a28, 1);
+    this.phoneBoothGfx.fillRoundedRect(px - 21, py - 29, 42, 58, 4);
+    // metallic trim
+    this.phoneBoothGfx.lineStyle(0.8, 0x3a3a48, 0.5);
+    this.phoneBoothGfx.strokeRoundedRect(px - 21, py - 29, 42, 58, 4);
+
+    // interior (dark)
+    this.phoneBoothGfx.fillStyle(0x050508, 1);
+    this.phoneBoothGfx.fillRoundedRect(px - 17, py - 25, 34, 50, 3);
+
+    // door frame — subtle metallic
+    this.phoneBoothGfx.lineStyle(1.5, 0x2a2a36, 1);
+    this.phoneBoothGfx.strokeRoundedRect(px - 17, py - 25, 34, 50, 3);
+
+    // small camera lens at top — modern
+    this.phoneBoothGfx.fillStyle(0x050508, 1);
+    this.phoneBoothGfx.fillCircle(px, py - 21, 4);
+    this.phoneBoothGfx.fillStyle(0x1a1a28, 1);
+    this.phoneBoothGfx.fillCircle(px, py - 21, 3);
+    this.phoneBoothGfx.fillStyle(0x4a8cd4, 0.8);
+    this.phoneBoothGfx.fillCircle(px, py - 21, 1.5);
+    this.phoneBoothGfx.fillStyle(0x88ccff, 0.4);
+    this.phoneBoothGfx.fillCircle(px - 0.5, py - 21.5, 0.7);
+
+    // "ON AIR" light (off by default)
+    this.phoneBoothLight = this.add.graphics().setDepth(3);
+    this.updatePhoneBoothVisual(false);
+
+    // roof / sign — dark anodized
+    this.phoneBoothGfx.fillStyle(0x12121a, 1);
+    this.phoneBoothGfx.fillRoundedRect(px - 25, py - 37, 50, 9, 3);
+    this.phoneBoothGfx.fillStyle(0x2a2a36, 1);
+    this.phoneBoothGfx.fillRoundedRect(px - 23, py - 35, 46, 5, 2);
+    // metallic trim on sign
+    this.phoneBoothGfx.lineStyle(0.8, 0x4a4a56, 0.4);
+    this.phoneBoothGfx.strokeRoundedRect(px - 23, py - 35, 46, 5, 2);
+  }
+
+  /** Update the phone booth ON AIR light. */
+  private updatePhoneBoothVisual(broadcasting: boolean): void {
+    if (!this.phoneBoothLight) return;
+    this.phoneBoothLight.clear();
+    const px = this.phoneBoothTile.x * TILE_PX + 32;
+    const py = this.phoneBoothTile.y * TILE_PX + 32;
+    if (broadcasting) {
+      // glowing red ON AIR light
+      this.phoneBoothLight.fillStyle(0xff3333, 0.3);
+      this.phoneBoothLight.fillCircle(px, py - 32, 8);
+      this.phoneBoothLight.fillStyle(0xff3333, 1);
+      this.phoneBoothLight.fillCircle(px, py - 32, 4);
+      this.phoneBoothLight.fillStyle(0xffaaaa, 0.8);
+      this.phoneBoothLight.fillCircle(px - 1, py - 33, 1.5);
+    } else {
+      // dim light
+      this.phoneBoothLight.fillStyle(0x333333, 1);
+      this.phoneBoothLight.fillCircle(px, py - 32, 4);
+    }
+  }
+
+  // ── Presenter video management ─────────────────────────────────────
+
+  private presenterKey(userId: string, type: "screen" | "webcam"): string {
+    return `${userId}:${type}`;
+  }
+
+  /** Attach a remote presenter stream to a video element for projector display. */
+  private attachPresenterStream(userId: string, type: "screen" | "webcam", stream: MediaStream): void {
+    const key = this.presenterKey(userId, type);
+    let entry = this.presenterVideoEls.get(key);
+    if (!entry) {
+      const wrap = document.createElement("div");
+      wrap.style.cssText = "position:fixed;border:none;pointer-events:none;z-index:51;border-radius:3px;display:none;overflow:hidden;";
+      const video = document.createElement("video");
+      video.autoplay = true;
+      video.playsInline = true;
+      video.muted = true; // muted by default; unmuted only for focused presenter
+      video.style.cssText = "position:absolute;top:0;left:0;width:100%;height:100%;display:block;border:none;";
+      video.style.objectFit = type === "screen" ? "contain" : "cover";
+      wrap.appendChild(video);
+      document.body.appendChild(wrap);
+      entry = { video, wrap };
+      this.presenterVideoEls.set(key, entry);
+    }
+    entry.video.srcObject = stream;
+    entry.wrap.style.display = "block";
+    this.updateProjectorVideoOverlays();
+  }
+
+  /** Detach a specific presenter's video element. */
+  private detachPresenterStream(userId: string, type: "screen" | "webcam"): void {
+    const key = this.presenterKey(userId, type);
+    const entry = this.presenterVideoEls.get(key);
+    if (entry) {
+      entry.video.srcObject = null;
+      entry.wrap.style.display = "none";
+      entry.wrap.remove();
+      this.presenterVideoEls.delete(key);
+    }
+    if (this.focusedPresenterKey === key) {
+      this.focusedPresenterKey = null;
+    }
+    this.mutedPresenterKeys.delete(key);
+    this.updateProjectorVideoOverlays();
+  }
+
+  /** Detach all presenter video elements. */
+  private detachAllPresenterStreams(): void {
+    for (const [, entry] of this.presenterVideoEls) {
+      entry.video.srcObject = null;
+      entry.wrap.remove();
+    }
+    this.presenterVideoEls.clear();
+    this.focusedPresenterKey = null;
+    this.mutedPresenterKeys.clear();
+    this.hidePresenterExpandBtn();
+  }
+
+  /** Handle a presenters_update from the server: sync WebRTC peers + video elements. */
+  private onPresentersUpdate(presenters: Presenter[]): void {
+    const oldPresenters = this.presenters;
+    this.presenters = presenters;
+
+    // Track webcam presenter for phone booth hint
+    const webcamP = presenters.find(p => p.type === "webcam");
+    this.webcamPresenterId = webcamP?.userId ?? null;
+    this.webcamPresenterName = webcamP?.name ?? null;
+
+    // Determine which presenters are new vs gone
+    const newKeys = new Set(presenters.map(p => this.presenterKey(p.userId, p.type)));
+    const oldKeys = new Set(oldPresenters.map(p => this.presenterKey(p.userId, p.type)));
+
+    // Initiate WebRTC for new presenters (unless it's me)
+    for (const p of presenters) {
+      const key = this.presenterKey(p.userId, p.type);
+      if (oldKeys.has(key)) continue;
+      if (p.userId === this._myUserId) continue;
+      if (p.type === "screen") {
+        this.screenShare?.onSharerPeer(p.userId, p.name);
+      } else {
+        this.webcam?.onBroadcasterPeer(p.userId, p.name);
+      }
+    }
+
+    // Clean up WebRTC + video for departed presenters
+    for (const old of oldPresenters) {
+      const key = this.presenterKey(old.userId, old.type);
+      if (newKeys.has(key)) continue;
+      if (old.type === "screen") {
+        this.screenShare?.onPeerLeft(old.userId);
+      } else {
+        this.webcam?.onPeerLeft(old.userId);
+      }
+      this.detachPresenterStream(old.userId, old.type);
+    }
+
+    this.updateProjectorVideoOverlays();
+  }
+
+  /** Update positions of presenter video overlays on the projector.
+   *  Supports 1-4 presenters in a grid, plus focus mode. */
+  private updateProjectorVideoOverlays(): void {
+    const px = this.projectorTile.x * TILE_PX + 32;
+    const py = this.projectorTile.y * TILE_PX - 100;
+    const sw = 480;
+    const sh = 288;
+
+    const visiblePresenters = this.presenters.filter(p => {
+      const key = this.presenterKey(p.userId, p.type);
+      // Skip presenter that's currently in the expanded view modal
+      if (this.expandedView?.isOpen && this.expandedView.expandedTabKey === key) return false;
+      return this.presenterVideoEls.has(key) && this.presenterVideoEls.get(key)!.wrap.style.display !== "none";
+    });
+
+    if (visiblePresenters.length === 0) {
+      this.hidePresenterExpandBtn();
+      return;
+    }
+
+    // Track the main video rect for the expand button
+    let mainRect: { x: number; y: number; w: number; h: number } | null = null;
+    let mainPresenter: Presenter | null = null;
+
+    // Helper: set wrap position only if changed (avoids layout thrash from redundant DOM writes)
+    const setWrapRect = (wrap: HTMLDivElement, x: number, y: number, w: number, h: number) => {
+      const s = wrap.style;
+      const lx = `${x}px`, ly = `${y}px`, lw = `${w}px`, lh = `${h}px`;
+      if (s.left !== lx) s.left = lx;
+      if (s.top !== ly) s.top = ly;
+      if (s.width !== lw) s.width = lw;
+      if (s.height !== lh) s.height = lh;
+    };
+
+    // Apply mute state: focused presenter is unmuted, all others muted
+    for (const [key, entry] of this.presenterVideoEls) {
+      const isFocused = this.focusedPresenterKey === key;
+      const isMuted = this.mutedPresenterKeys.has(key);
+      entry.video.muted = isFocused ? false : !isMuted;
+      if (isFocused) {
+        entry.video.style.outline = "2px solid #4af";
+      } else {
+        entry.video.style.outline = "none";
+      }
+    }
+
+    const focusKey = this.focusedPresenterKey;
+    if (focusKey) {
+      // Focus mode: one large video, others in a strip at the bottom
+      const focused = visiblePresenters.find(p => this.presenterKey(p.userId, p.type) === focusKey);
+      const others = visiblePresenters.filter(p => this.presenterKey(p.userId, p.type) !== focusKey);
+
+      if (focused) {
+        const key = this.presenterKey(focused.userId, focused.type);
+        const entry = this.presenterVideoEls.get(key)!;
+        const mainH = others.length > 0 ? sh - 50 : sh;
+        const rect = this.worldRectToScreen(px - sw / 2, py - sh / 2, sw, mainH);
+        setWrapRect(entry.wrap, rect.x, rect.y, rect.w, rect.h);
+        mainRect = rect;
+        mainPresenter = focused;
+      }
+
+      // Small thumbnails for others
+      const thumbW = sw / Math.max(others.length, 1);
+      others.forEach((p, i) => {
+        const key = this.presenterKey(p.userId, p.type);
+        const entry = this.presenterVideoEls.get(key)!;
+        const rect = this.worldRectToScreen(px - sw / 2 + i * thumbW, py - sh / 2 + sh - 50, thumbW, 50);
+        setWrapRect(entry.wrap, rect.x, rect.y, rect.w, rect.h);
+      });
+      this.positionPresenterExpandBtn(mainRect, mainPresenter);
+      return;
+    }
+
+    // Grid layout based on count
+    const n = visiblePresenters.length;
+    let cols: number, rows: number;
+    if (n <= 1) { cols = 1; rows = 1; }
+    else if (n <= 2) { cols = 2; rows = 1; }
+    else if (n <= 4) { cols = 2; rows = 2; }
+    else { cols = 2; rows = Math.ceil(n / 2); }
+
+    const cellW = sw / cols;
+    const cellH = sh / rows;
+
+    visiblePresenters.forEach((p, i) => {
+      const key = this.presenterKey(p.userId, p.type);
+      const entry = this.presenterVideoEls.get(key)!;
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const rect = this.worldRectToScreen(
+        px - sw / 2 + col * cellW,
+        py - sh / 2 + row * cellH,
+        cellW,
+        cellH,
+      );
+      setWrapRect(entry.wrap, rect.x, rect.y, rect.w, rect.h);
+      // Track the first presenter for the expand button
+      if (i === 0) {
+        mainRect = rect;
+        mainPresenter = p;
+      }
+    });
+    this.positionPresenterExpandBtn(mainRect, mainPresenter);
+  }
+
+  /** Position the expand button over the main presenter video. */
+  private positionPresenterExpandBtn(
+    rect: { x: number; y: number; w: number; h: number } | null,
+    presenter: Presenter | null,
+  ): void {
+    if (!rect || !presenter || this.expandedView?.isOpen) {
+      this.hidePresenterExpandBtn();
+      return;
+    }
+    if (!this.presenterExpandBtn) {
+      this.presenterExpandBtn = document.createElement("button");
+      this.presenterExpandBtn.className = "projector-expand-btn";
+      this.presenterExpandBtn.textContent = "⤢";
+      this.presenterExpandBtn.title = "Expand presenter view";
+      document.body.appendChild(this.presenterExpandBtn);
+    }
+    const key = this.presenterKey(presenter.userId, presenter.type);
+    this.presenterExpandBtnKey = key;
+    this.presenterExpandBtn.style.left = `${rect.x + rect.w - 28}px`;
+    this.presenterExpandBtn.style.top = `${rect.y + 4}px`;
+    this.presenterExpandBtn.style.display = "block";
+    // Re-bind click handler in case the target presenter changed
+    this.presenterExpandBtn.onclick = () => {
+      this.expandPresenter(presenter.userId, presenter.type);
+    };
+  }
+
+  /** Hide the presenter expand button. */
+  private hidePresenterExpandBtn(): void {
+    if (this.presenterExpandBtn) this.presenterExpandBtn.style.display = "none";
+    this.presenterExpandBtnKey = null;
+  }
+
+  // ── Expanded view (large modal for presenter video / projector iframe) ──
+
+  /** Expand a presenter's video stream into a large modal overlay. */
+  private expandPresenter(userId: string, type: "screen" | "webcam"): void {
+    if (!this.expandedView) return;
+    const activeKey = this.presenterKey(userId, type);
+
+    // Build tabs for all visible presenters
+    const tabs: PresenterTab[] = [];
+    for (const p of this.presenters) {
+      const key = this.presenterKey(p.userId, p.type);
+      const entry = this.presenterVideoEls.get(key);
+      if (entry && entry.wrap.style.display !== "none") {
+        tabs.push({ key, name: p.name, type: p.type, video: entry.video, wrap: entry.wrap });
+      }
+    }
+
+    if (tabs.length === 0) return;
+
+    this.expandedView.showVideo(tabs, activeKey);
+    this.updateProjectorVideoOverlays();
+  }
+
+  /** Expand the projector's current iframe content (YouTube / TradingView / HTML) into a large modal. */
+  private expandProjectorIframe(): void {
+    if (!this.expandedView) return;
+    const channel = this.store.projectorChannel;
+
+    // Determine which iframe and URL to expand
+    if (channel === "html" && this.projectorHtmlIframe && this.projectorHtmlIframe.style.display !== "none") {
+      // Agent HTML iframe — interactive
+      const src = this.projectorHtmlIframe.src;
+      if (src && src !== "about:blank") {
+        this.expandedView.showIframe(src, "Agent HTML Broadcast", {
+          sandbox: "allow-scripts allow-same-origin allow-forms",
+          allow: "autoplay; encrypted-media; fullscreen; clipboard-write",
+          originalIframe: this.projectorHtmlIframe,
+        });
+      }
+      return;
+    }
+
+    if (this.projectorIframe && this.projectorIframe.style.display !== "none") {
+      const src = this.projectorIframe.src;
+      if (src && src !== "about:blank") {
+        const isYouTube = src.includes("youtube.com/embed/");
+        const ch = OfficeScene.PROJECTOR_CHANNELS.find(c => c.id === channel);
+        const title = ch ? ch.label : "Projector";
+        this.expandedView.showIframe(src, title, {
+          isYouTube,
+          originalIframe: this.projectorIframe,
+        });
+      }
+      return;
+    }
+  }
+
+  // ── Matrix rain monitor animation ────────────────────────────────────
+
+  private initMatrixRain(): void {
+    const cols = Math.floor(OfficeScene.MATRIX_W / 6);
+    this.matrixColumns = [];
+    for (let i = 0; i < cols; i++) {
+      this.matrixColumns.push({
+        y: Math.random() * OfficeScene.MATRIX_H,
+        speed: 0.5 + Math.random() * 1.0,
+        chars: [],
+      });
+    }
+  }
+
+  private updateMatrixRain(_time: number): void {
+    const workingDesks = this.matrixRainWorkingDesks;
+    workingDesks.clear();
+    for (const agent of this.store.agents.values()) {
+      if (agent.deskIndex >= 0 && agent.status !== "idle" && agent.status !== "done" && agent.status !== "error" && agent.status !== "waiting") {
+        workingDesks.add(agent.deskIndex);
+      }
+    }
+
+    // No working agents — hide all overlays
+    if (workingDesks.size === 0) {
+      for (const overlay of this.monitorMatrixOverlays.values()) {
+        overlay.setVisible(false);
+      }
+      return;
+    }
+
+    // Throttle canvas painting + GPU texture upload to 15fps (every 66ms).
+    // Overlay visibility/positioning still happens every frame below.
+    const shouldPaint = _time - this.matrixRainLastUpdate >= 66;
+    if (shouldPaint) {
+      this.matrixRainLastUpdate = _time;
+
+      paintBlock: {
+        // Init columns if needed
+        if (this.matrixColumns.length === 0) this.initMatrixRain();
+
+        // Create texture if needed
+        if (!this.textures.exists(this.monitorMatrixTexKey)) {
+          const ct = this.textures.createCanvas(this.monitorMatrixTexKey, OfficeScene.MATRIX_W, OfficeScene.MATRIX_H);
+          if (!ct) break paintBlock;
+        }
+
+        // Update matrix rain canvas
+        const tex = this.textures.get(this.monitorMatrixTexKey) as Phaser.Textures.CanvasTexture;
+        const canvas = tex.getSourceImage() as HTMLCanvasElement;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) break paintBlock;
+
+        // Fade previous frame
+        ctx.fillStyle = "rgba(0,0,0,0.15)";
+        ctx.fillRect(0, 0, OfficeScene.MATRIX_W, OfficeScene.MATRIX_H);
+
+        // Draw falling characters
+        const charSet = "01ABCDEF<>/{}[]#$%&*+-=";
+        ctx.font = "6px monospace";
+        for (let col = 0; col < this.matrixColumns.length; col++) {
+          const mc = this.matrixColumns[col];
+          const x = col * 6;
+          const y = Math.floor(mc.y) * 6;
+
+          // Bright leading character
+          ctx.fillStyle = "#ccffcc";
+          ctx.fillText(charSet[Math.floor(Math.random() * charSet.length)], x, y);
+
+          // Trailing dimmer characters
+          ctx.fillStyle = "rgba(0,255,0,0.5)";
+          for (let trail = 1; trail < 5; trail++) {
+            const ty = y - trail * 6;
+            if (ty < 0) break;
+            ctx.fillText(charSet[Math.floor(Math.random() * charSet.length)], x, ty);
+          }
+
+          // Advance column
+          mc.y += mc.speed;
+          if (mc.y > OfficeScene.MATRIX_H) {
+            mc.y = -Math.random() * 15;
+            mc.speed = 0.5 + Math.random() * 1.0;
+          }
+        }
+        tex.refresh();
+      }
+    }
+
+    // Create/update overlays for working monitors
+    for (const deskIdx of workingDesks) {
+      const monitor = this.monitors[deskIdx];
+      if (!monitor) continue;
+
+      let overlay = this.monitorMatrixOverlays.get(deskIdx);
+      if (!overlay) {
+        overlay = this.add.image(monitor.x, monitor.y, this.monitorMatrixTexKey)
+          .setDepth(monitor.depth + 1)
+          .setOrigin(0.5, 0.5)
+          .setBlendMode(Phaser.BlendModes.ADD);
+        this.monitorMatrixOverlays.set(deskIdx, overlay);
+      }
+      // Position the overlay on the monitor screen area.
+      // Screen in the texture is at y: 0.11–0.51 (center 0.31), x: 0.15–0.85 (center 0.5)
+      // Monitor sprite origin is 0.5,0.5 so screen center is at offset (0, -0.19 * TILE_PX)
+      overlay.setPosition(monitor.x, monitor.y - TILE_PX * 0.19);
+      overlay.setDisplaySize(TILE_PX * 0.66, TILE_PX * 0.36);
+      overlay.setVisible(true);
+    }
+
+    // Hide overlays for non-working monitors
+    for (const [deskIdx, overlay] of this.monitorMatrixOverlays) {
+      if (!workingDesks.has(deskIdx)) {
+        overlay.setVisible(false);
+      }
+    }
+  }
+
+  // ── IDE Bridge: terminal stations ────────────────────────────────────
+
+  private createTerminalStations(): void {
+    this.terminalStations = [];
+    this.syncTerminalStations();
+  }
+
+  private destroyTerminalStations(): void {
+    for (const station of this.terminalStations) {
+      station.container.destroy(true);
+    }
+    this.terminalStations = [];
+  }
+
+  private createOneStation(tile: { x: number; y: number }): { container: Phaser.GameObjects.Container; monitor: Phaser.GameObjects.Sprite; glow: Phaser.GameObjects.Arc; toolLabel: Phaser.GameObjects.Text; fileLabel: Phaser.GameObjects.Text; } {
+    const px = tile.x * TILE_PX + TILE_PX / 2;
+    const py = tile.y * TILE_PX + TILE_PX / 2;
+    const container = this.add.container(px, py).setDepth(10 + py);
+
+    const desk = this.add.graphics();
+    desk.fillStyle(0x2a2a3a, 0.9);
+    desk.fillRoundedRect(-TILE_PX * 0.45, -TILE_PX * 0.1, TILE_PX * 0.9, TILE_PX * 0.25, 3);
+    desk.lineStyle(1, 0x3a3a4a, 0.6);
+    desk.strokeRoundedRect(-TILE_PX * 0.45, -TILE_PX * 0.1, TILE_PX * 0.9, TILE_PX * 0.25, 3);
+    container.add(desk);
+
+    const monitor = this.add.sprite(0, -TILE_PX * 0.35, MONITOR_TEX, "2").setDepth(1);
+    container.add(monitor);
+
+    const glow = this.add.circle(0, -TILE_PX * 0.3, 32, 0x4af0a8, 0).setDepth(0).setBlendMode(Phaser.BlendModes.ADD);
+    container.add(glow);
+
+    const toolLabel = this.add.text(0, -TILE_PX * 0.72, "", {
+      fontSize: "9px",
+      color: "#88ffcc",
+      fontFamily: "monospace",
+    }).setOrigin(0.5, 0.5).setDepth(2);
+    container.add(toolLabel);
+
+    const fileLabel = this.add.text(0, TILE_PX * 0.02, "", {
+      fontSize: "7px",
+      color: "#aaaacc",
+      fontFamily: "monospace",
+    }).setOrigin(0.5, 0.5).setDepth(2);
+    container.add(fileLabel);
+
+    return { container, monitor, glow, toolLabel, fileLabel };
+  }
+
+  private syncTerminalStations(): void {
+    if (!this.store.showTerminalStations) {
+      this.destroyTerminalStations();
+      return;
+    }
+
+    const personalSessions = [...this.store.externalSessions.values()].map(s => ({
+      sessionId: s.sessionId, userId: s.userId, tool: s.tool, state: s.state,
+      currentFile: s.currentFile, gitBranch: s.gitBranch, filesChanged: s.filesChanged,
+      linesAdded: s.linesAdded, linesRemoved: s.linesRemoved, userName: "You",
+    }));
+    const orgSessions = [...this.store.orgExternalSessions.values()].map(s => ({
+      sessionId: s.sessionId, userId: s.userId, tool: s.tool, state: s.state,
+      currentFile: s.currentFile, gitBranch: s.gitBranch, filesChanged: s.filesChanged,
+      linesAdded: s.linesAdded, linesRemoved: s.linesRemoved, userName: s.userName,
+    }));
+    const sessions = [...personalSessions, ...orgSessions].slice(0, this.terminalStationTiles.length);
+
+    // Destroy excess stations
+    while (this.terminalStations.length > sessions.length) {
+      const station = this.terminalStations.pop()!;
+      station.container.destroy(true);
+    }
+    // Create missing stations
+    while (this.terminalStations.length < sessions.length) {
+      const tile = this.terminalStationTiles[this.terminalStations.length];
+      this.terminalStations.push(this.createOneStation(tile));
+    }
+
+    const toolIcons: Record<string, string> = {
+      "claude-code": "Claude",
+      "codex": "Codex",
+      "aider": "Aider",
+      "vscode": "VSCode",
+      "cursor": "Cursor",
+      "windsurf": "Windsurf",
+      "unknown": "Terminal",
+    };
+    const stateColors: Record<string, number> = {
+      active: 0x4af0a8,
+      idle: 0x4a8cd4,
+      error: 0xff4a4a,
+      disconnected: 0x666666,
+    };
+
+    for (let i = 0; i < this.terminalStations.length; i++) {
+      const station = this.terminalStations[i];
+      const session = sessions[i];
+      if (!session) continue;
+
+      const color = stateColors[session.state] ?? 0x4af0a8;
+      const toolName = toolIcons[session.tool] ?? "Terminal";
+
+      if (session.state === "active") {
+        station.monitor.setFrame("1").setTint(color);
+      } else if (session.state === "idle") {
+        station.monitor.setFrame("0").clearTint();
+      } else if (session.state === "error") {
+        station.monitor.setFrame("1").setTint(color);
+      } else {
+        station.monitor.setFrame("2").clearTint();
+      }
+
+      const pulse = session.state === "active" ? 0.15 + Math.sin(this.time.now * 0.003) * 0.05 : 0;
+      station.glow.setFillStyle(color, pulse);
+
+      const branchTag = session.gitBranch ? ` [${session.gitBranch}]` : "";
+      const isOrg = session.userName !== "You";
+      const nameTag = isOrg ? `${session.userName} · ` : "";
+      station.toolLabel.setText(`${nameTag}${toolName}${branchTag}`);
+      station.toolLabel.setColor(session.state === "error" ? "#ff6a6a" : session.state === "active" ? "#88ffcc" : "#8888aa");
+
+      const fileShort = session.currentFile ? session.currentFile.split("/").pop() : "";
+      const stats = session.filesChanged > 0 ? ` +${session.linesAdded}/-${session.linesRemoved}` : "";
+      station.fileLabel.setText(fileShort ? `${fileShort}${stats}` : "");
+    }
+  }
+
+  // ── IDE Bridge: wall dashboard ─────────────────────────────────────
+
+  private createWallDashboard(): void {
+    this.syncWallDashboard();
+  }
+
+  private destroyWallDashboard(): void {
+    if (this.wallDashboard) {
+      this.wallDashboard.container.destroy(true);
+      this.wallDashboard = null;
+    }
+  }
+
+  private syncWallDashboard(): void {
+    const allSessions = [
+      ...this.store.externalSessions.values(),
+      ...this.store.orgExternalSessions.values(),
+    ];
+    const active = allSessions.filter(s => s.state === "active" || s.state === "idle");
+
+    // No active sessions — destroy dashboard if it exists
+    if (active.length === 0) {
+      this.destroyWallDashboard();
+      return;
+    }
+
+    // Lazy-create dashboard if it doesn't exist
+    if (!this.wallDashboard) {
+      // Place dashboard on the wall at tile (27, 2) — top-right, in-bounds
+      const px = 27 * TILE_PX + TILE_PX / 2;
+      const py = 2 * TILE_PX + TILE_PX / 2;
+      const container = this.add.container(px, py).setDepth(20);
+
+      const bg = this.add.rectangle(0, 0, 180, 120, 0x0a0a14, 0.85)
+        .setStrokeStyle(2, 0x2a2a3e)
+        .setOrigin(0.5, 0.5);
+      container.add(bg);
+
+      const titleText = this.add.text(0, -48, "TEAM DASHBOARD", {
+        fontSize: "11px",
+        fontFamily: "monospace",
+        color: "#4af0a8",
+      }).setOrigin(0.5, 0.5);
+      container.add(titleText);
+
+      const bodyText = this.add.text(0, 5, "", {
+        fontSize: "9px",
+        fontFamily: "monospace",
+        color: "#aaaacc",
+        align: "left",
+      }).setOrigin(0.5, 0.5);
+      container.add(bodyText);
+
+      this.wallDashboard = { container, titleText, bodyText };
+    }
+
+    this.wallDashboard.titleText.setColor("#4af0a8");
+
+    // Aggregate stats
+    const totalFiles = active.reduce((sum, s) => sum + (s.filesChanged ?? 0), 0);
+    const totalAdded = active.reduce((sum, s) => sum + (s.linesAdded ?? 0), 0);
+    const totalRemoved = active.reduce((sum, s) => sum + (s.linesRemoved ?? 0), 0);
+    const activeCount = active.filter(s => s.state === "active").length;
+
+    // Unique users
+    const users = new Set(active.map(s => (s as any).userName ?? "You"));
+
+    // Language breakdown
+    const langCounts: Record<string, number> = {};
+    for (const s of active) {
+      if (s.language) langCounts[s.language] = (langCounts[s.language] ?? 0) + 1;
+    }
+    const langEntries = Object.entries(langCounts).sort((a, b) => b[1] - a[1]).slice(0, 3);
+    const langStr = langEntries.length > 0
+      ? langEntries.map(([l, c]) => `${l} ${c}`).join("  ")
+      : "";
+
+    // Per-user summary (max 5 lines)
+    const userLines = active.slice(0, 5).map(s => {
+      const name = (s as any).userName ?? "You";
+      const tool = s.tool ?? "?";
+      const file = s.currentFile ? s.currentFile.split("/").pop() : "";
+      const state = s.state === "active" ? "●" : "○";
+      const branch = s.gitBranch ? ` [${s.gitBranch}]` : "";
+      return `${state} ${name} · ${tool}${branch}${file ? ` · ${file}` : ""}`;
+    });
+
+    const lines = [
+      `${activeCount} active · ${users.size} coder${users.size > 1 ? "s" : ""}`,
+      `${totalFiles} files · +${totalAdded}/-${totalRemoved} lines`,
+      langStr,
+      "",
+      ...userLines,
+    ];
+
+    this.wallDashboard.bodyText.setText(lines.join("\n"));
+  }
+
+  /** Create the DOM-based hotbar UI wired to the inventory system. */
+  private createHotbar(): void {
+    this.destroyHotbar();
+    const el = document.createElement("div");
+    el.className = "hotbar";
+    el.style.cssText = `
+      position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 4px; z-index: 500; pointer-events: none;
+      font-family: var(--font-pixel, system-ui, sans-serif);
+    `;
+    document.body.appendChild(el);
+    this.hotbarEl = el;
+
+    // Subscribe to inventory changes
+    this.world.inventory.onChange(() => this.updateHotbar());
+    this.updateHotbar();
+  }
+
+  /** Re-render hotbar slots from current inventory state. */
+  private updateHotbar(): void {
+    if (!this.hotbarEl) return;
+    const items = this.world.inventory.getItems();
+    const max = this.world.inventory.maxSlotCount;
+    const active = this.world.inventory.activeSlot;
+
+    // Auto-hide when all slots empty (no items to show)
+    const hasItems = items.some((it) => it !== null);
+    const shouldShow = this.hotbarVisible && hasItems;
+    this.hotbarEl.style.display = shouldShow ? "flex" : "none";
+    document.body.classList.toggle("hotbar-visible", shouldShow);
+
+    if (!shouldShow) return;
+
+    this.hotbarEl.innerHTML = "";
+    for (let i = 0; i < max; i++) {
+      const item = items[i];
+      const slot = document.createElement("div");
+      slot.className = "hotbar-slot" + (i === active ? " active" : "") + (item ? "" : " empty");
+      slot.style.cssText = `
+        width: 44px; height: 44px; border-radius: 8px;
+        background: ${i === active ? "rgba(58,140,212,0.35)" : "rgba(20,22,30,0.65)"};
+        border: 2px solid ${i === active ? "#3a8cd4" : "rgba(255,255,255,0.15)"};
+        display: flex; align-items: center; justify-content: center;
+        position: relative; backdrop-filter: blur(4px);
+        transition: border-color 0.15s, background 0.15s;
+        ${item ? "cursor: pointer; pointer-events: auto;" : ""}
+      `;
+
+      if (item) {
+        slot.title = `${item.name}${item.description ? " — " + item.description : ""}`;
+        const icon = document.createElement("span");
+        icon.style.cssText = "font-size: 22px; line-height: 1; user-select: none;";
+        icon.textContent = item.icon;
+        slot.appendChild(icon);
+
+        // quantity badge for materials
+        if (item.quantity && item.quantity > 1) {
+          const badge = document.createElement("span");
+          badge.style.cssText = `
+            position: absolute; bottom: 2px; right: 3px;
+            font-size: 10px; font-weight: bold; color: #fff;
+            background: rgba(0,0,0,0.6); border-radius: 4px;
+            padding: 0 3px; line-height: 14px;
+          `;
+          badge.textContent = String(item.quantity);
+          slot.appendChild(badge);
+        }
+
+        // slot number
+        const num = document.createElement("span");
+        num.style.cssText = `
+          position: absolute; top: 1px; left: 3px;
+          font-size: 9px; color: rgba(255,255,255,0.4); font-weight: bold;
+        `;
+        num.textContent = String(i + 1);
+        slot.appendChild(num);
+
+        slot.addEventListener("click", () => {
+          this.world.inventory.setActive(i);
+          const wt = this.world.inventory.getActiveWeaponType();
+          if (wt) this.world.equipWeapon(wt);
+        });
+      } else {
+        // empty slot — show number
+        const num = document.createElement("span");
+        num.style.cssText = `
+          font-size: 11px; color: rgba(255,255,255,0.2); font-weight: bold;
+        `;
+        num.textContent = String(i + 1);
+        slot.appendChild(num);
+      }
+
+      this.hotbarEl.appendChild(slot);
+    }
+  }
+
+  /** Remove the hotbar DOM element. */
+  private destroyHotbar(): void {
+    if (this.hotbarEl) {
+      this.hotbarEl.remove();
+      this.hotbarEl = null;
+    }
+  }
+
+}
+
+export { tileOf };

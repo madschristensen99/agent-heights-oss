@@ -1,0 +1,13 @@
+[deploy]
+# Railway volume mount — mount /app/ag as a volume to persist across redeployments.
+# All persistent data lives under /app/ag:
+#   - /app/ag/users/<id>/workspace/  — agent working directories (files agents create, edit, upload)
+#   - /app/ag/users/<id>/save.json   — user save files, session logs (file mode only; Supabase mode uses DB)
+#   - /app/ag/hermes/                — Hermes config (credentials, .env, config.yaml)
+#
+# Without this volume mount, all workspace files are lost on every redeploy.
+# Agent metadata and conversation memory persist via Supabase regardless.
+
+[deploy.healthcheck]
+path = "/"
+timeout = 30

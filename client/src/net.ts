@@ -1,0 +1,201 @@
+import type { ClientMsg, ServerMsg } from "../../shared/types";
+import { isNative, getServerHost } from "./platform";
+
+const SILENT_MSG_TYPES = new Set([
+  "mcp_keys_status", "mcp_key_status", "platform_connection",
+  "payment_status", "usage_update", "room_state", "rooms_list",
+  "mail_digest", "platform_config_result", "outfits",
+  "api_key_status", "mailbox_update", "players_moved",
+  "achievements_sync", "achievements_saved",
+  "friends_list", "friend_online", "friend_offline",
+  "online_players", "room_occupancy",
+  "ab_comparison", "efficiency_score", "resource_allocation", "seasonal_event",
+  "fulfillment_stats",
+  "external_session_update", "external_session_removed",
+  "external_feed_event", "external_sessions_sync",
+  "org_external_sessions_sync", "org_external_session_update",
+  "org_external_session_removed", "org_external_feed_event",
+  "ide_bridge_privacy",
+  "velocity_report", "standup_summary", "anomaly_alerts",
+  "office_invites",
+  "experiment_entry", "experiment_stats",
+  "breaker_state", "control_state",
+  "intervention_event", "intervention_history",
+  "agent_status_summary",
+  "cdp_lp_positions",
+  "token_gate_nonce",
+]);
+
+export class Net {
+  private ws: WebSocket | null = null;
+  private retryMs = 500;
+  private queue: ClientMsg[] = [];
+  private token: string | null = null;
+  private manuallyDisconnected = false;
+  private _spectator = false;
+  private customHost: string | null = null;
+  onMessage: (msg: ServerMsg) => void = () => {};
+  onStatus: (connected: boolean) => void = () => {};
+  onRefreshToken: () => Promise<string | null> = async () => null;
+  onSessionExpired: () => void = () => { location.reload(); };
+
+  setToken(token: string | null): void {
+    this.token = token;
+  }
+
+  getToken(): string | null {
+    return this.token;
+  }
+
+  setSpectator(value: boolean): void {
+    this._spectator = value;
+  }
+
+  get spectator(): boolean { return this._spectator; }
+
+  connect(): void {
+    this.manuallyDisconnected = false;
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const native = isNative();
+    // On native (Capacitor), location.host is a local file origin — use platform-aware host
+    // On web, use existing env-var + location.host logic
+    let host: string;
+    if (native) {
+      host = this.customHost ?? getServerHost();
+    } else {
+      const runtimeEnv = (typeof window !== "undefined" && (window as any).__ENV__) || {};
+      const wsHost = (runtimeEnv.VITE_WS_HOST ?? import.meta.env.VITE_WS_HOST) as string | undefined;
+      const isLocal = location.hostname === "localhost" || location.hostname === "127.0.0.1";
+      const effectiveWsHost = wsHost && (!wsHost.includes("localhost") || isLocal) ? wsHost : undefined;
+      const fallback = effectiveWsHost || (isLocal && location.port !== "3001"
+        ? "localhost:3001"
+        : location.host);
+      host = this.customHost ?? fallback;
+    }
+    const url = this._spectator
+      ? `${proto}://${host}/?spectator=1`
+      : `${proto}://${host}`;
+    console.log(`[net] connecting to ${url} (host=${host}, customHost=${this.customHost})`);
+    const ws = new WebSocket(url);
+    this.ws = ws;
+
+    ws.onopen = () => {
+      console.log(`[net] WebSocket OPEN — flushing ${this.queue.length} queued messages`);
+      this.retryMs = 500;
+      // Send auth message as the very first thing after open
+      if (this.token && !this._spectator) {
+        ws.send(JSON.stringify({ type: "auth", token: this.token }));
+        // After auth, send restore_room so the server can put us back where we were
+        try {
+          const saved = localStorage.getItem("agent-heights-last-room");
+          if (saved) {
+            const { roomId, roomType } = JSON.parse(saved);
+            if (roomId) {
+              this.queue.push({ type: "restore_room", roomId, roomType });
+            }
+          }
+        } catch {}
+      }
+      this.onStatus(true);
+      for (const msg of this.queue.splice(0)) {
+        ws.send(JSON.stringify(msg));
+      }
+    };
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data) as ServerMsg;
+        if (!SILENT_MSG_TYPES.has(msg.type)) {
+          console.log(`[net] received: type=${msg.type}`);
+        }
+        if (msg.type === "refresh_token") {
+          void this.handleRefreshToken();
+          return;
+        }
+        this.onMessage(msg);
+      } catch {
+        // ignore malformed frames
+      }
+    };
+    ws.onclose = (ev) => {
+      console.log(`[net] WebSocket CLOSED: code=${ev.code} reason="${ev.reason}" wasClean=${ev.wasClean} — retrying in ${this.retryMs}ms`);
+      this.onStatus(false);
+      if (this.manuallyDisconnected) return;
+      // On 4003 (expired token), refresh the session before reconnecting
+      if (ev.code === 4003) {
+        void this.onRefreshToken().then((newToken) => {
+          if (newToken) {
+            this.token = newToken;
+            this.retryMs = 500;
+            setTimeout(() => this.connect(), this.retryMs);
+          } else {
+            // No fresh token — delegate to caller (clears stale session, then reloads)
+            this.onSessionExpired();
+          }
+        });
+        return;
+      }
+      this.retryMs = Math.min(this.retryMs * 2, 8000);
+      setTimeout(() => this.connect(), this.retryMs);
+    };
+    ws.onerror = (ev) => {
+      console.error(`[net] WebSocket ERROR:`, ev);
+      ws.close();
+    };
+  }
+
+  private async handleRefreshToken(): Promise<void> {
+    const newToken = await this.onRefreshToken();
+    if (newToken && this.ws?.readyState === WebSocket.OPEN) {
+      this.token = newToken;
+      this.send({ type: "renew_token", token: newToken });
+    }
+  }
+
+  disconnect(): void {
+    this.manuallyDisconnected = true;
+    if (this.ws) {
+      this.ws.onclose = null;
+      this.ws.onerror = null;
+      this.ws.close();
+      this.ws = null;
+      this.onStatus(false);
+    }
+  }
+
+  /** Reconnect to a different WebSocket host (e.g. a deployed world instance). */
+  reconnectToHost(host: string): void {
+    this.customHost = host;
+    this.disconnect();
+    this.manuallyDisconnected = false;
+    this.retryMs = 500;
+    setTimeout(() => this.connect(), 100);
+  }
+
+  /** Reset back to the default host and reconnect. */
+  resetHost(): void {
+    this.customHost = null;
+    this.disconnect();
+    this.manuallyDisconnected = false;
+    this.retryMs = 500;
+    setTimeout(() => this.connect(), 100);
+  }
+
+  /** Whether currently connected to a custom (world) host. */
+  get isOnCustomHost(): boolean {
+    return this.customHost !== null;
+  }
+
+  /** The current custom host, or null if on default. */
+  get currentHost(): string | null {
+    return this.customHost;
+  }
+
+  send(msg: ClientMsg): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(msg));
+    } else {
+      console.log(`[net] WebSocket not open — queuing message. readyState=${this.ws?.readyState}`);
+      this.queue.push(msg);
+    }
+  }
+}

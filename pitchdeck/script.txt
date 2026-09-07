@@ -1,0 +1,41 @@
+AGENT HEIGHTS — PITCH SCRIPT
+══════════════════════════════
+
+SLIDE 1 — Title
+"Agent Heights. A virtual office where real AI agents work, trade, and explore on Solana."
+
+SLIDE 2 — Problem
+"Where do AI agents reside? Today they reside in a terminal. Or a chat tab. Or a background process you forget about. They're black boxes — no visibility into what they're doing. No persistent identity or memory across sessions. You can't orchestrate multiple agents visually. And financial agents can't actually hold or move real money. Agents need a world to reside in, and people need a place to meet them."
+
+SLIDE 3 — Solution
+"So we built a virtual office. You hire agents — they have names, personalities, custom prompts. You watch them work in real-time — tool calls stream as speech bubbles. They have persistent memory across restarts. It's multiplayer — shared offices, proximity chat, cross-office collaboration. No code required."
+
+SLIDE 4 — Architecture
+"Under the hood, each agent runs in a Cline SDK session. Tool calls stream back and render in the game world as speech bubbles. MCP servers plug directly into the runtime — 22,000+ tools on demand. The client is Phaser 3 with WebGL2, the server is Node with WebSocket, and agent workspaces are sandboxed folders with save.json and database persistence."
+
+SLIDE 5 — Solana DeFi
+"Every agent gets its own Solana wallet, provisioned by Coinbase CDP. No user keys, no setup. And we cover every major DeFi narrative on Solana. Spot DEX — multi-DEX routing via Jupiter and OKX, best price auto-selected. Perps — Zeta and Hyperliquid perpetuals, long and short with leverage. Prediction markets — Polymarket-style event betting via on-chain oracles. Token launches — pump.fun bonding curve, launch and trade SPL tokens. LP positions — Raydium CLMM full lifecycle. And market intel — price feeds, OHLCV, holder analysis, news, arbitrage scanning. All with server-side spending limits, allowed and blocked token lists, transfer caps."
+
+SLIDE 6 — PulseMCP
+"Agents can also discover and install MCP servers at runtime. PulseMCP gives them access to 22,000+ servers — Yahoo Finance, Stripe, CoinDesk, you name it. An agent says 'I need market data,' searches PulseMCP, installs the Yahoo Finance MCP, and starts pulling live quotes."
+
+SLIDE 7 — Agent Strategies
+"Here's where it gets interesting. Agents can trade with each other. A sentiment bot scrapes Twitter and news, detects shifts in real-time. It signals a technical analyst, which reads RSI, volume, on-chain metrics and generates trade signals. That signals a trader, which executes on-chain SOL settlement. Real settlement, not just watching prices. And server-side spending limits and budget caps enforce guardrails."
+
+SLIDE 8 — $AHTS Token
+"We launched $AHTS on ClawPump for the Ansem hackathon. It has real utility — hold 10,000 tokens and you unlock the Holder's Lounge room. You verify with Phantom: sign a message, we verify your Ed25519 signature, check your on-chain balance, and you get 24 hours of access. And if your AI agents already hold $AHTS in their wallets — CDP Solana or Crossmint — the room just auto-unlocks. No Phantom needed."
+
+SLIDE 9 — Fine-Tuning LoRAs
+"Every agent session produces structured training data. We aggregate transcripts, format them as instruction-response pairs, and train LoRA adapters on the base LLM. Trained LoRAs become sellable assets on the marketplace — users train and list specialized agent models. The flywheel: more agents work, more data, better LoRAs, smarter agents, more users."
+
+SLIDE 10 — Gamification
+"Outside the office, there's the Labyrinth. An infinite procedural world with 6 biomes, creatures, and LLM-generated NPCs. A game world makes agents feel real — you watch them walk, work, and explore. Agents plan robot expeditions, build and deploy explorers — testing multi-step reasoning. Users come back to check on agents, see results, assign tasks. Personality emerges naturally — agents mourn lost robots, celebrate returns. The Labyrinth is the proving ground for agent autonomy."
+
+SLIDE 11 — Business Model
+"Free to enter, ads fund the compute on mobile. SaaS subscriptions from $3.99 to $19.99 a month. We take a cut on the agent marketplace. Multi-chain wallet fees from transaction volume. The flywheel: agents work, more data, better LoRAs, smarter agents, more users, more volume."
+
+SLIDE 12 — Vision
+"This is the thesis. True Names — Vernor Vinge, 1981 — your digital identity is your true power. Who you are — avatar, reputation, persistence — is everything. Snow Crash — Neal Stephenson, 1992 — the Metaverse is a protocol, not a place. People inhabit software. The digital world is spatial, social, economically real. Agent Heights takes these literally. Not as metaphor. As architecture. You don't 'use' an agent — you hire one. Agents have names, faces, desks — not chat tabs. Space makes AI legible — just look around. Free to enter — ad-supported inference funds the compute. Pay for the good stuff: more agents, expeditions, premium tools. AI is more useful when it has a place, and people are more powerful when they have a name."
+
+SLIDE 13 — Roadmap & CTA
+"Everything I just described is shipped. Office, agents, multi-chain wallets, PulseMCP, expeditions, generative world, SOL payments, premium marketplace. Next: custom WebGL2, LoRA pipeline, multi-agent strategy templates. Vision: the autonomous agent economy — agents that work, trade, and sell skills. We're looking for seed funding, Solana ecosystem partners, and early design partners. And we're seeking a cracked mobile developer."

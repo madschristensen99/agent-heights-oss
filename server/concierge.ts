@@ -1,0 +1,560 @@
+/**
+ * Office Manager Concierge — server-side engagement tracker.
+ *
+ * Evaluates user state every 60s during an active session and generates
+ * LLM-based nudges from the Office Manager character. Rate-limited:
+ * 1 nudge per 8 minutes, max 2 per session.
+ */
+
+import type { AgentInfo, TaskCard, FulfillmentStats } from "../shared/types";
+import { getCachedProfile, type AspirationType } from "./aspirations.js";
+
+type DialectStyle = string | null;
+
+/** Dialect-aware greeting prefix for the Office Manager. */
+function dialectGreet(style: DialectStyle, bossName: string): string {
+  switch (style) {
+    case "street_urban": return `Yo ${bossName}`;
+    case "hawaiian_pidgin": return `Eh ${bossName}`;
+    case "southern_1812": return `Good day, ${bossName}`;
+    default: return bossName;
+  }
+}
+
+/** Pick a dialect-specific message variant, falling back to default. */
+function dialectNudge(style: DialectStyle, variants: { default: string; street_urban?: string; hawaiian_pidgin?: string; southern_1812?: string }): string {
+  switch (style) {
+    case "street_urban": return variants.street_urban ?? variants.default;
+    case "hawaiian_pidgin": return variants.hawaiian_pidgin ?? variants.default;
+    case "southern_1812": return variants.southern_1812 ?? variants.default;
+    default: return variants.default;
+  }
+}
+
+const NUDGE_COOLDOWN_MS = 8 * 60 * 1000; // 8 minutes between nudges
+const MAX_NUDGES_PER_SESSION = 2;
+const EVAL_INTERVAL_MS = 120 * 1000; // evaluate every 120s
+
+interface ConciergeState {
+  nudgesThisSession: number;
+  lastNudgeAt: number;
+  lastNudgeId: string | null;
+  sessionStartAt: number;
+  dismissedIds: Set<string>;
+  // Engagement signals
+  lastAgentCount: number;
+  lastTaskCount: number;
+  lastChatAt: number;
+  hasExploredWorld: boolean;
+  hasHiredFromMarket: boolean;
+  hasConnectedPlatform: boolean;
+  hasOpenedAchievements: boolean;
+  idleSince: number;
+}
+
+/** Per-user concierge state, keyed by userId. */
+const states = new Map<string, ConciergeState>();
+
+function getOrCreateState(userId: string): ConciergeState {
+  let s = states.get(userId);
+  if (!s) {
+    s = {
+      nudgesThisSession: 0,
+      lastNudgeAt: 0,
+      lastNudgeId: null,
+      sessionStartAt: Date.now(),
+      dismissedIds: new Set(),
+      lastAgentCount: 0,
+      lastTaskCount: 0,
+      lastChatAt: 0,
+      hasExploredWorld: false,
+      hasHiredFromMarket: false,
+      hasConnectedPlatform: false,
+      hasOpenedAchievements: false,
+      idleSince: Date.now(),
+    };
+    states.set(userId, s);
+  }
+  return s;
+}
+
+/** Called when user session starts — resets concierge state. */
+export function startSession(userId: string): void {
+  states.delete(userId);
+  getOrCreateState(userId);
+}
+
+/** Called when user dismisses a nudge. */
+export function dismissNudge(userId: string, nudgeId: string): void {
+  const s = states.get(userId);
+  if (s) s.dismissedIds.add(nudgeId);
+}
+
+/** Update engagement signals from client activity. */
+export function trackActivity(
+  userId: string,
+  signals: {
+    agentCount?: number;
+    taskCount?: number;
+    chatted?: boolean;
+    exploredWorld?: boolean;
+    hiredFromMarket?: boolean;
+    connectedPlatform?: boolean;
+    openedAchievements?: boolean;
+  },
+): void {
+  const s = getOrCreateState(userId);
+  if (signals.agentCount !== undefined) s.lastAgentCount = signals.agentCount;
+  if (signals.taskCount !== undefined) s.lastTaskCount = signals.taskCount;
+  if (signals.chatted) s.lastChatAt = Date.now();
+  if (signals.exploredWorld) s.hasExploredWorld = true;
+  if (signals.hiredFromMarket) s.hasHiredFromMarket = true;
+  if (signals.connectedPlatform) s.hasConnectedPlatform = true;
+  if (signals.openedAchievements) s.hasOpenedAchievements = true;
+  s.idleSince = Date.now();
+}
+
+export interface ConciergeNudge {
+  nudgeId: string;
+  text: string;
+  actionLabel: string | null;
+  actionType: string | null;
+}
+
+/**
+ * Evaluate whether to send a nudge. Returns a nudge if one should be sent,
+ * or null if rate-limited / no relevant nudge.
+ */
+export function evaluateNudge(
+  userId: string,
+  context: {
+    agents: AgentInfo[];
+    board: TaskCard[];
+    bossName: string;
+    hasPlatform: boolean;
+    subscriptionTier: string | null;
+    entrancePaid: boolean;
+    dialectStyle: string | null;
+    fulfillmentStats?: FulfillmentStats | null;
+  },
+): ConciergeNudge | null {
+  const s = getOrCreateState(userId);
+  const now = Date.now();
+
+  // Rate limit: 1 per 5 min, 3 per session
+  if (s.nudgesThisSession >= MAX_NUDGES_PER_SESSION) return null;
+  if (now - s.lastNudgeAt < NUDGE_COOLDOWN_MS) return null;
+
+  // Don't nudge if user was active in the last 30s (they're engaged)
+  if (now - s.idleSince < 30_000) return null;
+
+  const profile = getCachedProfile(userId);
+  const dominant = profile?.dominant ?? null;
+
+  const nudge = pickNudge(s, context, now, dominant);
+  if (!nudge) return null;
+
+  s.nudgesThisSession++;
+  s.lastNudgeAt = now;
+  s.lastNudgeId = nudge.nudgeId;
+  return nudge;
+}
+
+function pickNudge(
+  s: ConciergeState,
+  ctx: {
+    agents: AgentInfo[];
+    board: TaskCard[];
+    bossName: string;
+    hasPlatform: boolean;
+    subscriptionTier: string | null;
+    entrancePaid: boolean;
+    dialectStyle: string | null;
+    fulfillmentStats?: FulfillmentStats | null;
+  },
+  now: number,
+  dominant: AspirationType | null,
+): ConciergeNudge | null {
+  const { agents, board, bossName, hasPlatform, dialectStyle } = ctx;
+  const greet = dialectGreet(dialectStyle, bossName);
+  const hireable = agents.filter(
+    (a) => a.id !== "office-manager" && a.id !== "hermes" && a.id !== "wizard",
+  );
+  const idleAgents = hireable.filter((a) => a.status === "idle");
+  const busyAgents = hireable.filter((a) => a.status === "working" || a.status === "thinking");
+  const pendingTasks = board.filter((c) => c.status === "backlog" || c.status === "in_progress");
+  const sessionMinutes = Math.floor((now - s.sessionStartAt) / 60000);
+  const idleMinutes = Math.floor((now - s.idleSince) / 60000);
+  const timeSinceChat = Math.floor((now - s.lastChatAt) / 60000);
+
+  // ── Critical nudges (always fire regardless of aspiration) ──
+
+  // Priority 1: New user with no agents — suggest hiring
+  if (hireable.length === 0 && sessionMinutes >= 2) {
+    return {
+      nudgeId: `nudge-hire-${now}`,
+      text: dialectNudge(dialectStyle, {
+        default: `${greet}, your office is ready and waiting. Want to hire your first agent to get things started?`,
+        street_urban: `${greet}, the office is set up and looking fresh. Ready to bring in your first agent?`,
+        hawaiian_pidgin: `${greet}, your office is all ready. How about hiring your first agent to get things going?`,
+        southern_1812: `${greet}, your office is prepared and awaiting company. Might I suggest hiring your first agent?`,
+      }),
+      actionLabel: "Open Market",
+      actionType: "open_market",
+    };
+  }
+
+  // Priority 2: Idle agents + pending tasks — suggest assigning work
+  if (idleAgents.length > 0 && pendingTasks.length > 0) {
+    const names = idleAgents.slice(0, 2).map((a) => a.name).join(" and ");
+    const isPlural = idleAgents.length !== 1;
+    return {
+      nudgeId: `nudge-assign-${now}`,
+      text: dialectNudge(dialectStyle, {
+        default: `${greet}, ${names} ${isPlural ? "are" : "is"} available and you have ${pendingTasks.length} task${pendingTasks.length === 1 ? "" : "s"} ready to go. Want me to help assign them?`,
+        street_urban: `${greet}, ${names} ${isPlural ? "are" : "is"} free and you got ${pendingTasks.length} task${pendingTasks.length === 1 ? "" : "s"} waiting. Let's get them working.`,
+        hawaiian_pidgin: `${greet}, ${names} ${isPlural ? "are" : "is"} all free and you get ${pendingTasks.length} task${pendingTasks.length === 1 ? "" : "s"} waiting. How about assigning them?`,
+        southern_1812: `${greet}, ${names} ${isPlural ? "are" : "is"} at leisure and you have ${pendingTasks.length} task${pendingTasks.length === 1 ? "" : "s"} awaiting attention. Shall I help assign them?`,
+      }),
+      actionLabel: "View Task Board",
+      actionType: "open_board",
+    };
+  }
+
+  // Priority 3: All agents busy — suggest hiring more
+  if (hireable.length > 0 && idleAgents.length === 0 && busyAgents.length >= hireable.length && pendingTasks.length > 2) {
+    return {
+      nudgeId: `nudge-busy-${now}`,
+      text: dialectNudge(dialectStyle, {
+        default: `${greet}, all ${hireable.length} agents are busy and you have ${pendingTasks.length} tasks queued. Hiring another agent could help keep things moving.`,
+        street_urban: `${greet}, all ${hireable.length} agents are grinding and ${pendingTasks.length} tasks are backed up. Hiring another agent could help keep things moving.`,
+        hawaiian_pidgin: `${greet}, all ${hireable.length} agents stay busy and you get ${pendingTasks.length} tasks waiting. Maybe hire one more agent for help?`,
+        southern_1812: `${greet}, all ${hireable.length} agents are occupied and ${pendingTasks.length} tasks await. Perhaps hiring another agent would ease the burden?`,
+      }),
+      actionLabel: "Hire Agent",
+      actionType: "open_market",
+    };
+  }
+
+  // ── Free tier hook: nudge users to chat with their agent using free credit ──
+  // Fires before aspiration-aware nudges to hook new users on the core experience
+  const isFreeTier = !ctx.subscriptionTier && !ctx.entrancePaid;
+  if (isFreeTier && hireable.length > 0 && s.lastChatAt === 0 && sessionMinutes >= 3) {
+    const agentName = hireable[0].name;
+    return {
+      nudgeId: `nudge-free-chat-${now}`,
+      text: dialectNudge(dialectStyle, {
+        default: `${greet}, ${agentName} is at their desk ready to chat. You have 2¢ of free credit — click on them and say hello to see what they can do!`,
+        street_urban: `${greet}, ${agentName} is sitting there waiting. You got 2¢ free — click on them and say hi. See what they can do for you.`,
+        hawaiian_pidgin: `${greet}, ${agentName} stay at their desk ready for talking. You get 2¢ free credit — click on them and say hello!`,
+        southern_1812: `${greet}, ${agentName} awaits at their desk. You have 2¢ of complimentary credit — pray click upon them and extend a greeting.`,
+      }),
+      actionLabel: null,
+      actionType: null,
+    };
+  }
+
+  // ── Fulfillment gap nudges (highest priority among aspiration-aware) ──
+  // If user shows interest in a track but isn't acting on it, nudge toward action.
+  if (ctx.fulfillmentStats) {
+    const gapNudge = pickFulfillmentGapNudge(ctx.fulfillmentStats, greet, dialectStyle, now, s);
+    if (gapNudge) return gapNudge;
+  }
+
+  // ── Aspiration-aware nudges ──
+  // Build candidate nudges, then pick the one matching the user's dominant aspiration.
+  // If no dominant yet (cold start), rotate through all as probes.
+
+  const candidates: { aspiration: AspirationType; nudge: ConciergeNudge }[] = [];
+
+  // Builder: pipeline / automation satisfaction
+  if (busyAgents.length >= 2 && sessionMinutes >= 4) {
+    candidates.push({
+      aspiration: "builder",
+      nudge: {
+        nudgeId: `nudge-builder-${now}`,
+        text: dialectNudge(dialectStyle, {
+          default: `${busyAgents.length} agents working at the same time. You could set up a schedule so they keep running when you're not here.`,
+          street_urban: `${busyAgents.length} agents going hard. You should set up a schedule so they keep running while you're out. That's how you build something real.`,
+          hawaiian_pidgin: `${busyAgents.length} agents all working together. You should try setting up a schedule — they can keep going even when you stay away.`,
+          southern_1812: `${busyAgents.length} agents working in fine parallel. Might I suggest a schedule? A timed pipeline would keep the work flowing in your absence.`,
+        }),
+        actionLabel: "Open Settings",
+        actionType: "open_settings",
+      },
+    });
+  }
+
+  // Explorer: suggest trying new tools / MCP servers
+  if (hireable.length > 0 && sessionMinutes >= 5) {
+    candidates.push({
+      aspiration: "explorer",
+      nudge: {
+        nudgeId: `nudge-explorer-${now}`,
+        text: dialectNudge(dialectStyle, {
+          default: `New MCP servers are in the marketplace — GitHub, Notion, Slack. Your agents could do more with the right tools.`,
+          street_urban: `Yo, new MCP servers just dropped. GitHub, Notion, Slack — your agents could be doing way more. Check the market.`,
+          hawaiian_pidgin: `Eh, get new MCP servers in the marketplace. GitHub, Notion, Slack — your agents could do plenty more with the right tools.`,
+          southern_1812: `New MCP servers have arrived in the marketplace. GitHub, Notion, Slack — your agents might benefit from expanded capabilities.`,
+        }),
+        actionLabel: "Open Market",
+        actionType: "open_market",
+      },
+    });
+  }
+
+  // Puzzle solver: suggest task decomposition
+  if (hireable.length > 0 && pendingTasks.length > 0 && sessionMinutes >= 4) {
+    candidates.push({
+      aspiration: "puzzle_solver",
+      nudge: {
+        nudgeId: `nudge-puzzle-${now}`,
+        text: dialectNudge(dialectStyle, {
+          default: `You have ${pendingTasks.length} task${pendingTasks.length === 1 ? "" : "s"} on the board. I can break them down into subtasks with dependencies if you want.`,
+          street_urban: `You got ${pendingTasks.length} task${pendingTasks.length === 1 ? "" : "s"} on the board. I can help you break them down into a solid plan with dependencies. That's how you stay organized.`,
+          hawaiian_pidgin: `You get ${pendingTasks.length} task${pendingTasks.length === 1 ? "" : "s"} on the board. I can help break them down into a nice plan with dependencies. Makes everything go smoother.`,
+          southern_1812: `You have ${pendingTasks.length} task${pendingTasks.length === 1 ? "" : "s"} on the board. I would be happy to help decompose them into a structured plan with dependencies.`,
+        }),
+        actionLabel: "View Task Board",
+        actionType: "open_board",
+      },
+    });
+  }
+
+  // Creator: suggest customization
+  if (sessionMinutes >= 6) {
+    candidates.push({
+      aspiration: "creator",
+      nudge: {
+        nudgeId: `nudge-creator-${now}`,
+        text: dialectNudge(dialectStyle, {
+          default: `${greet}, new themes and outfits are in settings if you want to change up the office.`,
+          street_urban: `${greet}, new themes and fits just dropped in settings. Give the office a new look, you know?`,
+          hawaiian_pidgin: `${greet}, get new themes and outfits in settings. Maybe give the office a fresh look, yeah?`,
+          southern_1812: `${greet}, new themes and decorations are available in settings. A fresh appearance might suit the office nicely.`,
+        }),
+        actionLabel: "Open Settings",
+        actionType: "open_settings",
+      },
+    });
+  }
+
+  // Strategist: suggest org / long-term planning
+  if (hireable.length >= 2 && sessionMinutes >= 6) {
+    candidates.push({
+      aspiration: "strategist",
+      nudge: {
+        nudgeId: `nudge-strategist-${now}`,
+        text: dialectNudge(dialectStyle, {
+          default: `${hireable.length} agents on the team. You could check the leaderboards or start an org if you want to get competitive.`,
+          street_urban: `${hireable.length} agents — that's a real squad. You should check the leaderboards or start an org. There's a whole competitive side to this.`,
+          hawaiian_pidgin: `${hireable.length} agents — solid team. You should check the leaderboards or make an org. Get competitive, you know?`,
+          southern_1812: `${hireable.length} agents — a fine roster. Have you consulted the leaderboards or considered forming an organization? The competitive layer awaits.`,
+        }),
+        actionLabel: "View Leaderboards",
+        actionType: "open_leaderboards",
+      },
+    });
+  }
+
+  // Warrior: suggest world exploration / combat
+  if (!s.hasExploredWorld && sessionMinutes >= 5 && hireable.length > 0) {
+    candidates.push({
+      aspiration: "warrior",
+      nudge: {
+        nudgeId: `nudge-explore-${now}`,
+        text: dialectNudge(dialectStyle, {
+          default: `${greet}, there's a world outside with creatures and biomes. Step out whenever you want to check it out.`,
+          street_urban: `${greet}, there's a whole world outside. Creatures to hunt, places to explore. Step out when you're ready.`,
+          hawaiian_pidgin: `${greet}, get one whole world outside. Creatures to hunt, biomes to explore. Go check it out when you ready.`,
+          southern_1812: `${greet}, a vast world lies beyond yon door. Creatures to hunt, biomes to explore. Pray venture forth when you are ready.`,
+        }),
+        actionLabel: null,
+        actionType: null,
+      },
+    });
+  }
+
+  // Platform connection (universal, but lower priority)
+  if (!hasPlatform && !s.hasConnectedPlatform && sessionMinutes >= 8) {
+    candidates.push({
+      aspiration: "builder",
+      nudge: {
+        nudgeId: `nudge-platform-${now}`,
+        text: dialectNudge(dialectStyle, {
+          default: `${greet}, your agents finish tasks but you might not hear about it. Connecting Telegram or Slack would fix that. Want to set it up?`,
+          street_urban: `${greet}, your agents finish tasks and you don't even know. Hook up Telegram or Slack so you stay in the loop.`,
+          hawaiian_pidgin: `${greet}, your agents finish tasks but you might not hear. Connect Telegram or Slack so you stay updated, yeah?`,
+          southern_1812: `${greet}, your agents complete tasks but notification may elude you. Connecting Telegram or Slack would keep you informed. Shall we set that up?`,
+        }),
+        actionLabel: "Connect Platform",
+        actionType: "open_settings",
+      },
+    });
+  }
+
+  // ── Select candidate based on dominant aspiration ──
+
+  if (candidates.length === 0) {
+    // Fallback: long idle check-in (profile-aware)
+    if (idleMinutes >= 5 && timeSinceChat >= 5) {
+      const tips = getAspirationIdleTips(bossName, dominant);
+      return {
+        nudgeId: `nudge-idle-${now}`,
+        text: tips[Math.floor(Math.random() * tips.length)],
+        actionLabel: null,
+        actionType: null,
+      };
+    }
+
+    // Fallback: hasn't checked achievements
+    if (!s.hasOpenedAchievements && sessionMinutes >= 10) {
+      return {
+        nudgeId: `nudge-achievements-${now}`,
+        text: dialectNudge(dialectStyle, {
+          default: `You might have unlocked some achievements by now. The trophy case shows your progress.`,
+          street_urban: `Yo, you might have unlocked some achievements by now. Check the trophy case — your combat record is stacking up.`,
+          hawaiian_pidgin: `Eh, you might have unlocked some achievements already. Check the trophy case — your combat record is growing!`,
+          southern_1812: `By the by, you may have unlocked some achievements. The trophy case displays your progress — quite the combat record to build!`,
+        }),
+        actionLabel: "View Achievements",
+        actionType: "open_achievements",
+      };
+    }
+
+    return null;
+  }
+
+  // If we have a dominant aspiration, prefer matching candidates
+  if (dominant) {
+    const match = candidates.find((c) => c.aspiration === dominant);
+    if (match) return match.nudge;
+  }
+
+  // Cold start or no match: rotate through candidates as probes
+  // Use nudge count as rotation index for variety
+  const idx = s.nudgesThisSession % candidates.length;
+  return candidates[idx].nudge;
+}
+
+/** Get aspiration-flavored idle tips. */
+function getAspirationIdleTips(bossName: string, dominant: AspirationType | null): string[] {
+  switch (dominant) {
+    case "builder":
+      return [
+        `Everything running smoothly, ${bossName}? A good time to set up a scheduled task — a pipeline that runs while you sleep keeps things moving.`,
+        `Quiet in the office. Perfect time to design an automation chain. I can help you set one up whenever you're ready.`,
+      ];
+    case "explorer":
+      return [
+        `Hey ${bossName}, want to try a new MCP server? There might be tools that unlock new capabilities for your agents.`,
+        `Quiet moment — a good time to experiment with a different agent model. I can walk you through the options.`,
+      ];
+    case "puzzle_solver":
+      return [
+        `Everything running smoothly, ${bossName}? If you'd like, I can help review the task board and find any bottlenecks.`,
+        `Quiet in the office. Want to review the task board? I can help spot any dependencies that need attention.`,
+      ];
+    case "creator":
+      return [
+        `Hey ${bossName}, want to customize the office? New themes, outfits, and decorations are available in settings.`,
+        `Quiet moment — a good time to give your office a fresh look. The wardrobe and theme options are ready when you are.`,
+      ];
+    case "strategist":
+      return [
+        `Everything running smoothly, ${bossName}? The leaderboards are updating in real time — a good time to check your standing.`,
+        `Quiet in the office. Good time to plan your next hire or consider creating an org. I'm here to help with either.`,
+      ];
+    default: // warrior or null
+      return [
+        `Everything running smoothly, ${bossName}? I can decompose a goal into subtasks if you want to get the team moving.`,
+        `Quiet in the office. Want to check the task board, or maybe step outside for a bit? There's a whole world to explore.`,
+        `Hey ${bossName}, if you're stuck on what to do next, try giving the team a new goal — I'll break it down into tasks for you.`,
+      ];
+  }
+}
+
+/** Get the evaluation interval in milliseconds. */
+export const CONCIERGE_EVAL_INTERVAL = EVAL_INTERVAL_MS;
+
+const FULFILLMENT_GAP_THRESHOLD = -15; // nudge when fulfillment is 15+ points below detection
+
+const GAP_NUDGE_TEMPLATES: Record<string, {
+  default: (greet: string, det: number, ful: number) => string;
+  street_urban?: (greet: string, det: number, ful: number) => string;
+  hawaiian_pidgin?: (greet: string, det: number, ful: number) => string;
+  southern_1812?: (greet: string, det: number, ful: number) => string;
+  actionLabel: string;
+  actionType: string;
+}> = {
+  warrior: {
+    default: (g, d, f) => `${g}, your Warrior interest is at ${d}% but you're at ${f}% fulfillment. Step outside and hunt some creatures.`,
+    street_urban: (g, d, f) => `${g}, you're feeling the Warrior vibe (${d}%) but only living it at ${f}%. Get out there and hunt — your combat record ain't gonna build itself.`,
+    actionLabel: "Explore World",
+    actionType: "explore_world",
+  },
+  builder: {
+    default: (g, d, f) => `${g}, your Builder interest is at ${d}% but fulfillment is only ${f}%. Setting up a schedule or pipeline would close that gap.`,
+    street_urban: (g, d, f) => `${g}, you're into building (${d}%) but only at ${f}% fulfillment. Set up a schedule or chain — that's how you turn interest into real output.`,
+    actionLabel: "Open Settings",
+    actionType: "open_settings",
+  },
+  explorer: {
+    default: (g, d, f) => `${g}, your Explorer interest is at ${d}% but fulfillment is only ${f}%. Try a new MCP server or switch up an agent model.`,
+    street_urban: (g, d, f) => `${g}, you're curious (${d}%) but only exploring at ${f}%. Try a new MCP server or switch up an agent model — go see what's out there.`,
+    actionLabel: "Open Market",
+    actionType: "open_market",
+  },
+  puzzle_solver: {
+    default: (g, d, f) => `${g}, your Puzzle Solver interest is at ${d}% but fulfillment is only ${f}%. Breaking down a task into subtasks with dependencies would help.`,
+    street_urban: (g, d, f) => `${g}, you like solving puzzles (${d}%) but only at ${f}% fulfillment. Break down a task into subtasks with dependencies — that's your jam.`,
+    actionLabel: "View Task Board",
+    actionType: "open_board",
+  },
+  creator: {
+    default: (g, d, f) => `${g}, your Creator interest is at ${d}% but fulfillment is only ${f}%. New themes and outfits are in settings if you want to customize.`,
+    street_urban: (g, d, f) => `${g}, you're feeling creative (${d}%) but only at ${f}% fulfillment. New themes and fits are in settings — make the office yours.`,
+    actionLabel: "Open Settings",
+    actionType: "open_settings",
+  },
+  strategist: {
+    default: (g, d, f) => `${g}, your Strategist interest is at ${d}% but fulfillment is only ${f}%. Check the leaderboards or start an org.`,
+    street_urban: (g, d, f) => `${g}, you're thinking strategic (${d}%) but only at ${f}% fulfillment. Check the leaderboards or start an org — time to compete.`,
+    actionLabel: "View Leaderboards",
+    actionType: "open_leaderboards",
+  },
+};
+
+function pickFulfillmentGapNudge(
+  fs: FulfillmentStats,
+  greet: string,
+  dialectStyle: DialectStyle,
+  now: number,
+  s: ConciergeState,
+): ConciergeNudge | null {
+  // Find tracks with significant negative gap (interest > achievement)
+  const bigGaps = fs.gaps.filter((g) => g.gap <= FULFILLMENT_GAP_THRESHOLD);
+  if (bigGaps.length === 0) return null;
+
+  // Pick the worst gap, but avoid repeating the same track as last nudge
+  const sorted = [...bigGaps].sort((a, b) => a.gap - b.gap);
+  const lastNudgeTrack = s.lastNudgeId?.replace(/^nudge-gap-/, "").replace(/-\d+$/, "");
+  const pick = sorted.find((g) => g.track !== lastNudgeTrack) ?? sorted[0];
+
+  const template = GAP_NUDGE_TEMPLATES[pick.track];
+  if (!template) return null;
+
+  const text = dialectNudge(dialectStyle, {
+    default: template.default(greet, pick.detection, pick.fulfillment),
+    street_urban: template.street_urban?.(greet, pick.detection, pick.fulfillment),
+    hawaiian_pidgin: template.hawaiian_pidgin?.(greet, pick.detection, pick.fulfillment),
+    southern_1812: template.southern_1812?.(greet, pick.detection, pick.fulfillment),
+  });
+
+  return {
+    nudgeId: `nudge-gap-${pick.track}-${now}`,
+    text,
+    actionLabel: template.actionLabel,
+    actionType: template.actionType,
+  };
+}

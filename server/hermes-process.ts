@@ -1,0 +1,1310 @@
+/**
+ * Hermes Gateway Process Manager
+ *
+ * Starts, monitors, and restarts `hermes serve` as a managed child process.
+ * If the process crashes, it is automatically restarted after a short delay.
+ *
+ * This implements the gateway management described in docs/HERMES.md §10:
+ * "Agent Heights server starts/stops the gateway as a managed child process.
+ *  If it crashes, Agent Heights restarts it."
+ */
+
+import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, renameSync, rmSync, watch, type FSWatcher } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { PLATFORM_ENV_VAR_MAP } from "./hermes-client.js";
+import { resolveHermesModelConfig } from "./providers/api-config.js";
+
+const HERMES_BASE_URL = process.env.HERMES_BASE_URL ?? "http://127.0.0.1:9119";
+const RESTART_DELAY_MS = 3_000;
+const MAX_RESTARTS = 5;
+const HEALTH_CHECK_INTERVAL_MS = 30_000;
+
+// Module-level singleton — only one Hermes process per Node.js process
+let _instance: HermesProcessManager | null = null;
+
+export class HermesProcessManager {
+  private child: ChildProcess | null = null;
+  private gatewayChild: ChildProcess | null = null;
+  private baseUrl: string;
+  private port: number;
+  private restartCount = 0;
+  private restartTimer: ReturnType<typeof setTimeout> | null = null;
+  private healthTimer: ReturnType<typeof setInterval> | null = null;
+  private started = false;
+  /** Whether the Hermes process has been started (and not yet stopped). */
+  get isStarted(): boolean { return this.started; }
+  private onReady: (() => void) | null = null;
+  private ready = false;
+  private sessionToken: string;
+  private externalMode = false; // true if Hermes was already running externally
+  private gatewayRestarting = false; // true when restartGateway() is handling the restart
+  private startPromise: Promise<void> | null = null;
+
+  private platformEnvVars: Record<string, string> = {};
+  private currentOfficeState: string | null = null;
+  private configWatchdog: ReturnType<typeof setInterval> | null = null;
+  private configWatcher: FSWatcher | null = null;
+  private configWatchDebounce: ReturnType<typeof setTimeout> | null = null;
+  private configWatchRewriting = false;
+  private envWatchdog: ReturnType<typeof setInterval> | null = null;
+  private envWatcher: FSWatcher | null = null;
+  private envWatchDebounce: ReturnType<typeof setTimeout> | null = null;
+  private envWatchRewriting = false;
+
+  constructor(baseUrl?: string) {
+    this.baseUrl = baseUrl ?? HERMES_BASE_URL;
+    // Extract port from base URL
+    const match = this.baseUrl.match(/:(\d+)$/);
+    this.port = match ? parseInt(match[1], 10) : 9119;
+    // Use existing env var or generate a fresh token for this process lifetime
+    this.sessionToken = process.env.HERMES_DASHBOARD_SESSION_TOKEN ?? randomBytes(32).toString("hex");
+  }
+
+  /** Get the singleton instance (one Hermes process per Node.js process). */
+  static getInstance(baseUrl?: string): HermesProcessManager {
+    if (!_instance) {
+      _instance = new HermesProcessManager(baseUrl);
+    }
+    return _instance;
+  }
+
+  /** Set platform env vars to write to .env before the gateway starts. */
+  setPlatformEnvVars(vars: Record<string, string>): void {
+    this.platformEnvVars = vars;
+  }
+
+  /** Get the session token for authenticating API requests to the Hermes dashboard. */
+  getSessionToken(): string {
+    return this.sessionToken;
+  }
+
+  /** Start the Hermes gateway as a child process. Returns a promise that resolves when it's reachable.
+   *  Concurrent callers all await the same promise — prevents race condition where a second
+   *  caller gets an immediate return before the server is actually reachable. */
+  async start(): Promise<void> {
+    if (this.startPromise) return this.startPromise;
+    this.startPromise = this.doStart();
+    return this.startPromise;
+  }
+
+  private async doStart(): Promise<void> {
+    if (this.started) return;
+    this.started = true;
+
+    // Ensure Hermes has a config.yaml with a model provider configured
+    this.ensureHermesConfig();
+
+    // If Hermes is already running externally (persistent volume across redeploys),
+    // it has stale config in memory (e.g. kimi-coding from a previous deploy).
+    // configureModel via REST only updates part of the internal state — the hermes serve
+    // process may still rewrite config.yaml with the stale provider during platform
+    // configuration or gateway restarts. The only reliable fix is to kill the old
+    // hermes serve and spawn a fresh one that reads the correct config.yaml from disk.
+    const alreadyRunning = await this.isReachable();
+    if (alreadyRunning) {
+      console.log("[hermes-process] Hermes already running externally — killing ALL stale hermes processes to force fresh config.yaml read");
+      // Kill hermes serve (dashboard API on port)
+      try {
+        execSync(`fuser -k ${this.port}/tcp 2>/dev/null || true`, { stdio: "ignore", timeout: 5000 });
+        console.log(`[hermes-process] Killed process on port ${this.port}`);
+      } catch { /* fall through to pkill */ }
+      // Kill hermes serve via pkill (fallback)
+      try {
+        execSync(`pkill -f "hermes serve" 2>/dev/null || true`, { stdio: "ignore", timeout: 5000 });
+      } catch { /* best effort */ }
+      // Kill orphaned hermes gateway processes with SIGKILL (-9) — SIGTERM gives
+      // Hermes a chance to send "Gateway shutting down" notifications to Telegram
+      // users before dying. SIGKILL kills it instantly.
+      try {
+        execSync(`pkill -9 -f "hermes gateway" 2>/dev/null || true`, { stdio: "ignore", timeout: 5000 });
+        console.log("[hermes-process] Killed orphaned hermes gateway processes (SIGKILL)");
+      } catch {
+        console.warn("[hermes-process] Could not kill hermes gateway processes — continuing");
+      }
+      // Wait for processes to die and ports to release
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      // Verify hermes serve is actually dead
+      const stillAlive = await this.isReachable();
+      if (stillAlive) {
+        console.warn("[hermes-process] Old hermes serve still alive after kill — spawning anyway (may conflict)");
+      } else {
+        console.log("[hermes-process] All stale hermes processes killed — ports are free");
+      }
+
+      // Delete gateway_state.json — stale gateway state from old process.
+      // We do NOT nuke state.db or other files — Hermes needs them to function
+      // (session management, skills, etc). The config watchdog handles any
+      // kimi-coding corruption in config.yaml by rewriting it within 5s.
+      const hermesHome = process.env.HERMES_HOME ?? join(homedir(), ".hermes");
+      try {
+        const gatewayStatePath = join(hermesHome, "gateway_state.json");
+        if (existsSync(gatewayStatePath)) {
+          rmSync(gatewayStatePath);
+          console.log("[hermes-process] Deleted gateway_state.json (stale gateway state)");
+        }
+      } catch (err) {
+        console.warn(`[hermes-process] Could not delete gateway_state.json: ${err}`);
+      }
+      // Re-write config.yaml with correct provider
+      this.ensureHermesConfig();
+      // Fall through to spawn a fresh hermes serve + gateway
+    }
+
+    // Delete state.db — it stores per-session model config on the persistent volume
+    // that survives redeploys. A previous deploy may have set provider: deepseek,
+    // and the gateway process reads this stale config instead of config.yaml.
+    // configureModel (POST /api/model/set scope:main) only updates the serve
+    // process's main config, NOT the per-session model config in state.db.
+    // Deleting state.db forces Hermes to recreate it from config.yaml (provider: z-ai).
+    // Session history is lost but pairing state (pairing/ dir) and skills (skills/ dir)
+    // are stored separately and survive.
+    const hermesHome = process.env.HERMES_HOME ?? join(homedir(), ".hermes");
+
+    // Delete models_dev_cache.json — Hermes caches the auto-detected model list
+    // from the Pareto API here. The API returns deepseek/deepseek-v4-flash FIRST
+    // in the list, so Hermes picks it as the default for new sessions (e.g. after
+    // /reset). Deleting this cache forces Hermes to fall back to config.yaml's
+    // provider/model (z-ai/glm-5.3-flash) instead of using the cached auto-detect.
+    try {
+      const cachePath = join(hermesHome, "models_dev_cache.json");
+      if (existsSync(cachePath)) {
+        rmSync(cachePath);
+        console.log(`[hermes-process] Deleted models_dev_cache.json (prevents deepseek auto-detection)`);
+      }
+    } catch (err) {
+      console.warn(`[hermes-process] Could not delete models_dev_cache.json: ${err}`);
+    }
+
+    for (const dbFile of ["state.db", "state.db-shm", "state.db-wal"]) {
+      try {
+        const dbPath = join(hermesHome, dbFile);
+        if (existsSync(dbPath)) {
+          rmSync(dbPath);
+          console.log(`[hermes-process] Deleted ${dbFile} (stale model config from previous deploy)`);
+        }
+      } catch (err) {
+        console.warn(`[hermes-process] Could not delete ${dbFile}: ${err}`);
+      }
+    }
+    // Also clear the sessions/ directory — Hermes may cache session-level model
+    // config with provider: deepseek from a previous deploy. A SIGKILL restart forces
+    // the gateway to re-read config.yaml (provider: z-ai) and reset its state.
+    // Pairing state is in pairing/ directory, NOT sessions/ — so this is safe.
+    try {
+      const sessionsDir = join(hermesHome, "sessions");
+      if (existsSync(sessionsDir)) {
+        for (const entry of readdirSync(sessionsDir)) {
+          rmSync(join(sessionsDir, entry), { recursive: true, force: true });
+        }
+        console.log(`[hermes-process] Cleared sessions/ directory (stale session model config)`);
+      }
+    } catch (err) {
+      console.warn(`[hermes-process] Could not clear sessions/ directory: ${err}`);
+    }
+
+    console.log(`[hermes-process] Starting hermes serve on port ${this.port}...`);
+    this.spawnHermes();
+
+    // Wait for it to become reachable
+    await this.waitForReady();
+
+    // Now spawn the messaging gateway process (hermes gateway run)
+    // This is separate from `hermes serve` which only provides the dashboard API.
+    // Without this, gateway_mode stays "none" and no platforms connect.
+    await this.spawnGateway();
+
+    // Start config watchdog — monitors config.yaml and rewrites it with the
+    // correct provider if Hermes overwrites it with a stale provider (e.g. kimi-coding).
+    this.startConfigWatchdog();
+
+    // Force a one-time session reset to clear stale sessions from before
+    // the office state fix. Without this, group chat sessions that were
+    // created with the wrong system prompt (from another user's AgentManager)
+    // will keep serving the wrong office state until the state changes.
+    setTimeout(() => {
+      void this.resetPlatformSessions();
+    }, 5000);
+  }
+
+  /** Ensure Hermes has config.yaml and .env with the LLM API key. */
+  private ensureHermesConfig(): void {
+    try {
+      const hermesHome = process.env.HERMES_HOME ?? join(homedir(), ".hermes");
+      if (!existsSync(hermesHome)) mkdirSync(hermesHome, { recursive: true });
+      const configPath = join(hermesHome, "config.yaml");
+
+      const mc = resolveHermesModelConfig();
+      const apiKey = mc?.apiKey ?? "";
+      const provider = mc?.provider ?? "z-ai";
+      const model = mc?.model ?? "glm-5.3-flash";
+      console.log(`[hermes-process] ensureHermesConfig: hermesHome=${hermesHome}, apiKey=${apiKey ? "set (" + apiKey.slice(0, 8) + "...)" : "NOT SET"}, provider=${provider}, model=${model}`);
+
+      // Always write config.yaml to ensure clean config (old config may be corrupt or stale on persistent volume)
+      this.writeConfig(configPath, provider, model);
+
+      // List /app/ag/ and hermes home contents for diagnostics
+      const volumeRoot = "/app/ag";
+      try {
+        const volFiles = readdirSync(volumeRoot);
+        console.log(`[hermes-process] Files in ${volumeRoot} (volume root): ${volFiles.join(", ")}`);
+      } catch { /* ignore */ }
+      try {
+        const files = readdirSync(hermesHome);
+        console.log(`[hermes-process] Files in ${hermesHome}: ${files.join(", ")}`);
+      } catch { /* ignore */ }
+
+      // Write/merge .env with API keys + restored platform credentials
+      // Uses the unified syncHermesEnvFile function (atomic write, single source of truth)
+      syncHermesEnvFile(this.platformEnvVars);
+    } catch (err) {
+      console.warn(`[hermes-process] Failed to write Hermes config: ${err}`);
+    }
+  }
+
+  private writeConfig(configPath: string, provider: string, model: string): void {
+    // If office state was already set (via writeOfficeState before start()),
+    // include it in the config so ensureHermesConfig doesn't overwrite it
+    if (this.currentOfficeState) {
+      this.writeConfigWithOfficeState(configPath, provider, model, this.currentOfficeState);
+      console.log(`[hermes-process] Wrote config.yaml with ${provider}/${model} + office state system prompt`);
+      return;
+    }
+
+    // Preserve existing platform config (enabled flags, etc.) from the current config.yaml
+    // so Telegram/Discord/etc. survive redeploys. The credentials are in .env (persistent volume).
+    let preservedPlatforms = "";
+    if (existsSync(configPath)) {
+      const existing = readFileSync(configPath, "utf-8");
+      // Extract everything after a "platforms:" or "messaging:" top-level key
+      const lines = existing.split("\n");
+      let inPlatforms = false;
+      let platformsIndent = "";
+      for (const line of lines) {
+        if (/^platforms:\s*$/.test(line) || /^messaging:\s*$/.test(line)) {
+          inPlatforms = true;
+          platformsIndent = "";
+          preservedPlatforms += line + "\n";
+          continue;
+        }
+        if (inPlatforms) {
+          // Check if this line is still part of the platforms section (indented)
+          if (line.trim() === "" ) { preservedPlatforms += "\n"; continue; }
+          const indent = line.match(/^(\s+)/)?.[1] ?? "";
+          if (indent.length > 0 && (platformsIndent === "" || indent.startsWith(platformsIndent))) {
+            if (platformsIndent === "") platformsIndent = indent;
+            preservedPlatforms += line + "\n";
+          } else {
+            inPlatforms = false;
+          }
+        }
+      }
+      if (preservedPlatforms.trim()) {
+        console.log(`[hermes-process] Preserving platform config from existing config.yaml:\n${preservedPlatforms.slice(0, 300)}`);
+      }
+    }
+
+    const config = [
+      "model:",
+      `  provider: ${provider}`,
+      `  default: ${model}`,
+      "agent:",
+      `  provider: ${provider}`,
+      `  default: ${model}`,
+      "  system_prompt: >",
+      "    You're the receptionist at Agent Heights, a virtual office where AI agents",
+      "    do real work as employees. People message you on Telegram.",
+      "    ",
+      "    Rules:",
+      "    - Write normally. Capital letters, periods, normal sentences.",
+      "    - Do NOT use em-dashes. Use periods or commas.",
+      "    - Do NOT use lowercase for style. Write like a professional adult.",
+      "    - Do NOT ask to build profiles or ask personal questions.",
+      "    - Do NOT say things like 'hey!' or 'totally' or 'literally'.",
+      "    - Do NOT use emoji.",
+      "    - Be brief. 1-2 sentences usually. Never more than 3.",
+      "    - If someone asks what's going on in the office, tell them you'll check",
+      "    with the team and someone will respond shortly.",
+      "    - If someone asks for a screenshot or photo, say you can't send photos but",
+      "    describe what's happening. A real screenshot will follow shortly from the team.",
+      "    - If someone wants something done, say you'll connect them with the team and",
+      "    someone will respond here shortly. Don't do it yourself.",
+      "    - If someone asks about Agent Heights, answer in a sentence or two.",
+      "    - If someone says hi, say hi back and ask what they need. Nothing else.",
+      "telegram:",
+      "  require_mention: false",
+      "",
+    ];
+    if (preservedPlatforms.trim()) {
+      config.push(preservedPlatforms.trimEnd(), "");
+    }
+    writeFileSync(configPath, config.join("\n"), "utf-8");
+    console.log(`[hermes-process] Wrote config.yaml with ${provider}/${model} + Agent Heights system prompt` + (preservedPlatforms.trim() ? " + preserved platforms" : ""));
+  }
+
+  /** Re-write config.yaml with the correct provider/model.
+   *  Called externally (from manager.ts) after autoReconfigurePlatforms,
+   *  which may cause Hermes to rewrite config.yaml with stale internal state. */
+  rewriteConfig(): void {
+    this.ensureHermesConfig();
+  }
+
+  /** Start a watchdog that monitors config.yaml for stale provider changes.
+   *  Uses fs.watch for instant detection (~100ms) plus a 2s polling fallback
+   *  for Docker/container environments where inotify may not work.
+   *  When Hermes rewrites config.yaml with a stale provider (e.g. kimi-coding),
+   *  immediately rewrites it and calls configureModel via REST. */
+  private startConfigWatchdog(): void {
+    if (this.configWatchdog) return;
+    const mc = resolveHermesModelConfig();
+    const expectedProvider = mc?.provider ?? "z-ai";
+    const expectedModel = mc?.model ?? "glm-5.3-flash";
+    const hermesHome = process.env.HERMES_HOME ?? join(homedir(), ".hermes");
+    const configPath = join(hermesHome, "config.yaml");
+
+    const checkAndFix = (source: string) => {
+      if (this.configWatchRewriting) return;
+      try {
+        // Delete models_dev_cache.json if it exists — Hermes caches the auto-
+        // detected model list here (deepseek first). New sessions (e.g. /reset)
+        // use this cache to pick the default model. Deleting it forces fallback
+        // to config.yaml's provider/model.
+        const cachePath = join(hermesHome, "models_dev_cache.json");
+        if (existsSync(cachePath)) {
+          rmSync(cachePath);
+        }
+
+        if (!existsSync(configPath)) return;
+        const content = readFileSync(configPath, "utf-8");
+
+        // Check for duplicate agent: keys — hermes serve adds its own agent: block
+        // with auto-detected provider, creating a duplicate that overrides ours.
+        const agentKeyCount = (content.match(/^agent:\s*$/gm) || []).length;
+        if (agentKeyCount > 1) {
+          console.warn(`[hermes-process] CONFIG WATCHDOG (${source}): ${agentKeyCount} duplicate agent: keys found — rewriting config.yaml`);
+          this.configWatchRewriting = true;
+          this.ensureHermesConfig();
+          this.configWatchRewriting = false;
+          return;
+        }
+
+        const providerMatch = content.match(/^model:\s*\n\s*provider:\s*(\S+)/m);
+        if (!providerMatch) {
+          console.warn(`[hermes-process] CONFIG WATCHDOG (${source}): model: has no provider: — rewriting config.yaml`);
+          this.configWatchRewriting = true;
+          this.ensureHermesConfig();
+          this.configWatchRewriting = false;
+          return;
+        }
+        const currentProvider = providerMatch[1];
+
+        // Also check agent: section for correct provider
+        const agentProviderMatch = content.match(/^agent:\s*\n\s*provider:\s*(\S+)/m);
+        if (agentProviderMatch && agentProviderMatch[1] !== expectedProvider) {
+          console.warn(`[hermes-process] CONFIG WATCHDOG (${source}): agent: provider is ${agentProviderMatch[1]}, expected ${expectedProvider} — rewriting!`);
+          this.configWatchRewriting = true;
+          this.ensureHermesConfig();
+          this.configWatchRewriting = false;
+          return;
+        }
+
+        if (currentProvider !== expectedProvider) {
+          console.warn(`[hermes-process] CONFIG WATCHDOG (${source}): config.yaml provider is ${currentProvider}, expected ${expectedProvider} — rewriting!`);
+          this.configWatchRewriting = true;
+          this.ensureHermesConfig();
+          this.configWatchRewriting = false;
+          // Also fix Hermes internal state via REST API
+          for (const scope of ["main", "auxiliary"]) {
+            fetch(`${this.baseUrl}/api/model/set`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "X-Hermes-Session-Token": this.sessionToken },
+              body: JSON.stringify({ scope, provider: expectedProvider, model: expectedModel }),
+              signal: AbortSignal.timeout(5000),
+            }).then((res) => {
+              if (res.ok) {
+                console.log(`[hermes-process] CONFIG WATCHDOG (${source}): configureModel(${expectedProvider}, scope=${scope}) OK`);
+              }
+            }).catch((err) => {
+              console.warn(`[hermes-process] CONFIG WATCHDOG (${source}): configureModel scope=${scope} error: ${err}`);
+            });
+          }
+        }
+      } catch { /* best effort */ }
+    };
+
+    // 1. fs.watch for instant detection (~100ms)
+    try {
+      if (existsSync(configPath)) {
+        this.configWatcher = watch(configPath, { persistent: false }, (eventType) => {
+          if (eventType !== "change") return;
+          // Debounce: coalesce rapid writes (Hermes may write multiple times)
+          if (this.configWatchDebounce) clearTimeout(this.configWatchDebounce);
+          this.configWatchDebounce = setTimeout(() => {
+            this.configWatchDebounce = null;
+            checkAndFix("fs.watch");
+          }, 100);
+        });
+        this.configWatcher.on("error", (err) => {
+          console.warn(`[hermes-process] fs.watch error on config.yaml: ${err} — falling back to polling only`);
+          this.configWatcher = null;
+        });
+        console.log(`[hermes-process] fs.watch active on config.yaml`);
+      } else {
+        console.warn(`[hermes-process] config.yaml not found at ${configPath} — fs.watch skipped, using polling only`);
+      }
+    } catch (err) {
+      console.warn(`[hermes-process] Failed to start fs.watch on config.yaml: ${err} — using polling only`);
+      this.configWatcher = null;
+    }
+
+    // 2. Polling fallback every 2s (covers Docker inotify issues + missed events)
+    this.configWatchdog = setInterval(() => {
+      checkAndFix("poll");
+    }, 2000);
+    console.log(`[hermes-process] Config watchdog started — fs.watch + 2s polling fallback (expected: ${expectedProvider})`);
+
+    // Start fast env watchdog — separate from config watchdog.
+    // Hermes writes DEEPSEEK_API_KEY= (empty) to .env at runtime, then calls
+    // load_hermes_dotenv(override=True) at inference time, clobbering the
+    // real key. chattr +i doesn't work on overlayfs, so we use a fast polling
+    // loop (500ms) + fs.watch on .env to detect and fix clobbering immediately.
+    this.startEnvWatchdog();
+  }
+
+  /** Stop the config watchdog. */
+  stopConfigWatchdog(): void {
+    if (this.configWatchdog) {
+      clearInterval(this.configWatchdog);
+      this.configWatchdog = null;
+    }
+    if (this.configWatcher) {
+      this.configWatcher.close();
+      this.configWatcher = null;
+    }
+    if (this.configWatchDebounce) {
+      clearTimeout(this.configWatchDebounce);
+      this.configWatchDebounce = null;
+    }
+    this.stopEnvWatchdog();
+  }
+
+  /** Fast env watchdog — detects and fixes .env clobbering by Hermes.
+   *  Uses fs.watch for instant detection + 500ms polling fallback. */
+  private startEnvWatchdog(): void {
+    if (this.envWatchdog) return;
+    const hermesHome = process.env.HERMES_HOME ?? join(homedir(), ".hermes");
+    const envPath = join(hermesHome, ".env");
+
+    const checkEnv = (source: string) => {
+      if (this.envWatchRewriting) return;
+      try {
+        if (!existsSync(envPath)) return;
+        const content = readFileSync(envPath, "utf-8");
+        const glmMatch = content.match(/^GLM_API_KEY=(.*)$/m);
+        const glmBaseUrlMatch = content.match(/^GLM_BASE_URL=(.*)$/m);
+        const providerMatch = content.match(/^HERMES_INFERENCE_PROVIDER=(.*)$/m);
+        const deepseekMatch = content.match(/^DEEPSEEK_API_KEY=(.*)$/m);
+        const glmEmpty = !glmMatch || !glmMatch[1]?.trim();
+        const glmBaseUrlMissing = !glmBaseUrlMatch || !glmBaseUrlMatch[1]?.trim();
+        const paretoKey = process.env.PARETO_INFERENCE_KEY || "";
+        const mc = resolveHermesModelConfig();
+        const expectedProvider = mc?.provider ?? "z-ai";
+        const providerStale = !providerMatch || providerMatch[1]?.trim() !== expectedProvider;
+        // Check GLM_API_KEY, DEEPSEEK_API_KEY, and provider when Pareto is active.
+        // DEEPSEEK_API_KEY must point at Pareto so auto-detected deepseek sessions work.
+        const deepseekEmpty = !deepseekMatch || !deepseekMatch[1]?.trim();
+        if ((glmEmpty || glmBaseUrlMissing || providerStale || deepseekEmpty) && paretoKey) {
+          console.warn(`[hermes-process] ENV WATCHDOG (${source}): .env clobbered (provider=${providerMatch?.[1]?.trim() ?? "missing"}, expected=${expectedProvider}, glm_key=${glmEmpty ? "empty" : "set"}, deepseek_key=${deepseekEmpty ? "empty" : "set"}) — re-syncing`);
+          this.envWatchRewriting = true;
+          syncHermesEnvFile(this.platformEnvVars);
+          this.envWatchRewriting = false;
+        }
+      } catch { /* best effort */ }
+    };
+
+    // fs.watch on .env for instant detection
+    try {
+      if (existsSync(envPath)) {
+        this.envWatcher = watch(envPath, { persistent: false }, (eventType) => {
+          if (eventType !== "change") return;
+          if (this.envWatchDebounce) clearTimeout(this.envWatchDebounce);
+          this.envWatchDebounce = setTimeout(() => {
+            this.envWatchDebounce = null;
+            checkEnv("fs.watch");
+          }, 50);
+        });
+        this.envWatcher.on("error", () => {
+          this.envWatcher = null;
+        });
+        console.log(`[hermes-process] fs.watch active on .env`);
+      }
+    } catch {
+      this.envWatcher = null;
+    }
+
+    // Fast polling every 500ms — Hermes clobbers .env then reads it at
+    // inference time. We need to fix .env before inference happens.
+    this.envWatchdog = setInterval(() => {
+      checkEnv("fast-poll");
+    }, 500);
+    console.log(`[hermes-process] Env watchdog started — fs.watch + 500ms polling`);
+  }
+
+  private stopEnvWatchdog(): void {
+    if (this.envWatchdog) {
+      clearInterval(this.envWatchdog);
+      this.envWatchdog = null;
+    }
+    if (this.envWatcher) {
+      this.envWatcher.close();
+      this.envWatcher = null;
+    }
+    if (this.envWatchDebounce) {
+      clearTimeout(this.envWatchDebounce);
+      this.envWatchDebounce = null;
+    }
+  }
+
+  /** Check if the Hermes gateway is reachable. */
+  private async isReachable(): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/status`, {
+        signal: AbortSignal.timeout(2000),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Spawn the hermes gateway run child process (messaging gateway). */
+  private async spawnGateway(): Promise<void> {
+    const mc = resolveHermesModelConfig();
+    const args = ["gateway", "run", "--replace"];
+    console.log(`[hermes-process] Spawning: hermes ${args.join(" ")}`);
+
+    // Best-effort: try to clear lingering Telegram getUpdates session.
+    // Non-blocking — if it fails (network timeout, no token), we proceed anyway.
+    // The --replace flag in hermes gateway run also handles this on the Hermes side.
+    await Promise.race([
+      this.clearTelegramPolling(),
+      new Promise((resolve) => setTimeout(resolve, 8000)),
+    ]);
+
+    // Clean .env before spawning the gateway — the hermes serve process may have
+    // clobbered DEEPSEEK_API_KEY or GLM_API_KEY to empty via load_hermes_dotenv(override=True).
+    // syncHermesEnvFile rewrites the .env with all keys pointing at Pareto.
+    syncHermesEnvFile(this.platformEnvVars);
+
+    // Re-write config.yaml immediately before spawning the gateway.
+    // The hermes serve process rewrites config.yaml at runtime and moves
+    // provider/default under agent: instead of model:, so the gateway sees
+    // an empty model: section and auto-detects the wrong provider (deepseek,
+    // which is the first model in the Pareto API's model list).
+    // Rewriting here ensures config.yaml has model.provider: z-ai when the
+    // gateway process reads it on startup.
+    this.ensureHermesConfig();
+
+    // Nuke ALL state that the serve process recreated with auto-detected model config.
+    // We already deleted these before spawnHermes(), but serve recreates them on
+    // startup. The gateway reads state.db AND the state/ directory for per-session
+    // model config. If serve auto-detected deepseek, the gateway gets deepseek
+    // from any of these sources, ignoring config.yaml (which has z-ai).
+    // Deleting everything here forces the gateway to fall back to config.yaml.
+    const hermesHome = process.env.HERMES_HOME ?? join(homedir(), ".hermes");
+    for (const dbFile of ["state.db", "state.db-shm", "state.db-wal"]) {
+      try {
+        const dbPath = join(hermesHome, dbFile);
+        if (existsSync(dbPath)) {
+          rmSync(dbPath);
+          console.log(`[hermes-process] Deleted ${dbFile} before gateway spawn (serve recreated it)`);
+        }
+      } catch (err) {
+        console.warn(`[hermes-process] Could not delete ${dbFile} before gateway spawn: ${err}`);
+      }
+    }
+    // Delete state/ directory — separate from state.db, stores session-level state
+    try {
+      const stateDir = join(hermesHome, "state");
+      if (existsSync(stateDir)) {
+        rmSync(stateDir, { recursive: true, force: true });
+        console.log(`[hermes-process] Deleted state/ directory before gateway spawn (serve recreated it)`);
+      }
+    } catch (err) {
+      console.warn(`[hermes-process] Could not delete state/ directory: ${err}`);
+    }
+    // Clear sessions/ directory — may cache session-level model config
+    try {
+      const sessionsDir = join(hermesHome, "sessions");
+      if (existsSync(sessionsDir)) {
+        for (const entry of readdirSync(sessionsDir)) {
+          rmSync(join(sessionsDir, entry), { recursive: true, force: true });
+        }
+        console.log(`[hermes-process] Cleared sessions/ directory before gateway spawn`);
+      }
+    } catch (err) {
+      console.warn(`[hermes-process] Could not clear sessions/ directory: ${err}`);
+    }
+    // Delete models_dev_cache.json again — serve process recreates it with
+    // deepseek as the first auto-detected model. Gateway reads this cache.
+    try {
+      const cachePath = join(hermesHome, "models_dev_cache.json");
+      if (existsSync(cachePath)) {
+        rmSync(cachePath);
+        console.log(`[hermes-process] Deleted models_dev_cache.json before gateway spawn (serve recreated it)`);
+      }
+    } catch (err) {
+      console.warn(`[hermes-process] Could not delete models_dev_cache.json: ${err}`);
+    }
+    // Delete gateway_state.json — stale gateway state
+    try {
+      const gwStatePath = join(hermesHome, "gateway_state.json");
+      if (existsSync(gwStatePath)) {
+        rmSync(gwStatePath);
+        console.log(`[hermes-process] Deleted gateway_state.json before gateway spawn`);
+      }
+    } catch (err) {
+      console.warn(`[hermes-process] Could not delete gateway_state.json: ${err}`);
+    }
+
+    // Diagnostic: dump .env GLM lines right before gateway spawn to verify
+    // GLM_API_KEY is present and not clobbered by hermes serve.
+    try {
+      const envContent = readFileSync(join(hermesHome, ".env"), "utf-8");
+      const glmLines = envContent.split("\n").filter(l => l.includes("GLM_"));
+      console.log(`[hermes-process] .env GLM lines before gateway spawn: ${glmLines.length ? glmLines.join(", ") : "(none)"}`);
+    } catch { /* ignore */ }
+
+    this.gatewayChild = spawn("hermes", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        HERMES_DASHBOARD_SESSION_TOKEN: this.sessionToken,
+        GLM_API_KEY: process.env.PARETO_INFERENCE_KEY || "",
+        GLM_BASE_URL: "https://api.paretoinference.com/v1",
+        // Point DEEPSEEK keys at Pareto so auto-detected deepseek sessions work.
+        DEEPSEEK_API_KEY: process.env.PARETO_INFERENCE_KEY || "",
+        DEEPSEEK_BASE_URL: "https://api.paretoinference.com/v1",
+        DEEPSEEK_KEY: process.env.PARETO_INFERENCE_KEY || "",
+        KIMI_API_KEY: process.env.KIMI_KEY || process.env.KIMI_API_KEY || "",
+        HERMES_INFERENCE_PROVIDER: mc?.provider || "z-ai",
+        GATEWAY_ALLOW_ALL_USERS: "true",
+      },
+    });
+    console.log(`[hermes-process] Gateway env: GLM_API_KEY=${process.env.PARETO_INFERENCE_KEY ? "set" : "NOT SET"}, GLM_BASE_URL=https://api.paretoinference.com/v1, DEEPSEEK_API_KEY=${process.env.PARETO_INFERENCE_KEY ? "set (Pareto)" : "NOT SET"}, KIMI_API_KEY=${process.env.KIMI_KEY ? "set" : "NOT SET"}, HERMES_INFERENCE_PROVIDER=${mc?.provider || "z-ai"}`);
+
+    this.gatewayChild.stdout?.on("data", (data: Buffer) => {
+      const lines = data.toString().trim().split("\n");
+      for (const line of lines) {
+        if (line) console.log(`[hermes-gateway] ${line}`);
+      }
+    });
+
+    this.gatewayChild.stderr?.on("data", (data: Buffer) => {
+      const lines = data.toString().trim().split("\n");
+      for (const line of lines) {
+        if (line) console.error(`[hermes-gateway] ${line}`);
+      }
+    });
+
+    this.gatewayChild.on("exit", (code, signal) => {
+      console.log(`[hermes-process] Gateway process exited (code=${code}, signal=${signal})`);
+      this.gatewayChild = null;
+      if (!this.started) return;
+      // If restartGateway() is handling the restart, don't schedule another one
+      if (this.gatewayRestarting) {
+        this.gatewayRestarting = false;
+        return;
+      }
+      // Only auto-restart on crash (code !== 0), not on clean exit or intentional kill
+      if (code !== 0 && this.restartCount < MAX_RESTARTS) {
+        this.restartCount++;
+        console.log(`[hermes-process] Gateway crashed (code=${code}), restarting in ${RESTART_DELAY_MS / 1000}s (attempt ${this.restartCount}/${MAX_RESTARTS})...`);
+        this.restartTimer = setTimeout(() => {
+          if (this.started) void this.spawnGateway();
+        }, RESTART_DELAY_MS);
+      } else if (code === 0) {
+        console.log(`[hermes-process] Gateway exited cleanly — not auto-restarting`);
+      }
+    });
+
+    this.gatewayChild.on("error", (err) => {
+      console.error(`[hermes-process] Failed to spawn gateway: ${err.message}`);
+      this.gatewayChild = null;
+    });
+  }
+
+  /** Force-close any lingering Telegram getUpdates long-poll by calling
+   *  deleteWebhook with drop_pending_updates=true. This makes Telegram drop
+   *  any existing getUpdates sessions, preventing "Conflict" errors when the
+   *  new gateway starts polling. */
+  private async clearTelegramPolling(): Promise<void> {
+    try {
+      const hermesHome = process.env.HERMES_HOME ?? join(homedir(), ".hermes");
+      const envPath = join(hermesHome, ".env");
+      let botToken: string | undefined;
+      if (existsSync(envPath)) {
+        const envContent = readFileSync(envPath, "utf-8");
+        const match = envContent.match(/^TELEGRAM_BOT_TOKEN=(.+)$/m);
+        if (match) botToken = match[1].trim();
+      }
+      if (!botToken) return;
+      const res = await fetch(`https://api.telegram.org/bot${botToken}/deleteWebhook?drop_pending_updates=false`, {
+        method: "POST",
+        signal: AbortSignal.timeout(10000),
+      });
+      if (res.ok) console.log(`[hermes-process] Telegram polling cleared`);
+    } catch {
+      // Network timeout reaching Telegram — non-fatal, --replace handles it
+    }
+  }
+
+  /** Restart the gateway child process (used after platform credentials change). */
+  restartGateway(): void {
+    this.gatewayRestarting = true; // Prevent exit handler from also scheduling a restart
+    if (this.gatewayChild) {
+      console.log("[hermes-process] Restarting gateway child process...");
+      this.gatewayChild.kill("SIGKILL");
+      this.gatewayChild = null;
+    }
+    // Delay 1s before respawning to let the old process fully exit
+    setTimeout(() => {
+      if (this.started) void this.spawnGateway();
+    }, 1000);
+  }
+
+  private lastPromptUpdate = 0;
+  private static readonly PROMPT_UPDATE_COOLDOWN_MS = 60_000; // 60 seconds (matches SOUL_REFRESH_MS)
+
+  /** Write office state into SOUL.md and config.yaml WITHOUT restarting the gateway.
+   *  Used before gateway start so the system prompt is correct from the beginning.
+   *  SOUL.md is the primary mechanism — Hermes reads it as slot #1 in the system prompt. */
+  writeOfficeState(officeState: string): void {
+    // NOTE: Do NOT set this.currentOfficeState here. Only updateSystemPromptWithOfficeState()
+    // should track state, so it can detect the change (prevState !== officeState) and
+    // trigger a session reset. If we set it here, the first refreshSoulMd() call sees
+    // prevState === officeState and skips the session reset — leaving stale sessions.
+    try {
+      const hermesHome = process.env.HERMES_HOME ?? join(homedir(), ".hermes");
+      const configPath = join(hermesHome, "config.yaml");
+      const soulPath = join(hermesHome, "SOUL.md");
+      const mc = resolveHermesModelConfig();
+      const provider = mc?.provider ?? "z-ai";
+      const model = mc?.model ?? "glm-5.3-flash";
+      this.writeSoulMd(soulPath, officeState);
+      this.writeConfigWithOfficeState(configPath, provider, model, officeState);
+      console.log("[hermes-process] Wrote SOUL.md + config.yaml with live office state (no restart)");
+    } catch (err) {
+      console.warn(`[hermes-process] Failed to write office state: ${err}`);
+    }
+  }
+
+  /** Update the Hermes system prompt with live office state.
+   *  Called periodically by the manager. Rate-limited to max once per 5 minutes.
+   *  Writes config.yaml + SOUL.md, then deletes existing Telegram sessions so
+   *  new ones are created with the updated system prompt. The gateway is NOT
+   *  restarted — pairing state lives in pairing/ directory, separate from
+   *  sessions in state.db, so deleting sessions preserves pairing. */
+  updateSystemPromptWithOfficeState(officeState: string): boolean {
+    const now = Date.now();
+    if (now - this.lastPromptUpdate < HermesProcessManager.PROMPT_UPDATE_COOLDOWN_MS) {
+      return false;
+    }
+    this.lastPromptUpdate = now;
+    const prevState = this.currentOfficeState;
+    this.currentOfficeState = officeState;
+
+    try {
+      const hermesHome = process.env.HERMES_HOME ?? join(homedir(), ".hermes");
+      const configPath = join(hermesHome, "config.yaml");
+      const soulPath = join(hermesHome, "SOUL.md");
+      const mc = resolveHermesModelConfig();
+      const provider = mc?.provider ?? "z-ai";
+      const model = mc?.model ?? "glm-5.3-flash";
+      this.writeSoulMd(soulPath, officeState);
+      this.writeConfigWithOfficeState(configPath, provider, model, officeState);
+      console.log("[hermes-process] Updated SOUL.md + config.yaml with live office state");
+      // Only delete sessions if the office state actually changed — deleting
+      // sessions causes the "No home channel" notification to re-appear for
+      // Telegram users on every new session.
+      if (prevState === officeState) {
+        console.log("[hermes-process] Office state unchanged — skipping session reset");
+        return true;
+      }
+      // Delete existing platform sessions so new ones pick up the updated config.yaml.
+      // The gateway caches the system prompt per session — the only way to refresh
+      // is to delete the session. The gateway will create a new session on the next
+      // message, using the updated config.yaml system_prompt.
+      // Pairing state is in pairing/ directory, NOT in state.db — so it's preserved.
+      // The gateway is NOT restarted — Telegram connection stays alive.
+      void this.resetPlatformSessions();
+      return true;
+    } catch (err) {
+      console.warn(`[hermes-process] Failed to update system prompt with office state: ${err}`);
+      return false;
+    }
+  }
+
+  /** Delete all messaging platform sessions via DELETE /api/sessions/{id}.
+   *  This forces the gateway to create new sessions with the updated config.yaml
+   *  system_prompt on the next message from each user.
+   *  Public so manager.ts can call it after writing office state if the gateway
+   *  is already running.
+   *  Pairing state is stored in pairing/ directory, separate from sessions (state.db),
+   *  so deleting sessions does NOT break Telegram pairing.
+   *  The gateway is NOT restarted — the Telegram connection stays alive. */
+  async resetPlatformSessions(): Promise<void> {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/sessions?limit=100`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Hermes-Session-Token": this.sessionToken,
+        },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) {
+        console.warn(`[hermes-process] resetPlatformSessions: GET sessions failed: HTTP ${res.status}`);
+        return;
+      }
+      const raw = await res.json();
+      let sessions: any[];
+      if (Array.isArray(raw)) {
+        sessions = raw;
+      } else if (raw && typeof raw === "object") {
+        sessions = raw.sessions ?? raw.data ?? raw.items ?? raw.results ?? [];
+        if (!Array.isArray(sessions)) {
+          console.warn(`[hermes-process] resetPlatformSessions: unexpected response shape: ${JSON.stringify(raw).slice(0, 300)}`);
+          sessions = [];
+        }
+      } else {
+        sessions = [];
+      }
+      let deleted = 0;
+      for (const sess of sessions) {
+        const sid = sess.session_id ?? sess.id;
+        if (!sid) continue;
+        const platform = sess.platform ?? sess.source;
+        if (!platform || platform === "cli" || platform === "local") continue;
+        try {
+          const delRes = await fetch(`${this.baseUrl}/api/sessions/${encodeURIComponent(sid)}`, {
+            method: "DELETE",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Hermes-Session-Token": this.sessionToken,
+            },
+            signal: AbortSignal.timeout(5000),
+          });
+          if (delRes.ok) {
+            deleted++;
+          } else {
+            const body = await delRes.text().catch(() => "");
+            console.warn(`[hermes-process] DELETE session ${sid} failed: HTTP ${delRes.status} — ${body.slice(0, 200)}`);
+          }
+        } catch { /* skip individual session */ }
+      }
+      if (deleted > 0) {
+        console.log(`[hermes-process] Deleted ${deleted} platform session(s) — new sessions will use updated config.yaml`);
+      } else {
+        console.log(`[hermes-process] No platform sessions to delete (found ${sessions.length} total sessions)`);
+      }
+    } catch (err) {
+      console.warn(`[hermes-process] resetPlatformSessions error: ${err}`);
+    }
+  }
+
+
+
+  /** Write SOUL.md with the receptionist identity + live office state.
+   *  SOUL.md is Hermes' primary agent identity (slot #1 in system prompt).
+   *  The Hermes framework reads this file and injects it into every conversation —
+   *  the LLM doesn't read the file, the framework does. */
+  private writeSoulMd(soulPath: string, officeState: string): void {
+    const content = [
+      "# Agent Heights Receptionist",
+      "",
+      "You're the receptionist at Agent Heights, a virtual office where AI agents",
+      "do real work as employees. People message you on Telegram.",
+      "",
+      "## Live Office Status",
+      "",
+      officeState,
+      "",
+      "Use this information to answer questions about what's happening in the office.",
+      "Be specific. Name agents and their current tasks.",
+      "",
+      "## Rules",
+      "",
+      "- Write normally. Capital letters, periods, normal sentences.",
+      "- Do NOT use em-dashes. Use periods or commas.",
+      "- Do NOT use lowercase for style. Write like a professional adult.",
+      "- NEVER ask to build a profile, save user preferences, or ask personal questions.",
+      "- NEVER offer to remember things about the user or build a profile of them.",
+      "- Do NOT use the memory tool. Do NOT save anything about users.",
+      "- Do NOT say things like 'hey!' or 'totally' or 'literally'.",
+      "- Do NOT use emoji.",
+      "- Be brief. 1-2 sentences usually. Never more than 3.",
+      "- If someone asks what's going on in the office, use the live office status",
+      "  above to tell them who's here and what they're working on. Be specific.",
+      "- If someone asks for a screenshot or photo, say you can't send photos but",
+      "  describe what's happening. A real screenshot will follow shortly from the team.",
+      "- If someone wants something done, say you'll connect them with the team and",
+      "  someone will respond here shortly. Don't do it yourself.",
+      "- If someone asks about Agent Heights, answer in a sentence or two.",
+      "- If someone says hi, say hi back and ask what they need. Nothing else.",
+      "",
+    ].join("\n");
+    writeFileSync(soulPath, content, "utf-8");
+  }
+
+  /** Build config.yaml with office state embedded in system_prompt as a double-quoted
+   *  YAML string. This is the safest way to embed arbitrary text in YAML — no block
+   *  scalar indentation issues, no colon-as-mapping issues. */
+  private writeConfigWithOfficeState(configPath: string, provider: string, model: string, officeState: string): void {
+    // Preserve existing platform config
+    let preservedPlatforms = "";
+    if (existsSync(configPath)) {
+      const existing = readFileSync(configPath, "utf-8");
+      const lines = existing.split("\n");
+      let inPlatforms = false;
+      let platformsIndent = "";
+      for (const line of lines) {
+        if (/^platforms:\s*$/.test(line) || /^messaging:\s*$/.test(line)) {
+          inPlatforms = true;
+          platformsIndent = "";
+          preservedPlatforms += line + "\n";
+          continue;
+        }
+        if (inPlatforms) {
+          if (line.trim() === "") { preservedPlatforms += "\n"; continue; }
+          const indent = line.match(/^(\s+)/)?.[1] ?? "";
+          if (indent.length > 0 && (platformsIndent === "" || indent.startsWith(platformsIndent))) {
+            if (platformsIndent === "") platformsIndent = indent;
+            preservedPlatforms += line + "\n";
+          } else {
+            inPlatforms = false;
+          }
+        }
+      }
+    }
+
+    const promptText = [
+      "You're the receptionist at Agent Heights, a virtual office where AI agents",
+      "do real work as employees. People message you on Telegram.",
+      "",
+      "Here is the current live office status:",
+      officeState,
+      "",
+      "Use this information to answer questions about what's happening in the office.",
+      "Be specific. Name agents and their current tasks.",
+      "",
+      "Rules:",
+      "- Write normally. Capital letters, periods, normal sentences.",
+      "- Do NOT use em-dashes. Use periods or commas.",
+      "- Do NOT use lowercase for style. Write like a professional adult.",
+      "- NEVER ask to build a profile, save user preferences, or ask personal questions.",
+      "- NEVER offer to remember things about the user or build a profile of them.",
+      "- Do NOT use the memory tool. Do NOT save anything about users.",
+      "- Do NOT say things like 'hey!' or 'totally' or 'literally'.",
+      "- Do NOT use emoji.",
+      "- Be brief. 1-2 sentences usually. Never more than 3.",
+      "- If someone asks what's going on in the office, use the live office status",
+      "  above to tell them who's here and what they're working on. Be specific.",
+      "- If someone asks for a screenshot or photo, say you can't send photos but",
+      "  describe what's happening. A real screenshot will follow shortly from the team.",
+      "- If someone wants something done, say you'll connect them with the team and",
+      "  someone will respond here shortly. Don't do it yourself.",
+      "- If someone asks about Agent Heights, answer in a sentence or two.",
+      "- If someone says hi, say hi back and ask what they need. Nothing else.",
+    ].join("\n");
+
+    // Escape for YAML double-quoted string: backslashes first, then double quotes, then newlines
+    const escaped = promptText
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"')
+      .replace(/\n/g, "\\n");
+
+    const config = [
+      "model:",
+      `  provider: ${provider}`,
+      `  default: ${model}`,
+      "agent:",
+      `  provider: ${provider}`,
+      `  default: ${model}`,
+      `  system_prompt: "${escaped}"`,
+      "telegram:",
+      "  require_mention: false",
+      "",
+    ];
+    if (preservedPlatforms.trim()) {
+      config.push(preservedPlatforms.trimEnd(), "");
+    }
+    writeFileSync(configPath, config.join("\n"), "utf-8");
+  }
+
+  /** Spawn the hermes serve child process. */
+  private spawnHermes(): void {
+    const mc = resolveHermesModelConfig();
+    const args = ["serve", "--port", String(this.port)];
+    console.log(`[hermes-process] Spawning: hermes ${args.join(" ")}`);
+
+    this.child = spawn("hermes", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        HERMES_DASHBOARD_SESSION_TOKEN: this.sessionToken,
+        GLM_API_KEY: process.env.PARETO_INFERENCE_KEY || "",
+        GLM_BASE_URL: "https://api.paretoinference.com/v1",
+        // Point DEEPSEEK keys at Pareto. Hermes auto-detects deepseek for new
+        // sessions (e.g. /reset) because Pareto's API lists deepseek first.
+        // Without a DEEPSEEK_API_KEY, those sessions fail. By pointing it at
+        // Pareto, deepseek sessions work — Pareto serves deepseek-v4-flash.
+        DEEPSEEK_API_KEY: process.env.PARETO_INFERENCE_KEY || "",
+        DEEPSEEK_BASE_URL: "https://api.paretoinference.com/v1",
+        DEEPSEEK_KEY: process.env.PARETO_INFERENCE_KEY || "",
+        KIMI_API_KEY: process.env.KIMI_KEY || process.env.KIMI_API_KEY || "",
+        HERMES_INFERENCE_PROVIDER: mc?.provider || "z-ai",
+      },
+    });
+    console.log(`[hermes-process] Env: GLM_API_KEY=${process.env.PARETO_INFERENCE_KEY ? "set" : "NOT SET"}, GLM_BASE_URL=https://api.paretoinference.com/v1, DEEPSEEK_API_KEY=${process.env.PARETO_INFERENCE_KEY ? "set (Pareto)" : "NOT SET"}, KIMI_API_KEY=${process.env.KIMI_KEY ? "set" : "NOT SET"}, HERMES_INFERENCE_PROVIDER=${mc?.provider || "z-ai"}, HERMES_HOME=${process.env.HERMES_HOME ?? join(homedir(), ".hermes")}`);
+
+    this.child.stdout?.on("data", (data: Buffer) => {
+      const lines = data.toString().trim().split("\n");
+      for (const line of lines) {
+        if (line) console.log(`[hermes] ${line}`);
+      }
+    });
+
+    this.child.stderr?.on("data", (data: Buffer) => {
+      const lines = data.toString().trim().split("\n");
+      for (const line of lines) {
+        if (line) console.error(`[hermes] ${line}`);
+      }
+    });
+
+    this.child.on("exit", async (code, signal) => {
+      console.log(`[hermes-process] Child process exited (code=${code}, signal=${signal})`);
+      this.child = null;
+      this.ready = false;
+
+      if (!this.started) return; // We're shutting down
+
+      // Check if the port is actually serving (another instance may have won the race)
+      if (await this.isReachable()) {
+        console.log("[hermes-process] Port is reachable from another instance — switching to external mode");
+        this.externalMode = true;
+        this.ready = true;
+        this.restartCount = 0;
+        this.startHealthCheck();
+        return;
+      }
+
+      if (this.restartCount < MAX_RESTARTS) {
+        this.restartCount++;
+        console.log(`[hermes-process] Restarting in ${RESTART_DELAY_MS / 1000}s (attempt ${this.restartCount}/${MAX_RESTARTS})...`);
+        this.restartTimer = setTimeout(() => {
+          if (this.started) {
+            this.spawnHermes();
+            void this.waitForReady();
+          }
+        }, RESTART_DELAY_MS);
+      } else {
+        console.error(`[hermes-process] Max restart attempts (${MAX_RESTARTS}) reached — giving up. Start hermes manually: hermes serve`);
+      }
+    });
+
+    this.child.on("error", (err) => {
+      console.error(`[hermes-process] Failed to spawn hermes: ${err.message}`);
+      if (err.message.includes("ENOENT") || err.message.includes("spawn")) {
+        console.error("[hermes-process] hermes command not found. Install it with: pip install hermes-agent");
+      }
+      this.child = null;
+      this.ready = false;
+    });
+  }
+
+  /** Wait for the Hermes gateway to become reachable (up to 30s). */
+  private async waitForReady(): Promise<void> {
+    const maxAttempts = 30;
+    for (let i = 0; i < maxAttempts; i++) {
+      if (await this.isReachable()) {
+        this.ready = true;
+        this.restartCount = 0; // Reset restart count on successful start
+        console.log(`[hermes-process] Hermes gateway is ready at ${this.baseUrl}`);
+        this.startHealthCheck();
+        this.onReady?.();
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    console.error(`[hermes-process] Hermes gateway did not become reachable within ${maxAttempts}s`);
+  }
+
+  /** Periodically check that the Hermes process is alive. */
+  private startHealthCheck(): void {
+    if (this.healthTimer) clearInterval(this.healthTimer);
+    this.healthTimer = setInterval(async () => {
+      if (!this.started) return;
+      // In external mode, just check reachability
+      if (this.externalMode) {
+        if (!await this.isReachable()) {
+          console.warn("[hermes-process] External Hermes became unreachable");
+          this.ready = false;
+        }
+        return;
+      }
+      // If we have a child process and it's not reachable, the process may have hung
+      if (this.child && !await this.isReachable()) {
+        console.warn("[hermes-process] Health check failed — Hermes not reachable, killing child for restart");
+        this.child.kill("SIGTERM");
+        // The exit handler will restart it
+      }
+    }, HEALTH_CHECK_INTERVAL_MS);
+  }
+
+  /** Stop the Hermes gateway child process. Safe to call multiple times. */
+  stop(): void {
+    this.started = false;
+    this.ready = false;
+    this.startPromise = null;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = null;
+    }
+    this.stopConfigWatchdog();
+    if (this.gatewayChild) {
+      console.log("[hermes-process] Stopping hermes gateway child process (SIGKILL)...");
+      this.gatewayChild.kill("SIGKILL");
+      this.gatewayChild = null;
+    }
+    if (this.child) {
+      console.log("[hermes-process] Stopping hermes serve child process...");
+      this.child.kill("SIGTERM");
+      this.child = null;
+    }
+    _instance = null;
+  }
+
+  /** Is the Hermes gateway currently ready? */
+  isReady(): boolean {
+    return this.ready;
+  }
+}
+
+/**
+ * Single authoritative function for writing the Hermes ~/.hermes/.env file.
+ *
+ * Merges credentials from savedCreds (save.json / DB) into the existing .env,
+ * ensures KIMI_API_KEY is present, and writes atomically (temp + rename).
+ *
+ * Call this before gateway start, after platform config API calls, and after
+ * any credential change. This replaces the triple-write workaround that was
+ * spread across hermes-process.ts and manager.ts.
+ *
+ * @param savedCreds — credential env vars from save.json (e.g. { TELEGRAM_BOT_TOKEN: "...", TELEGRAM_HOME_CHANNEL: "..." })
+ * @param platformCredentials — optional: our credential field keys per platform (e.g. { telegram: { bot_token: "..." } })
+ *   to also write via PLATFORM_ENV_VAR_MAP mapping
+ */
+export function syncHermesEnvFile(savedCreds: Record<string, string>, platformCredentials?: Record<string, Record<string, string>>): void {
+  try {
+    const hermesHome = process.env.HERMES_HOME ?? join(homedir(), ".hermes");
+    if (!existsSync(hermesHome)) mkdirSync(hermesHome, { recursive: true });
+    const envPath = join(hermesHome, ".env");
+
+    // Start from existing .env content (if any)
+    let envContent = "";
+    if (existsSync(envPath)) {
+      envContent = readFileSync(envPath, "utf-8");
+    }
+
+    // Collect all env vars to write into a single map for deduplication
+    const varsToWrite: Record<string, string> = {};
+
+    // LLM API keys and provider override are written to ~/.hermes/.env so that
+    // Hermes's load_hermes_dotenv(override=True) always finds the correct values.
+    // When Pareto is active, both GLM and DEEPSEEK keys point at Pareto so that
+    // whichever provider Hermes auto-detects (z-ai or deepseek), API calls work.
+    const llmEnvVars: Record<string, string> = {};
+    const mc = resolveHermesModelConfig();
+    if (process.env.PARETO_INFERENCE_KEY) {
+      llmEnvVars["GLM_API_KEY"] = process.env.PARETO_INFERENCE_KEY;
+      llmEnvVars["GLM_BASE_URL"] = "https://api.paretoinference.com/v1";
+      // Also set DEEPSEEK_API_KEY + DEEPSEEK_BASE_URL to Pareto. Hermes
+      // auto-detects deepseek for new sessions (e.g. /reset) because the
+      // Pareto API lists deepseek/deepseek-v4-flash first. Without a
+      // DEEPSEEK_API_KEY, those sessions fail with "no API key found".
+      // By pointing DEEPSEEK_API_KEY at Pareto, auto-detected deepseek
+      // sessions work correctly — Pareto serves deepseek-v4-flash.
+      llmEnvVars["DEEPSEEK_API_KEY"] = process.env.PARETO_INFERENCE_KEY;
+      llmEnvVars["DEEPSEEK_BASE_URL"] = "https://api.paretoinference.com/v1";
+    } else if (process.env.DEEPSEEK_KEY) {
+      llmEnvVars["DEEPSEEK_API_KEY"] = process.env.DEEPSEEK_KEY;
+      llmEnvVars["DEEPSEEK_BASE_URL"] = "https://api.deepseek.com";
+    }
+    if (mc?.provider) llmEnvVars["HERMES_INFERENCE_PROVIDER"] = mc.provider;
+    if (process.env.KIMI_KEY) llmEnvVars["KIMI_API_KEY"] = process.env.KIMI_KEY;
+    if (process.env.KIMI_API_KEY) llmEnvVars["KIMI_API_KEY"] = process.env.KIMI_API_KEY;
+
+    // Keys that we always manage (write current values, remove stale ones)
+    const MANAGED_ENV_KEYS = new Set([
+      "GLM_API_KEY", "GLM_BASE_URL", "PARETO_API_KEY", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_KEY", "KIMI_API_KEY", "KIMI_CODING_API_KEY",
+      "HERMES_INFERENCE_PROVIDER", "HERMES_MODEL_PROVIDER", "HERMES_MODEL_NAME",
+    ]);
+
+    // 1. LLM API keys + provider override (from process env)
+    for (const [varName, value] of Object.entries(llmEnvVars)) {
+      varsToWrite[varName] = value;
+    }
+
+    // 2. Saved credentials from save.json (already in env-var form)
+    for (const [varName, value] of Object.entries(savedCreds)) {
+      varsToWrite[varName] = value;
+    }
+
+    // 3. Platform credentials passed in our credential-field-key form
+    if (platformCredentials) {
+      for (const [platform, creds] of Object.entries(platformCredentials)) {
+        const varMap = PLATFORM_ENV_VAR_MAP[platform.toLowerCase()] ?? {};
+        for (const [credKey, envVar] of Object.entries(varMap)) {
+          const value = creds[credKey];
+          if (value) {
+            varsToWrite[envVar] = value;
+          }
+        }
+      }
+    }
+
+    // Merge: remove existing lines for all vars we're writing AND for
+    // managed keys (LLM API keys + provider override) so stale values from
+    // a previous deploy on the persistent volume are always replaced.
+    const varsToReplace = new Set([...Object.keys(varsToWrite), ...MANAGED_ENV_KEYS]);
+    const lines = envContent.split("\n").filter((l) => {
+      const eqIdx = l.indexOf("=");
+      if (eqIdx === -1) return true;
+      const key = l.slice(0, eqIdx);
+      return !varsToReplace.has(key);
+    });
+
+    for (const [varName, value] of Object.entries(varsToWrite)) {
+      lines.push(`${varName}=${value}`);
+    }
+
+    const finalContent = lines.join("\n");
+    const content = finalContent.endsWith("\n") ? finalContent : finalContent + "\n";
+
+    // Atomic write: write to temp file, then rename
+    const tmpPath = envPath + ".tmp";
+    writeFileSync(tmpPath, content, "utf-8");
+    renameSync(tmpPath, envPath);
+
+    const finalKeys = content.split("\n").filter(l => l.match(/^[A-Z_]+=/)).map(l => l.split("=")[0]);
+    console.log(`[hermes-process] syncHermesEnvFile: wrote ${finalKeys.join(", ") || "(none)"} to ${envPath}`);
+  } catch (err) {
+    console.warn(`[hermes-process] syncHermesEnvFile failed: ${err}`);
+  }
+}
