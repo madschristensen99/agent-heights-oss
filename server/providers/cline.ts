@@ -55,7 +55,7 @@ async function describeScreenshotWithKimi(base64Frame: string, agentId: string):
         },
       ],
       max_tokens: 1024,
-      temperature: 0.3,
+      temperature: 1,
     }),
     signal: AbortSignal.timeout(30_000),
   });

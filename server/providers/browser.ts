@@ -30,11 +30,19 @@ async function getBrowser(): Promise<Browser> {
   browserInstance = await chromium.launch({
     headless: true,
     // --no-sandbox is required because the container runs as root.
-    // TODO: Create a non-root user in the Dockerfile and remove --no-sandbox
-    // to enable Chromium's built-in sandbox for defense-in-depth.
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-gpu",
+      "--disable-dev-shm-usage",
+      // Stealth: reduce automation fingerprints for Cloudflare / bot detection
+      "--disable-blink-features=AutomationControlled",
+      "--disable-features=IsolateOrigins,site-per-process",
+      "--disable-infobars",
+      "--window-size=1280,720",
+    ],
   });
-  console.log("[browser] launched headless Chromium");
+  console.log("[browser] launched headless Chromium (stealth args)");
   return browserInstance;
 }
 
@@ -50,8 +58,18 @@ export async function getAgentBrowser(agentId: string): Promise<AgentBrowser> {
   const context = await browser.newContext({
     viewport: { width: 1280, height: 720 },
     locale: "en-US",
+    userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
   });
   const page = await context.newPage();
+
+  // Anti-detection: remove navigator.webdriver flag and patch other fingerprints
+  // that Cloudflare and similar services use to detect headless browsers.
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+    (window as any).chrome = { runtime: {} };
+  });
 
   const ab: AgentBrowser = {
     browser,
@@ -111,10 +129,28 @@ export async function browserNavigate(agentId: string, url: string): Promise<str
   }
   const ab = await getAgentBrowser(agentId);
   await ab.page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+
+  // Detect Cloudflare "Just a moment..." challenge and wait for it to resolve.
+  // The challenge auto-executes JS in the browser; with stealth args it may clear.
+  const title = await ab.page.title();
+  if (title.includes("Just a moment") || title.includes("Attention Required")) {
+    console.log(`[browser] Cloudflare challenge detected on ${url}, waiting up to 10s for resolution...`);
+    try {
+      // Wait for the challenge to resolve — the page title or URL will change
+      await ab.page.waitForFunction(
+        () => !document.title.includes("Just a moment") && !document.title.includes("Attention Required"),
+        { timeout: 10_000 },
+      );
+      console.log(`[browser] Cloudflare challenge resolved for ${url}`);
+    } catch {
+      console.log(`[browser] Cloudflare challenge did not resolve within 10s for ${url}`);
+    }
+  }
+
   ab.currentUrl = ab.page.url();
   ab.lastActivity = Date.now();
-  const title = await ab.page.title();
-  return `Navigated to ${ab.page.url()}\nTitle: ${title}`;
+  const finalTitle = await ab.page.title();
+  return `Navigated to ${ab.page.url()}\nTitle: ${finalTitle}`;
 }
 
 /** Take a screenshot and cache it. Returns base64 JPEG (no data: prefix). */
