@@ -330,6 +330,8 @@ export class OfficeScene extends Phaser.Scene {
   private projectorAgentTextureKey = "projector-agent-frame";
   /** Phaser image object for agent frames on projector. */
   private projectorAgentImage: Phaser.GameObjects.Image | null = null;
+  /** Cached last broadcast frame (base64) for projector expand. */
+  private projectorAgentLastFrame: string | null = null;
   /** Matrix rain overlays for working monitors — keyed by desk index. */
   private monitorMatrixOverlays: Map<number, Phaser.GameObjects.Image> = new Map();
   /** Matrix rain canvas texture. */
@@ -603,6 +605,9 @@ export class OfficeScene extends Phaser.Scene {
         }
         const placeholder = document.getElementById("agent-view-screen-placeholder");
         if (placeholder) placeholder.style.display = "none";
+        // Show expand button now that we have a frame
+        const expandBtn = document.getElementById("agent-view-screen-expand");
+        if (expandBtn) expandBtn.style.display = "flex";
         if (url) {
           const urlEl = document.getElementById("agent-view-url");
           if (urlEl) urlEl.textContent = url;
@@ -617,6 +622,7 @@ export class OfficeScene extends Phaser.Scene {
       this.agentBroadcastAgentId = agentId;
       if (!agentId) {
         this.hideProjectorAgentFrame();
+        this.projectorAgentLastFrame = null;
       }
       // Update modal broadcast button if open
       const btn = document.getElementById("agent-view-broadcast");
@@ -6162,7 +6168,13 @@ export class OfficeScene extends Phaser.Scene {
       }
       this.projectorVideoId = null;
       this.projectorEmbedUrl = null;
-      this.hideProjectorExpandBtn();
+      // Show expand button if we have a cached frame to expand
+      if (this.projectorAgentLastFrame && this.projectorAgentImage?.visible) {
+        const rect = this.worldRectToScreen(px - sw / 2, py - sh / 2, sw, sh);
+        this.showProjectorExpandBtn(rect);
+      } else {
+        this.hideProjectorExpandBtn();
+      }
       return;
     }
 
@@ -9379,6 +9391,17 @@ export class OfficeScene extends Phaser.Scene {
 
     if (this.agentViewTab === "screen") {
       content.innerHTML = this.renderAgentScreenTab(agent);
+      // Wire expand button
+      const expandBtn = document.getElementById("agent-view-screen-expand");
+      if (expandBtn) {
+        expandBtn.addEventListener("click", () => {
+          if (!this.expandedView) return;
+          const img = document.getElementById("agent-view-screen-img") as HTMLImageElement | null;
+          if (img && img.style.display !== "none" && img.src) {
+            this.expandedView.showImage(img.src, `${agent.name} — Live Screen`);
+          }
+        });
+      }
     } else if (this.agentViewTab === "files") {
       this.renderFilesTab(agentId, content);
     } else if (this.agentViewTab === "terminal") {
@@ -10385,6 +10408,7 @@ export class OfficeScene extends Phaser.Scene {
             <div style="font-size:0.85rem;color:#1a6bb0;">Waiting for ${agent.name} to open a browser…</div>
             <div style="font-size:0.7rem;color:#3a8cb8;">The agent can use the <code style="color:#1a6bb0;background:rgba(255,255,255,0.5);padding:2px 6px;border-radius:4px;border:1px solid rgba(255,255,255,0.6);">browse_url</code> tool to navigate to websites.</div>
           </div>
+          <button id="agent-view-screen-expand" title="Expand screenshot" style="position:absolute;top:6px;right:6px;width:28px;height:28px;border:1px solid rgba(255,255,255,0.5);border-radius:6px;background:rgba(255,255,255,0.7);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);color:#1a6bb0;font-size:1rem;cursor:pointer;display:${imgDisplay};align-items:center;justify-content:center;padding:0;line-height:1;">⤢</button>
         </div>
         <div style="flex-shrink:0;padding:6px 14px;background:linear-gradient(to bottom,rgba(255,255,255,0.6),rgba(220,240,255,0.4));backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border-top:1px solid rgba(255,255,255,0.4);display:flex;align-items:center;gap:8px;">
           <span style="color:#4a7a9a;font-size:0.7rem;">URL:</span>
@@ -10561,6 +10585,9 @@ export class OfficeScene extends Phaser.Scene {
 
   /** Render an agent screenshot frame onto the projector canvas. */
   private updateProjectorAgentFrame(frame: string): void {
+    // Cache frame for projector expand
+    this.projectorAgentLastFrame = frame;
+
     // Hide YouTube iframe and HTML iframe if visible
     if (this.projectorIframe) this.projectorIframe.style.display = "none";
     this.hideProjectorHtmlIframe();
@@ -11038,10 +11065,23 @@ export class OfficeScene extends Phaser.Scene {
     this.updateProjectorVideoOverlays();
   }
 
-  /** Expand the projector's current iframe content (YouTube / TradingView / HTML) into a large modal. */
+  /** Expand the projector's current content (YouTube / TradingView / HTML / agent screenshot) into a large modal. */
   private expandProjectorIframe(): void {
     if (!this.expandedView) return;
     const channel = this.store.projectorChannel;
+
+    // Agent screenshot frame — expand as image
+    if (channel === "agent" && this.projectorAgentLastFrame) {
+      const agent = this.agentBroadcastAgentId
+        ? this.store.agents.get(this.agentBroadcastAgentId)
+        : null;
+      const title = agent ? `${agent.name} — Live Screen` : "Agent Screen";
+      this.expandedView.showImage(
+        `data:image/jpeg;base64,${this.projectorAgentLastFrame}`,
+        title,
+      );
+      return;
+    }
 
     // Determine which iframe and URL to expand
     if (channel === "html" && this.projectorHtmlIframe && this.projectorHtmlIframe.style.display !== "none") {

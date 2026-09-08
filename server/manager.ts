@@ -7075,7 +7075,6 @@ You are talking to your boss in a hallway, not writing a performance review docu
   /** Scheduler tick — check all enabled schedules and fire due ones. */
   private tickSchedules(): void {
     if (this.shuttingDown) return;
-    if (!this.isUserConnectedFn()) return;
     const now = Date.now();
     const orphaned: string[] = [];
     for (const sched of this.schedules.values()) {

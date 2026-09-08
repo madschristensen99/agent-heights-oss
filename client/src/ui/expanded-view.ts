@@ -25,7 +25,7 @@ export class ExpandedView {
   private tabBar: HTMLDivElement | null = null;
 
   /** Currently displayed mode */
-  private mode: "video" | "iframe" | null = null;
+  private mode: "video" | "iframe" | "image" | null = null;
 
   /** Video mode: the original wrap div to return the video to */
   private originalWrap: HTMLDivElement | null = null;
@@ -40,6 +40,9 @@ export class ExpandedView {
   private modalIframe: HTMLIFrameElement | null = null;
   /** Iframe mode: the original projector iframe to un-hide on close */
   private originalIframe: HTMLIFrameElement | null = null;
+
+  /** Image mode: the <img> element currently in the modal */
+  private modalImage: HTMLImageElement | null = null;
 
   private keyHandler: ((e: KeyboardEvent) => void) | null = null;
 
@@ -157,6 +160,40 @@ export class ExpandedView {
     this.attachKeyHandler();
   }
 
+  /**
+   * Show an image (screenshot) in the expanded modal.
+   * Creates a new <img> element with object-fit: contain.
+   */
+  showImage(src: string, title: string): void {
+    this.close();
+
+    this.mode = "image";
+
+    this.buildShell();
+
+    // Title
+    if (this.titleBar) {
+      const titleEl = this.titleBar.querySelector(".ev-title") as HTMLSpanElement;
+      if (titleEl) titleEl.textContent = title;
+    }
+
+    // Content area with image
+    this.contentArea = document.createElement("div");
+    this.contentArea.className = "ev-content";
+    this.container!.appendChild(this.contentArea);
+
+    this.modalImage = document.createElement("img");
+    this.modalImage.style.cssText =
+      "width:100%;height:100%;object-fit:contain;display:block;border-radius:0 0 8px 8px;background:#0a0a14;";
+    this.modalImage.src = src;
+    this.contentArea.appendChild(this.modalImage);
+
+    // Controls
+    this.buildImageControls();
+
+    this.attachKeyHandler();
+  }
+
   /** Switch the active video tab in the modal. */
   switchToTab(key: string): void {
     if (this.mode !== "video") return;
@@ -211,6 +248,8 @@ export class ExpandedView {
       this.originalIframe.style.display = "block";
     }
 
+    // Image mode: no element restoration needed
+
     this.mode = null;
     this.currentVideo = null;
     this.originalWrap = null;
@@ -218,6 +257,7 @@ export class ExpandedView {
     this.activeTabKey = null;
     this.modalIframe = null;
     this.originalIframe = null;
+    this.modalImage = null;
 
     this.detachKeyHandler();
 
@@ -369,6 +409,22 @@ export class ExpandedView {
       window.open(watchUrl, "_blank", "noopener,noreferrer");
     };
     controls.appendChild(openBtn);
+
+    // Fullscreen
+    const fsBtn = document.createElement("button");
+    fsBtn.className = "ev-btn";
+    fsBtn.textContent = "⛶";
+    fsBtn.title = "Fullscreen (F)";
+    fsBtn.onclick = () => this.toggleFullscreen();
+    controls.appendChild(fsBtn);
+
+    this.container.appendChild(controls);
+  }
+
+  private buildImageControls(): void {
+    if (!this.container) return;
+    const controls = document.createElement("div");
+    controls.className = "ev-controls";
 
     // Fullscreen
     const fsBtn = document.createElement("button");
