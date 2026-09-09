@@ -58,6 +58,7 @@ import { searchPulseMCP, shouldSearchPulseMCP, extractSearchQuery } from "./puls
 import { shouldCreateTask } from "./agent-mail.js";
 import { parseStoredToken, refreshMcpToken } from "./mcp-oauth.js";
 import { getAgentAccount, getAgentBalances as getCdpBalances } from "./providers/cdp-solana.js";
+import { getAgentAccount as getEvmAgentAccount } from "./providers/cdp-evm.js";
 import { getOrCreateAgentWallet as getCrossmintWallet, getAgentBalances as getCrossmintBalances } from "./providers/crossmint-wallets.js";
 import type { CircleServiceConfig } from "./providers/premium-proxy.js";
 import { OfficeState } from "./office-state.js";
@@ -158,8 +159,9 @@ const MAX_CALLS_PER_TOOL = 10; // Abort after 10 calls to the same tool name (ca
 const MAX_MCP_TOOL_CALLS = 20; // Total MCP-originated tool calls per task before aborting
 const MAX_REWORKS = 3; // Maximum rework cycles before warning the manager
 const MAX_REVIEW_CHAIN_DEPTH = 3; // Auto-approve after this many review cycles on the same card
-const MAX_PENDING_REVIEWS = 5; // Global circuit breaker: stop creating review tasks if this many are already pending
+const MAX_PENDING_REVIEWS = 3; // Global circuit breaker: stop creating review tasks if this many are already pending
 const MAX_QUEUE_DEPTH = 5; // Maximum queued tasks per agent — prevents unbounded queue growth
+const MAX_BOARD_CARDS = 50; // Auto-prune oldest done/backlog cards when board exceeds this size
 const MAX_CONSECUTIVE_FAILURES = 3; // Stop an agent after this many consecutive task failures
 const API_FAILURE_WINDOW_MS = 60_000; // Window for counting concurrent API failures
 const API_FAILURE_THRESHOLD = 3; // Number of failures within the window to trigger office-wide pause
@@ -1804,7 +1806,7 @@ export class AgentManager {
     return this.chunkOverrides[`${cx},${cy}`];
   }
 
-  async hire(name: string, provider: Provider, model: string, systemPrompt = "", role: AgentRole = "worker", sprite?: number, appearance?: CharAppearance | null, mcpServers?: MCPServerConfig[], personality?: PersonalityTraits, cdpSolana?: boolean, crossmintWallet?: boolean, isPremium?: boolean, circleServices?: CircleServiceConfig[], skills?: TaskCategory[], acl?: AgentACL, monidEnabled?: boolean): Promise<void> {
+  async hire(name: string, provider: Provider, model: string, systemPrompt = "", role: AgentRole = "worker", sprite?: number, appearance?: CharAppearance | null, mcpServers?: MCPServerConfig[], personality?: PersonalityTraits, cdpSolana?: boolean, crossmintWallet?: boolean, isPremium?: boolean, circleServices?: CircleServiceConfig[], skills?: TaskCategory[], acl?: AgentACL, monidEnabled?: boolean, cdpEvm?: boolean, crossmintChain?: string): Promise<void> {
     const cleanName = name.trim().slice(0, 24) || "Agent";
     console.log(`[manager] hire called: name=${cleanName} provider=${provider} model=${model}`);
 
@@ -1866,7 +1868,9 @@ export class AgentManager {
       tasksDone: 0,
       mcpServers: mcpServers?.length ? mcpServers : undefined,
       cdpSolana: cdpSolana ?? false,
+      cdpEvm: cdpEvm ?? false,
       crossmintWallet: crossmintWallet ?? false,
+      crossmintChain: crossmintChain ?? undefined,
       isPremium: isPremium ?? false,
       circleServices: circleServices?.length ? circleServices : undefined,
       monidEnabled: monidEnabled ?? false,
@@ -1897,8 +1901,16 @@ export class AgentManager {
       });
     }
 
+    if (cdpEvm) {
+      getEvmAgentAccount(info.id).then((account) => {
+        console.log(`[manager] Provisioned EVM wallet for ${cleanName} (id=${info.id}): ${account.address}`);
+      }).catch((err) => {
+        console.error(`[manager] Failed to provision EVM wallet for ${cleanName} (id=${info.id}):`, err);
+      });
+    }
+
     if (crossmintWallet) {
-      getCrossmintWallet(info.id).then((wallet) => {
+      getCrossmintWallet(info.id, crossmintChain).then((wallet) => {
         if (wallet) console.log(`[manager] Provisioned Crossmint wallet for ${cleanName} (id=${info.id}): ${wallet.address}`);
       }).catch((err) => {
         console.error(`[manager] Failed to provision Crossmint wallet for ${cleanName} (id=${info.id}):`, err);
@@ -1909,7 +1921,7 @@ export class AgentManager {
   /** Hire an agent from the Office Manager's chat — broadcasts helicopter_delivery to client
    *  so the helicopter animation plays, then hires the agent server-side.
    *  Returns the new agent's id. */
-  async hireAgent(name: string, model: string, systemPrompt: string, mcpServers?: MCPServerConfig[], cdpSolana?: boolean, crossmintWallet?: boolean, isPremium?: boolean, circleServices?: CircleServiceConfig[], skills?: TaskCategory[]): Promise<string> {
+  async hireAgent(name: string, model: string, systemPrompt: string, mcpServers?: MCPServerConfig[], cdpSolana?: boolean, crossmintWallet?: boolean, isPremium?: boolean, circleServices?: CircleServiceConfig[], skills?: TaskCategory[], cdpEvm?: boolean, crossmintChain?: string): Promise<string> {
     const cleanName = name.trim().slice(0, 24) || "Agent";
     // Broadcast helicopter delivery to all clients so the animation plays
     this.broadcast({
@@ -1922,7 +1934,7 @@ export class AgentManager {
       alreadyHired: true,
     });
     // Hire the agent server-side (this creates the agent + broadcasts "agent" msg)
-    await this.hire(cleanName, "cline", model, systemPrompt, "worker", undefined, undefined, mcpServers, undefined, cdpSolana, crossmintWallet, isPremium, circleServices, skills);
+    await this.hire(cleanName, "cline", model, systemPrompt, "worker", undefined, undefined, mcpServers, undefined, cdpSolana, crossmintWallet, isPremium, circleServices, skills, undefined, undefined, cdpEvm, crossmintChain);
     // Find the agent we just hired by name
     const rt = [...this.agents.values()].find((a) => a.info.name === cleanName);
     // Surface MCP OAuth requirements if the new agent has remote MCP servers
@@ -1988,7 +2000,9 @@ export class AgentManager {
 
     // Inherit wallet flags if either agent has them
     const cdpSolana = infoA.cdpSolana || infoB.cdpSolana;
+    const cdpEvm = infoA.cdpEvm || infoB.cdpEvm;
     const crossmintWallet = infoA.crossmintWallet || infoB.crossmintWallet;
+    const crossmintChain = infoA.crossmintChain ?? infoB.crossmintChain;
     // Inherit premium services if either agent has them
     const isPremium = infoA.isPremium || infoB.isPremium;
     const mergedCircleServices = [...(infoA.circleServices ?? []), ...(infoB.circleServices ?? [])];
@@ -2024,6 +2038,10 @@ export class AgentManager {
       isPremium || undefined,
       mergedCircleServices.length > 0 ? mergedCircleServices : undefined,
       mergedSkills.length > 0 ? mergedSkills : undefined,
+      undefined,
+      undefined,
+      cdpEvm || undefined,
+      crossmintChain,
     );
 
     // Find the newly hired fused agent
@@ -2057,7 +2075,7 @@ export class AgentManager {
     this.broadcast({ type: "toast", text: `${rt.info.name}'s system prompt updated.` });
   }
 
-  assign(agentId: string, task: string, handoffTo?: string, cardId?: string, scheduleId?: string, reviewContext?: { agentId: string; agentName: string; originalTask: string; cardId?: string | null; previousResult?: string; platformContext?: { platform: string; sender: string } | null } | null, notifyOnComplete?: string, waitFor?: string, platformContext?: { platform: string; sender: string } | null): void {
+  assign(agentId: string, task: string, handoffTo?: string, cardId?: string, scheduleId?: string, reviewContext?: { agentId: string; agentName: string; originalTask: string; cardId?: string | null; previousResult?: string; platformContext?: { platform: string; sender: string } | null } | null, notifyOnComplete?: string, waitFor?: string, platformContext?: { platform: string; sender: string } | null, cardOverrides?: { title?: string; description?: string }): void {
     const rt = this.agents.get(agentId);
     if (!rt) return;
     const cleanTask = task.trim();
@@ -2074,7 +2092,7 @@ export class AgentManager {
     }
 
     // Auto-create a board card if none was provided (makes every task visible on the board)
-    const effectiveCardId = cardId ?? this.autoCardFor(agentId, cleanTask, reviewContext ? "review" : "task");
+    const effectiveCardId = cardId ?? this.autoCardFor(agentId, cleanTask, reviewContext ? "review" : "task", cardOverrides);
 
     if (rt.info.status === "thinking" || rt.info.status === "working" || rt.info.status === "done" || rt.info.status === "waiting" || rt.info.status === "error") {
       if (rt.taskQueue.length >= MAX_QUEUE_DEPTH) {
@@ -2263,7 +2281,11 @@ export class AgentManager {
       handoffTo: rt.handoffTo,
     });
     this.setStatus(rt, "thinking");
-    this.log(rt, "status", `New task: ${cleanTask}`);
+    if (reviewContext) {
+      this.log(rt, "status", `New task: Reviewing ${reviewContext.agentName}'s work on "${reviewContext.originalTask.slice(0, 80)}"`);
+    } else {
+      this.log(rt, "status", `New task: ${cleanTask}`);
+    }
     if (target) this.log(rt, "status", `Will hand the result to ${target.info.name} when done.`);
     rt.cardId = cardId ?? null;
     // V-model: set phase to implementation and record start time if not already set
@@ -2897,7 +2919,9 @@ export class AgentManager {
       sessionId: fa.sessionId,
       tasksDone: fa.tasksDone,
       cdpSolana: fa.cdpSolana ?? false,
+      cdpEvm: fa.cdpEvm ?? false,
       crossmintWallet: fa.crossmintWallet ?? false,
+      crossmintChain: fa.crossmintChain ?? undefined,
       isPremium: fa.isPremium ?? false,
       circleServices: fa.circleServices,
       skills: fa.skills,
@@ -2927,8 +2951,16 @@ export class AgentManager {
       });
     }
 
+    if (info.cdpEvm) {
+      getEvmAgentAccount(info.id).then((account) => {
+        console.log(`[manager] Re-provisioned EVM wallet for ${info.name} (id=${info.id}): ${account.address}`);
+      }).catch((err) => {
+        console.error(`[manager] Failed to re-provision EVM wallet for ${info.name} (id=${info.id}):`, err);
+      });
+    }
+
     if (info.crossmintWallet) {
-      getCrossmintWallet(info.id).then((wallet) => {
+      getCrossmintWallet(info.id, info.crossmintChain).then((wallet) => {
         if (wallet) console.log(`[manager] Re-provisioned Crossmint wallet for ${info.name} (id=${info.id}): ${wallet.address}`);
       }).catch((err) => {
         console.error(`[manager] Failed to re-provision Crossmint wallet for ${info.name} (id=${info.id}):`, err);
@@ -2956,13 +2988,36 @@ export class AgentManager {
   }
 
   /** Create a board card automatically for a task assignment (not manually created by the user). */
-  private autoCardFor(agentId: string, task: string, type: CardType = "task"): string {
-    const title = task.length > 80 ? task.slice(0, 77) + "…" : task;
+  private autoCardFor(agentId: string, task: string, type: CardType = "task", overrides?: { title?: string; description?: string }): string {
+    // Auto-prune: if board exceeds MAX_BOARD_CARDS, remove oldest done cards first, then oldest backlog
+    if (this.board.size >= MAX_BOARD_CARDS) {
+      const doneCards = [...this.board.values()]
+        .filter((c) => c.status === "done")
+        .sort((a, b) => (a.statusChangedAt ?? a.createdAt) - (b.statusChangedAt ?? b.createdAt));
+      const backlogCards = [...this.board.values()]
+        .filter((c) => c.status === "backlog" && !c.assignedAgentId)
+        .sort((a, b) => (a.statusChangedAt ?? a.createdAt) - (b.statusChangedAt ?? b.createdAt));
+      const toPrune = [...doneCards, ...backlogCards];
+      let pruned = 0;
+      for (const c of toPrune) {
+        if (this.board.size < MAX_BOARD_CARDS) break;
+        this.board.delete(c.id);
+        this.broadcast({ type: "card_removed", cardId: c.id });
+        pruned++;
+      }
+      if (pruned > 0) {
+        this.persistBoard();
+        this.broadcastGanttUpdate();
+        console.log(`[manager] Auto-pruned ${pruned} old card(s) to stay under MAX_BOARD_CARDS (${MAX_BOARD_CARDS})`);
+      }
+    }
+    const title = (overrides?.title ?? (task.length > 80 ? task.slice(0, 77) + "…" : task)).slice(0, 200);
+    const description = (overrides?.description ?? task).slice(0, 1000);
     const category = this.inferCategory(task);
     const card: TaskCard = {
       id: randomUUID().slice(0, 8),
       title,
-      description: task,
+      description,
       status: "in_progress",
       assignedAgentId: agentId,
       lockedBy: agentId,
@@ -3082,6 +3137,20 @@ export class AgentManager {
     this.persistBoard();
     this.broadcast({ type: "card_removed", cardId });
     this.broadcastGanttUpdate();
+  }
+
+  /** Remove all backlog cards that aren't assigned to anyone. */
+  clearBacklog(): void {
+    const toRemove = [...this.board.values()].filter(
+      (c) => c.status === "backlog" && !c.assignedAgentId,
+    );
+    for (const c of toRemove) {
+      this.board.delete(c.id);
+      this.broadcast({ type: "card_removed", cardId: c.id });
+    }
+    this.persistBoard();
+    this.broadcastGanttUpdate();
+    this.broadcast({ type: "toast", text: `Cleared ${toRemove.length} backlog card${toRemove.length === 1 ? "" : "s"}.` });
   }
 
   // ── V-model / Gantt / dependency methods ───────────────────────
@@ -3952,6 +4021,7 @@ export class AgentManager {
     if (this.isApiPaused()) return;
     for (const card of this.board.values()) {
       if (card.status !== "review_pending") continue;
+      if (card.type === "review") continue; // don't re-escalate review task cards
       if (card.assignedAgentId) continue; // someone is already reviewing
       // Also check if any manager has this card in their reviewContext — the card's
       // assignedAgentId may not be set even though a review task was already dispatched.
@@ -4790,7 +4860,9 @@ You are talking to your boss in a hallway, not writing a performance review docu
           ...getServerConfigs(this.userId),
         ],
         cdpSolana: rt.info.cdpSolana ?? false,
+        cdpEvm: rt.info.cdpEvm ?? false,
         crossmintWallet: rt.info.crossmintWallet ?? false,
+        crossmintChain: rt.info.crossmintChain,
         circleServices: rt.info.circleServices,
         monidEnabled: rt.info.monidEnabled ?? false,
         subscriptionTier: this.subscriptionTier,
@@ -5431,7 +5503,12 @@ You are talking to your boss in a hallway, not writing a performance review docu
           this.setStatus(rt, "done");
           if (rt.cardId) {
             const card = this.board.get(rt.cardId);
-            if (card && card.phase && card.phase !== "done") {
+            // When a manager completes a review task, complete the review card directly —
+            // do NOT transition it to review_pending or notify managers, which would
+            // create a recursive review-of-review loop.
+            if (isManager && isReviewTask) {
+              this.completeCard(rt.cardId);
+            } else if (card && card.phase && card.phase !== "done") {
               // V-model: transition to verification phase instead of done
               card.phase = "verification";
               card.status = "review_pending";
@@ -6270,7 +6347,14 @@ You are talking to your boss in a hallway, not writing a performance review docu
         } else {
           reviewTask = `${rt.info.name} completed their task: "${stripNestedTaskText(task)}". Result: ${redactSecrets(result.slice(0, 2000))}. Review their work and decide if any follow-up is needed. End your response with either APPROVED (if the work is acceptable) or NEEDS REWORK: <specific feedback for the agent> (if the agent should retry with your feedback).${capContext}`;
         }
-        this.assign(mgr.info.id, reviewTask, undefined, undefined, undefined, { agentId: rt.info.id, agentName: rt.info.name, originalTask: stripNestedTaskText(task, 300), cardId: rt.cardId, previousResult: redactSecrets(result.slice(0, 2000)), platformContext: rt.platformContext ?? null });
+        const shortTask = stripNestedTaskText(task, 60);
+        const reviewTitle = failed
+          ? `Review: ${rt.info.name} failed — ${shortTask}`
+          : `Review: ${rt.info.name} — ${shortTask}`;
+        const reviewDesc = failed
+          ? `${rt.info.name} failed their task. Awaiting manager review.`
+          : `${rt.info.name} completed their task. Awaiting manager review.`;
+        this.assign(mgr.info.id, reviewTask, undefined, undefined, undefined, { agentId: rt.info.id, agentName: rt.info.name, originalTask: stripNestedTaskText(task, 300), cardId: rt.cardId, previousResult: redactSecrets(result.slice(0, 2000)), platformContext: rt.platformContext ?? null }, undefined, undefined, undefined, { title: reviewTitle, description: reviewDesc });
       }
     }
 
@@ -6839,8 +6923,10 @@ You are talking to your boss in a hallway, not writing a performance review docu
       this.broadcast({ type: "toast", text: "Invalid cron expression — could not compute next run time." });
       return "Invalid cron expression — could not compute next run time.";
     }
-    // Enforce minimum interval
-    if (nextRun - now < MIN_SCHEDULE_INTERVAL_MS) {
+    // Enforce minimum interval — check actual cron interval, not time-to-next-run
+    const secondRun = nextCronRun(cleanCron, new Date(nextRun));
+    const cronInterval = secondRun !== null ? secondRun - nextRun : nextRun - now;
+    if (cronInterval < MIN_SCHEDULE_INTERVAL_MS) {
       const msg = `Schedule interval too short — minimum is ${MIN_SCHEDULE_INTERVAL_MS / 60000} minutes.`;
       this.broadcast({ type: "toast", text: msg });
       return msg;
@@ -6982,7 +7068,9 @@ You are talking to your boss in a hallway, not writing a performance review docu
           this.broadcast({ type: "toast", text: "Invalid cron expression — could not compute next run time." });
           return "Invalid cron expression — could not compute next run time.";
         }
-        if (nextRun - Date.now() < MIN_SCHEDULE_INTERVAL_MS) {
+        const secondRun = nextCronRun(cleanCron, new Date(nextRun));
+        const cronInterval = secondRun !== null ? secondRun - nextRun : nextRun - Date.now();
+        if (cronInterval < MIN_SCHEDULE_INTERVAL_MS) {
           const msg = `Schedule interval too short — minimum is ${MIN_SCHEDULE_INTERVAL_MS / 60000} minutes.`;
           this.broadcast({ type: "toast", text: msg });
           return msg;

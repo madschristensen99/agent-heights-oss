@@ -14,7 +14,9 @@ export interface HelicopterDelivery {
   appearance?: CharAppearance;
   mcpServers?: MCPServerConfig[];
   cdpSolana?: boolean;
+  cdpEvm?: boolean;
   crossmintWallet?: boolean;
+  crossmintChain?: string;
   isPremium?: boolean;
   circleServices?: import("../../shared/types").CircleServiceConfig[];
   skills?: import("../../shared/types").TaskCategory[];

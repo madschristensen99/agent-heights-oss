@@ -302,6 +302,227 @@ export class AudioSystem {
     };
   }
 
+  /** Van engine rumble — low-frequency diesel chug with road rumble.
+   *  Returns a handle whose stop() fades out and tears down all nodes. */
+  vanEngine(): { stop: () => void } {
+    if (!this.ctx || !this.sfxGain || !this.enabled) return { stop: () => {} };
+    const ctx = this.ctx;
+    const now = ctx.currentTime;
+
+    // Diesel chug — low sawtooth with slow frequency modulation
+    const chugOsc = ctx.createOscillator();
+    chugOsc.type = "sawtooth";
+    chugOsc.frequency.value = 45;
+    const chugLfo = ctx.createOscillator();
+    chugLfo.type = "sine";
+    chugLfo.frequency.value = 8;
+    const chugLfoGain = ctx.createGain();
+    chugLfoGain.gain.value = 12;
+    chugLfo.connect(chugLfoGain);
+    chugLfoGain.connect(chugOsc.frequency);
+
+    const chugFilter = ctx.createBiquadFilter();
+    chugFilter.type = "lowpass";
+    chugFilter.frequency.value = 300;
+    chugFilter.Q.value = 2;
+
+    const chugGain = ctx.createGain();
+    chugGain.gain.value = 0;
+    chugGain.gain.linearRampToValueAtTime(0.18, now + 0.5);
+
+    chugOsc.connect(chugFilter);
+    chugFilter.connect(chugGain);
+    chugGain.connect(this.sfxGain);
+
+    // Road rumble — filtered noise
+    const noiseLen = ctx.sampleRate * 1;
+    const noiseBuf = ctx.createBuffer(1, noiseLen, ctx.sampleRate);
+    const noiseData = noiseBuf.getChannelData(0);
+    for (let i = 0; i < noiseLen; i++) noiseData[i] = Math.random() * 2 - 1;
+    const noiseSrc = ctx.createBufferSource();
+    noiseSrc.buffer = noiseBuf;
+    noiseSrc.loop = true;
+    const noiseFilter = ctx.createBiquadFilter();
+    noiseFilter.type = "bandpass";
+    noiseFilter.frequency.value = 80;
+    noiseFilter.Q.value = 0.5;
+    const noiseGain = ctx.createGain();
+    noiseGain.gain.value = 0;
+    noiseGain.gain.linearRampToValueAtTime(0.08, now + 0.5);
+    noiseSrc.connect(noiseFilter);
+    noiseFilter.connect(noiseGain);
+    noiseGain.connect(this.sfxGain);
+
+    chugOsc.start(now);
+    chugLfo.start(now);
+    noiseSrc.start(now);
+
+    return {
+      stop: () => {
+        const stopTime = ctx.currentTime;
+        const fadeDuration = 0.4;
+        chugGain.gain.cancelScheduledValues(stopTime);
+        chugGain.gain.setValueAtTime(chugGain.gain.value, stopTime);
+        chugGain.gain.linearRampToValueAtTime(0, stopTime + fadeDuration);
+        noiseGain.gain.cancelScheduledValues(stopTime);
+        noiseGain.gain.setValueAtTime(noiseGain.gain.value, stopTime);
+        noiseGain.gain.linearRampToValueAtTime(0, stopTime + fadeDuration);
+        const end = stopTime + fadeDuration + 0.1;
+        try { chugOsc.stop(end); } catch {}
+        try { chugLfo.stop(end); } catch {}
+        try { noiseSrc.stop(end); } catch {}
+      },
+    };
+  }
+
+  /** Outrigger canoe — rhythmic paddle strokes in water.
+   *  Returns a handle whose stop() fades out and tears down all nodes. */
+  paddleSplash(): { stop: () => void } {
+    if (!this.ctx || !this.sfxGain || !this.enabled) return { stop: () => {} };
+    const ctx = this.ctx;
+    const now = ctx.currentTime;
+
+    // Water ambience — low filtered noise (ocean lapping)
+    const waterLen = ctx.sampleRate * 2;
+    const waterBuf = ctx.createBuffer(1, waterLen, ctx.sampleRate);
+    const waterData = waterBuf.getChannelData(0);
+    for (let i = 0; i < waterLen; i++) waterData[i] = (Math.random() * 2 - 1) * 0.5;
+    const waterSrc = ctx.createBufferSource();
+    waterSrc.buffer = waterBuf;
+    waterSrc.loop = true;
+    const waterFilter = ctx.createBiquadFilter();
+    waterFilter.type = "lowpass";
+    waterFilter.frequency.value = 400;
+    waterFilter.Q.value = 0.5;
+    const waterGain = ctx.createGain();
+    waterGain.gain.value = 0;
+    waterGain.gain.linearRampToValueAtTime(0.06, now + 1);
+    waterSrc.connect(waterFilter);
+    waterFilter.connect(waterGain);
+    waterGain.connect(this.sfxGain);
+
+    // Paddle stroke — periodic noise burst via LFO-modulated gain
+    const paddleNoiseLen = ctx.sampleRate * 0.3;
+    const paddleBuf = ctx.createBuffer(1, paddleNoiseLen, ctx.sampleRate);
+    const paddleData = paddleBuf.getChannelData(0);
+    for (let i = 0; i < paddleNoiseLen; i++) paddleData[i] = (Math.random() * 2 - 1) * (1 - i / paddleNoiseLen);
+    const paddleSrc = ctx.createBufferSource();
+    paddleSrc.buffer = paddleBuf;
+    paddleSrc.loop = true;
+    const paddleFilter = ctx.createBiquadFilter();
+    paddleFilter.type = "bandpass";
+    paddleFilter.frequency.value = 1200;
+    paddleFilter.Q.value = 1.5;
+    const paddleLfo = ctx.createOscillator();
+    paddleLfo.type = "sine";
+    paddleLfo.frequency.value = 1.2; // stroke rate
+    const paddleLfoGain = ctx.createGain();
+    paddleLfoGain.gain.value = 0.12;
+    const paddleGain = ctx.createGain();
+    paddleGain.gain.value = 0;
+    paddleLfo.connect(paddleLfoGain);
+    paddleLfoGain.connect(paddleGain.gain);
+    paddleSrc.connect(paddleFilter);
+    paddleFilter.connect(paddleGain);
+    paddleGain.connect(this.sfxGain);
+
+    waterSrc.start(now);
+    paddleSrc.start(now);
+    paddleLfo.start(now);
+
+    return {
+      stop: () => {
+        const stopTime = ctx.currentTime;
+        const fadeDuration = 0.5;
+        waterGain.gain.cancelScheduledValues(stopTime);
+        waterGain.gain.setValueAtTime(waterGain.gain.value, stopTime);
+        waterGain.gain.linearRampToValueAtTime(0, stopTime + fadeDuration);
+        paddleGain.gain.cancelScheduledValues(stopTime);
+        paddleGain.gain.setValueAtTime(paddleGain.gain.value, stopTime);
+        paddleGain.gain.linearRampToValueAtTime(0, stopTime + fadeDuration);
+        const end = stopTime + fadeDuration + 0.1;
+        try { waterSrc.stop(end); } catch {}
+        try { paddleSrc.stop(end); } catch {}
+        try { paddleLfo.stop(end); } catch {}
+      },
+    };
+  }
+
+  /** Horse-drawn carriage — rhythmic hoof beats + creaking wood.
+   *  Returns a handle whose stop() fades out and tears down all nodes. */
+  horseTrot(): { stop: () => void } {
+    if (!this.ctx || !this.sfxGain || !this.enabled) return { stop: () => {} };
+    const ctx = this.ctx;
+    const now = ctx.currentTime;
+
+    // Hoof beats — short low-frequency thumps at trot rate (~3 Hz)
+    const trotOsc = ctx.createOscillator();
+    trotOsc.type = "sine";
+    trotOsc.frequency.value = 80;
+    const trotGain = ctx.createGain();
+    trotGain.gain.value = 0;
+    trotOsc.connect(trotGain);
+    trotGain.connect(this.sfxGain);
+
+    // LFO to create rhythmic thumps (gating the gain)
+    const beatLfo = ctx.createOscillator();
+    beatLfo.type = "square";
+    beatLfo.frequency.value = 3; // ~3 beats/sec = trot
+    const beatLfoGain = ctx.createGain();
+    beatLfoGain.gain.value = 0.15;
+    beatLfo.connect(beatLfoGain);
+    beatLfoGain.connect(trotGain.gain);
+
+    // Creaking wood — low filtered noise with slow modulation
+    const creakLen = ctx.sampleRate * 1;
+    const creakBuf = ctx.createBuffer(1, creakLen, ctx.sampleRate);
+    const creakData = creakBuf.getChannelData(0);
+    for (let i = 0; i < creakLen; i++) creakData[i] = Math.random() * 2 - 1;
+    const creakSrc = ctx.createBufferSource();
+    creakSrc.buffer = creakBuf;
+    creakSrc.loop = true;
+    const creakFilter = ctx.createBiquadFilter();
+    creakFilter.type = "bandpass";
+    creakFilter.frequency.value = 250;
+    creakFilter.Q.value = 3;
+    const creakLfo = ctx.createOscillator();
+    creakLfo.type = "sine";
+    creakLfo.frequency.value = 0.7;
+    const creakLfoGain = ctx.createGain();
+    creakLfoGain.gain.value = 100;
+    creakLfo.connect(creakLfoGain);
+    creakLfoGain.connect(creakFilter.frequency);
+    const creakGain = ctx.createGain();
+    creakGain.gain.value = 0;
+    creakGain.gain.linearRampToValueAtTime(0.05, now + 0.8);
+    creakSrc.connect(creakFilter);
+    creakFilter.connect(creakGain);
+    creakGain.connect(this.sfxGain);
+
+    trotOsc.start(now);
+    beatLfo.start(now);
+    creakSrc.start(now);
+    creakLfo.start(now);
+
+    return {
+      stop: () => {
+        const stopTime = ctx.currentTime;
+        const fadeDuration = 0.5;
+        trotGain.gain.cancelScheduledValues(stopTime);
+        trotGain.gain.setValueAtTime(trotGain.gain.value, stopTime);
+        trotGain.gain.linearRampToValueAtTime(0, stopTime + fadeDuration);
+        creakGain.gain.cancelScheduledValues(stopTime);
+        creakGain.gain.setValueAtTime(creakGain.gain.value, stopTime);
+        creakGain.gain.linearRampToValueAtTime(0, stopTime + fadeDuration);
+        const end = stopTime + fadeDuration + 0.1;
+        try { trotOsc.stop(end); } catch {}
+        try { beatLfo.stop(end); } catch {}
+        try { creakSrc.stop(end); } catch {}
+        try { creakLfo.stop(end); } catch {}
+      },
+    };
+  }
+
   // ============================================================
   // Ambient Music
   // ============================================================

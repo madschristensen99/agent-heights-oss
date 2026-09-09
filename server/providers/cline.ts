@@ -14,6 +14,7 @@ import { wrapRailwayTools } from "./railway-mcp.js";
 import { loadMCPTools, type OnApiErrorFn } from "./mcp-client.js";
 import { isGoogleWorkspaceMcp, loadGoogleWorkspaceTools } from "./google-workspace.js";
 import { loadCdpSolanaTools } from "./cdp-solana.js";
+import { loadCdpEvmTools } from "./cdp-evm.js";
 import { loadCrossmintWalletTools } from "./crossmint-wallets.js";
 import { loadPremiumTools, type CircleServiceConfig, type PremiumProxyContext } from "./premium-proxy.js";
 import { loadMonidTools } from "./monid.js";
@@ -250,7 +251,9 @@ export async function makeTools(cwd: string, opts?: {
   submitState?: { called: boolean; verified: boolean; callCount: number };
   mcpServers?: import("../../shared/types.js").MCPServerConfig[];
   cdpSolana?: boolean;
+  cdpEvm?: boolean;
   crossmintWallet?: boolean;
+  crossmintChain?: string;
   circleServices?: CircleServiceConfig[];
   premiumProxyCtx?: PremiumProxyContext;
   monidEnabled?: boolean;
@@ -1359,10 +1362,18 @@ export async function makeTools(cwd: string, opts?: {
     } catch (e) { console.error("[cline] CDP Solana tools failed:", e); }
   }
 
+  // Load CDP EVM wallet tools (auto-provisioned, no user credentials needed)
+  if (opts?.cdpEvm && opts?.agentId) {
+    try {
+      const evmTools = await loadCdpEvmTools(opts.agentId);
+      if (evmTools.length > 0) allTools.push(...evmTools);
+    } catch (e) { console.error("[cline] CDP EVM tools failed:", e); }
+  }
+
   // Load Crossmint multi-chain wallet tools (auto-provisioned, gas sponsored)
   if (opts?.crossmintWallet && opts?.agentId) {
     try {
-      const crossmintTools = await loadCrossmintWalletTools(opts.agentId);
+      const crossmintTools = await loadCrossmintWalletTools(opts.agentId, opts?.crossmintChain);
       if (crossmintTools.length > 0) allTools.push(...crossmintTools);
     } catch (e) { console.error("[cline] Crossmint tools failed:", e); }
   }
@@ -1554,7 +1565,9 @@ export const runCline: ProviderRunner = async function* (task, ctx) {
         submitState: isChat ? undefined : submitState,
         mcpServers: ctx.mcpServers,
         cdpSolana: ctx.cdpSolana,
+        cdpEvm: ctx.cdpEvm,
         crossmintWallet: ctx.crossmintWallet,
+        crossmintChain: ctx.crossmintChain,
         circleServices: ctx.circleServices,
         premiumProxyCtx: (ctx.circleServices && ctx.circleServices.length > 0) || ctx.monidEnabled ? {
           userId: ctx.userId ?? "",
@@ -1612,6 +1625,12 @@ export const runCline: ProviderRunner = async function* (task, ctx) {
       if (ctx.cdpSolana && runtimeSystemPrompt && !runtimeSystemPrompt.includes("Solana Wallet & DeFi Capabilities")) {
         const defiSuffix = `\n\n## Solana Wallet & DeFi Capabilities\nYou have a dedicated Solana wallet via Coinbase CDP. You can swap tokens (solana_jupiter_swap), manage Raydium CLMM liquidity pools (solana_list_clmm_pools, solana_create_clmm_pool, solana_open_clmm_position, solana_increase_liquidity, solana_decrease_liquidity, solana_collect_clmm_fees, solana_close_clmm_position, solana_list_clmm_positions), check balances (solana_get_balance), request faucet (solana_request_faucet), and more. Always check balance before operations — leave ~0.01 SOL for gas. Never repeat the same tool call without a state change. If you hit a fundamental blocker (insufficient SOL on mainnet, program doesn't exist on network, unfixable tool error), STOP and report "BLOCKER: <what's blocking you> — <what you need>" instead of wasting your tool call budget on workarounds.`;
         runtimeSystemPrompt = (runtimeSystemPrompt + defiSuffix).slice(0, 6000);
+      }
+
+      // Inject DeFi context for CDP EVM agents if not already in system prompt
+      if (ctx.cdpEvm && runtimeSystemPrompt && !runtimeSystemPrompt.includes("EVM Wallet & DeFi Capabilities")) {
+        const evmSuffix = `\n\n## EVM Wallet & DeFi Capabilities\nYou have a dedicated EVM wallet via Coinbase CDP. You can check balances (evm_get_balance), transfer ETH/ERC-20 tokens (evm_transfer), swap tokens via 0x DEX aggregation (evm_swap, evm_swap_quote), send raw transactions for DeFi composability (evm_send_transaction), request testnet faucet funds (evm_request_faucet), sign messages (evm_sign_message), search for tokens (evm_token_search), and view your portfolio (evm_portfolio). Your wallet is secured in Coinbase TEE. Always confirm transactions with the user before executing. You are knowledgeable about EVM DeFi ecosystems including Uniswap V3, Aave V3, Lido staking, Curve Finance, and Compound. If no spending policy is set, recommend the user set one in the agent detail panel. Never repeat the same tool call without a state change. If you hit a fundamental blocker (insufficient ETH on mainnet, contract doesn't exist on network, unfixable tool error), STOP and report "BLOCKER: <what's blocking you> — <what you need>" instead of wasting your tool call budget on workarounds.`;
+        runtimeSystemPrompt = (runtimeSystemPrompt + evmSuffix).slice(0, 6000);
       }
 
       agent = new Agent({

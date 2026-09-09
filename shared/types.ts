@@ -278,8 +278,12 @@ export interface AgentInfo {
   acl?: AgentACL;
   /** If true, agent gets auto-provisioned Solana wallet tools via Coinbase CDP SDK. */
   cdpSolana?: boolean;
+  /** If true, agent gets auto-provisioned EVM wallet tools via Coinbase CDP SDK. */
+  cdpEvm?: boolean;
   /** If true, agent gets auto-provisioned multi-chain smart wallet tools via Crossmint. */
   crossmintWallet?: boolean;
+  /** Per-agent default chain override for Crossmint (e.g. "base-sepolia", "ethereum"). Overrides CROSSMINT_CHAIN env var. */
+  crossmintChain?: string;
   /** If true, this is a premium marketplace agent with paid API services. */
   isPremium?: boolean;
   /** Premium Circle x402 API services this agent can call (paid via Circle Gateway). */
@@ -407,7 +411,9 @@ export interface FiredAgent {
   worldY: number;
   mood: FiredAgentMood;
   cdpSolana?: boolean;
+  cdpEvm?: boolean;
   crossmintWallet?: boolean;
+  crossmintChain?: string;
   isPremium?: boolean;
   circleServices?: CircleServiceConfig[];
   skills?: TaskCategory[];
@@ -1189,7 +1195,7 @@ export type ClientMsg =
   | { type: "auth"; token: string }
   | { type: "setup"; player: PlayerInfo }
   | { type: "set_settings"; settings: GameSettings }
-  | { type: "hire"; name: string; provider: Provider; model: string; systemPrompt?: string; role?: AgentRole; sprite?: number; appearance?: CharAppearance; mcpServers?: MCPServerConfig[]; personality?: PersonalityTraits; cdpSolana?: boolean; crossmintWallet?: boolean; isPremium?: boolean; circleServices?: CircleServiceConfig[]; skills?: TaskCategory[]; acl?: AgentACL; monidEnabled?: boolean }
+  | { type: "hire"; name: string; provider: Provider; model: string; systemPrompt?: string; role?: AgentRole; sprite?: number; appearance?: CharAppearance; mcpServers?: MCPServerConfig[]; personality?: PersonalityTraits; cdpSolana?: boolean; crossmintWallet?: boolean; isPremium?: boolean; circleServices?: CircleServiceConfig[]; skills?: TaskCategory[]; acl?: AgentACL; monidEnabled?: boolean; cdpEvm?: boolean; crossmintChain?: string }
   | { type: "assign"; agentId: string; task: string; handoffTo?: string }
   | { type: "assign_new"; agentId: string; task: string; handoffTo?: string }
   | { type: "assign_all"; task: string }
@@ -1207,6 +1213,7 @@ export type ClientMsg =
   | { type: "assign_card"; cardId: string; agentId: string }
   | { type: "move_card"; cardId: string; status: CardStatus }
   | { type: "delete_card"; cardId: string }
+  | { type: "clear_backlog" }
   | { type: "set_phase"; cardId: string; phase: TaskPhase }
   | { type: "advance_phase"; cardId: string }
   | { type: "set_due_date"; cardId: string; dueDate: number | null }

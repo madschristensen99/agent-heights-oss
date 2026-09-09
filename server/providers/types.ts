@@ -46,8 +46,12 @@ export interface RunContext {
   mcpServers?: MCPServerConfig[];
   /** If true, inject CDP Solana wallet tools (auto-provisioned via Coinbase CDP SDK). */
   cdpSolana?: boolean;
+  /** If true, inject CDP EVM wallet tools (auto-provisioned via Coinbase CDP SDK). */
+  cdpEvm?: boolean;
   /** If true, inject Crossmint multi-chain wallet tools (auto-provisioned, gas sponsored). */
   crossmintWallet?: boolean;
+  /** Per-agent default chain override for Crossmint (e.g. "base-sepolia"). */
+  crossmintChain?: string;
   /** Premium Circle x402 API services — paid via Circle Gateway, costs flow into usage budget. */
   circleServices?: CircleServiceConfig[];
   /** If true, inject Monid data marketplace tools (discover/inspect/run, 1300+ endpoints, paid via x402). */

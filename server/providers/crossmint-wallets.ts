@@ -39,7 +39,10 @@ function getSignerSecret(): string | null {
   return process.env.CROSSMINT_SERVER_SIGNER_SECRET ?? null;
 }
 
-function getDefaultChain(): string {
+const agentChainOverrides = new Map<string, string>();
+
+function getDefaultChain(agentId?: string): string {
+  if (agentId && agentChainOverrides.has(agentId)) return agentChainOverrides.get(agentId)!;
   return process.env.CROSSMINT_CHAIN ?? "solana";
 }
 
@@ -71,8 +74,8 @@ function getSolanaSignerAddress(): string {
 }
 
 /** Get the signer address for the current default chain. */
-function getSignerAddress(): string {
-  const chain = getDefaultChain();
+function getSignerAddress(agentId?: string): string {
+  const chain = getDefaultChain(agentId);
   return chainToType(chain) === "solana" ? getSolanaSignerAddress() : getEvmSignerAddress();
 }
 
@@ -94,7 +97,7 @@ export async function getOrCreateAgentWallet(
 ): Promise<{ address: string; chainType: string } | null> {
   if (!isCrossmintConfigured()) return null;
 
-  const useChain = chain ?? getDefaultChain();
+  const useChain = chain ?? getDefaultChain(agentId);
   const cacheKey = `agent-${agentId}-${useChain}`;
   if (walletCache.has(cacheKey)) return walletCache.get(cacheKey)!;
 
@@ -176,7 +179,7 @@ export async function getAgentBalances(
     const wallet = await getOrCreateAgentWallet(agentId);
     if (!wallet) return null;
 
-    const chain = getDefaultChain();
+    const chain = getDefaultChain(agentId);
     const tokenList = tokens ?? ["sol", "usdc", "usdxm"];
 
     const url = new URL(
@@ -241,8 +244,8 @@ export async function getAgentBalances(
 }
 
 /** Sign an approval message with the server signer key (EVM or Solana). */
-async function signApprovalMessage(message: string): Promise<string> {
-  const chain = getDefaultChain();
+async function signApprovalMessage(message: string, agentId?: string): Promise<string> {
+  const chain = getDefaultChain(agentId);
   const secret = getSignerSecret()!;
 
   if (chainToType(chain) === "solana") {
@@ -280,11 +283,11 @@ export async function transferAgentTokens(
   try {
     const apiKey = getApiKey()!;
     const baseUrl = getBaseUrl();
-    const useChain = chain ?? getDefaultChain();
+    const useChain = chain ?? getDefaultChain(agentId);
     const wallet = await getOrCreateAgentWallet(agentId, useChain);
     if (!wallet) return null;
 
-    const signerAddress = getSignerAddress();
+    const signerAddress = getSignerAddress(agentId);
     const tokenLocator = `${useChain}:${tokenSymbol}`;
     const walletLocator = wallet.address;
 
@@ -378,10 +381,10 @@ async function submitCrossmintTransaction(
   try {
     const apiKey = getApiKey()!;
     const baseUrl = getBaseUrl();
-    const chain = getDefaultChain();
+    const chain = getDefaultChain(agentId);
     const wallet = await getOrCreateAgentWallet(agentId, chain);
     if (!wallet) return null;
-    const signerAddress = getSignerAddress();
+    const signerAddress = getSignerAddress(agentId);
     const walletLocator = wallet.address;
 
     // Create the transaction
@@ -514,7 +517,7 @@ export async function getAgentPolicy(agentId: string): Promise<CrossmintPolicyIn
   try {
     const wallet = await getOrCreateAgentWallet(agentId);
     if (!wallet) return null;
-    const chain = getDefaultChain();
+    const chain = getDefaultChain(agentId);
     return {
       chain,
       description: `Crossmint smart wallet on ${chain}. Policies are enforced onchain via the smart contract.`,
@@ -566,7 +569,7 @@ export async function fundAgentWallet(
   try {
     const apiKey = getApiKey()!;
     const baseUrl = getBaseUrl();
-    const chain = getDefaultChain();
+    const chain = getDefaultChain(agentId);
     const wallet = await getOrCreateAgentWallet(agentId);
     if (!wallet) return { success: false, message: "Wallet not found" };
 
@@ -606,7 +609,7 @@ export async function createCrossmintOnrampUrl(
   try {
     const apiKey = getApiKey()!;
     const baseUrl = getBaseUrl();
-    const chain = getDefaultChain();
+    const chain = getDefaultChain(agentId);
     const wallet = await getOrCreateAgentWallet(agentId);
     if (!wallet) return null;
 
@@ -663,13 +666,15 @@ export async function createCrossmintOnrampUrl(
  */
 export async function loadCrossmintWalletTools(
   agentId: string,
+  chainOverride?: string,
 ): Promise<AgentTool<any, any>[]> {
   if (!isCrossmintConfigured()) {
     console.warn("[crossmint] Env vars not set — Crossmint wallet tools disabled.");
     return [];
   }
 
-  const chain = getDefaultChain();
+  const chain = chainOverride || getDefaultChain(agentId);
+  if (chainOverride) agentChainOverrides.set(agentId, chainOverride);
 
   const getWalletTool: AgentTool<any, any> = {
     name: "crossmint_get_wallet",
@@ -979,7 +984,7 @@ export async function loadCrossmintWalletTools(
     },
     async execute(input: any) {
       try {
-        const chain = getDefaultChain();
+        const chain = getDefaultChain(agentId);
         const isSol = chainToType(chain) === "solana";
         const isSolToken = input.inputMint === "So11111111111111111111111111111111111111112";
         let decimals: number;
@@ -1064,7 +1069,7 @@ export async function loadCrossmintWalletTools(
     },
     async execute(input: any) {
       try {
-        const chain = getDefaultChain();
+        const chain = getDefaultChain(agentId);
         const isSol = chainToType(chain) === "solana";
         const isSolToken = input.inputMint === "So11111111111111111111111111111111111111112";
         let decimals: number;
@@ -1153,9 +1158,9 @@ export async function loadCrossmintWalletTools(
     },
     async execute(input: any) {
       try {
-        const signature = await signApprovalMessage(input.message);
-        const chain = getDefaultChain();
-        const signerAddr = getSignerAddress();
+        const signature = await signApprovalMessage(input.message, agentId);
+        const chain = getDefaultChain(agentId);
+        const signerAddr = getSignerAddress(agentId);
         return `Message signed successfully.\n` +
           `Chain: ${chain}\n` +
           `Signer: ${signerAddr}\n` +
@@ -1246,7 +1251,7 @@ export async function loadCrossmintWalletTools(
     },
     async execute(input: any) {
       try {
-        const chain = getDefaultChain();
+        const chain = getDefaultChain(agentId);
         const isSol = chainToType(chain) === "solana";
         const txResult = await submitCrossmintTransaction(
           agentId,
@@ -1306,7 +1311,7 @@ export async function loadCrossmintWalletTools(
         if (!recipients || recipients.length === 0) return `No recipients provided.`;
         if (recipients.length > 20) return `Too many recipients (${recipients.length}). Maximum 20 per batch.`;
         const token = input.token ?? "sol";
-        const chain = getDefaultChain();
+        const chain = getDefaultChain(agentId);
         const isSol = chainToType(chain) === "solana";
         const decimals = token === "sol" || token === "native" ? (isSol ? 9 : 18) : (input.decimals ?? 6);
         const results: string[] = [];

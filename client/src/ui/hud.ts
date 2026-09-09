@@ -3987,7 +3987,7 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
     if (!this.canHireAgent()) return;
     // Parse the agent config JSON — may contain a custom appearance, model,
     // and systemPrompt for premium/curated marketplace agents.
-    let config: { model?: string; systemPrompt?: string; appearance?: CharAppearance; mcpServers?: MCPServerConfig[]; cdpSolana?: boolean; crossmintWallet?: boolean; isPremium?: boolean; circleServices?: import("../../../shared/types").CircleServiceConfig[]; skills?: import("../../../shared/types").TaskCategory[]; monidEnabled?: boolean } = {};
+    let config: { model?: string; systemPrompt?: string; appearance?: CharAppearance; mcpServers?: MCPServerConfig[]; cdpSolana?: boolean; crossmintWallet?: boolean; isPremium?: boolean; circleServices?: import("../../../shared/types").CircleServiceConfig[]; skills?: import("../../../shared/types").TaskCategory[]; monidEnabled?: boolean; cdpEvm?: boolean; crossmintChain?: string } = {};
     try {
       if (agent.agent) config = JSON.parse(agent.agent);
     } catch { /* not JSON or missing — fall back to defaults */ }
@@ -4017,7 +4017,9 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
       appearance,
       mcpServers: config.mcpServers,
       cdpSolana: config.cdpSolana,
+      cdpEvm: config.cdpEvm,
       crossmintWallet: config.crossmintWallet,
+      crossmintChain: config.crossmintChain,
       isPremium: config.isPremium,
       circleServices: config.circleServices,
       skills: config.skills,
@@ -6750,7 +6752,7 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
 
     const colHtml = (status: CardStatus) => `
       <div class="board-col col-${status}">
-        <div class="board-col-header">${colLabels[status]} <span class="board-col-count">${cols[status].length}</span></div>
+        <div class="board-col-header">${colLabels[status]} <span class="board-col-count">${cols[status].length}</span>${status === "backlog" && cols[status].length > 0 ? ` <button class="btn mini" data-clear-backlog style="margin-left:auto;font-size:10px;padding:2px 6px;">Clear All</button>` : ""}</div>
         <div class="board-col-cards">
           ${cols[status].map(cardHtml).join("") || `<div class="board-empty">no cards</div>`}
         </div>
@@ -6775,6 +6777,11 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
     document.querySelectorAll<HTMLElement>("[data-delete]").forEach((el) => {
       el.addEventListener("click", () => {
         this.net.send({ type: "delete_card", cardId: el.dataset.delete! });
+      });
+    });
+    document.querySelectorAll<HTMLElement>("[data-clear-backlog]").forEach((el) => {
+      el.addEventListener("click", () => {
+        this.net.send({ type: "clear_backlog" });
       });
     });
     document.querySelectorAll<HTMLElement>("[data-advance-phase]").forEach((el) => {

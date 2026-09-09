@@ -5126,10 +5126,16 @@ export class OfficeScene extends Phaser.Scene {
       return;
     }
 
+    this.heliContainer?.destroy();
+    this.heliContainer = null;
+    this.heliRotor = null;
+
     this.heliActive = true;
     this.heliDelivery = delivery ?? null;
     const agentName = delivery?.name ?? "Agent";
     this.store.toast(`Helicopter summoned! ${agentName} incoming...`);
+    this.world?.audio.init();
+    this.world?.audio.resume();
     this.heliSound?.stop();
     this.heliSound = this.world?.audio.helicopter() ?? null;
     console.log(`[heli-debug] triggerHelicopter: agentName=${agentName}, world=${!!this.world}, audio=${!!this.world?.audio}, heliSound=${!!this.heliSound}, ready=${this.ready}, heliActive=${this.heliActive}`);
@@ -5195,7 +5201,9 @@ export class OfficeScene extends Phaser.Scene {
         appearance: delivery.appearance,
         mcpServers: delivery.mcpServers,
         cdpSolana: delivery.cdpSolana,
+        cdpEvm: delivery.cdpEvm,
         crossmintWallet: delivery.crossmintWallet,
+        crossmintChain: delivery.crossmintChain,
         isPremium: delivery.isPremium,
         circleServices: delivery.circleServices,
         skills: delivery.skills,
@@ -5211,6 +5219,10 @@ export class OfficeScene extends Phaser.Scene {
     this.heliDelivery = delivery ?? null;
     const agentName = delivery?.name ?? "Agent";
     this.store.toast(`Van incoming! ${agentName} arriving...`);
+    this.world?.audio.init();
+    this.world?.audio.resume();
+    this.heliSound?.stop();
+    this.heliSound = this.world?.audio.vanEngine() ?? null;
 
     this.heliSafetyTimer?.remove();
     this.heliSafetyTimer = this.time.delayedCall(15000, () => {
@@ -5400,6 +5412,10 @@ export class OfficeScene extends Phaser.Scene {
     this.heliDelivery = delivery ?? null;
     const agentName = delivery?.name ?? "Agent";
     this.store.toast(`Outrigger incoming! ${agentName} paddling in...`);
+    this.world?.audio.init();
+    this.world?.audio.resume();
+    this.heliSound?.stop();
+    this.heliSound = this.world?.audio.paddleSplash() ?? null;
 
     this.heliSafetyTimer?.remove();
     this.heliSafetyTimer = this.time.delayedCall(15000, () => {
@@ -5546,6 +5562,10 @@ export class OfficeScene extends Phaser.Scene {
     this.heliDelivery = delivery ?? null;
     const agentName = delivery?.name ?? "Agent";
     this.store.toast(`Carriage incoming! ${agentName} arriving...`);
+    this.world?.audio.init();
+    this.world?.audio.resume();
+    this.heliSound?.stop();
+    this.heliSound = this.world?.audio.horseTrot() ?? null;
 
     this.heliSafetyTimer?.remove();
     this.heliSafetyTimer = this.time.delayedCall(15000, () => {
@@ -5833,28 +5853,30 @@ export class OfficeScene extends Phaser.Scene {
       this.endHelicopter();
     });
 
-    if (!this.heliContainer) return;
+    const container = this.heliContainer;
+    if (!container) return;
     const padCx = this.padCenter.x;
     const padCy = this.padCenter.y;
 
     // lift off straight up slowly, then fly away to the side
     this.tweens.add({
-      targets: this.heliContainer,
+      targets: container,
       y: padCy - 250,
       duration: 2000,
       ease: "Cubic.out",
       onComplete: () => {
-        if (!this.heliContainer) return;
         this.tweens.add({
-          targets: this.heliContainer,
+          targets: container,
           x: padCx + 500,
           y: padCy - 500,
           duration: 3000,
           ease: "Cubic.in",
           onComplete: () => {
-            this.heliContainer?.destroy();
-            this.heliContainer = null;
-            this.heliRotor = null;
+            container.destroy();
+            if (this.heliContainer === container) {
+              this.heliContainer = null;
+              this.heliRotor = null;
+            }
           },
         });
       },
@@ -5910,6 +5932,9 @@ export class OfficeScene extends Phaser.Scene {
     this.heliSafetyTimer = null;
     this.heliSound?.stop();
     this.heliSound = null;
+    this.heliContainer?.destroy();
+    this.heliContainer = null;
+    this.heliRotor = null;
     // Fallback: if the elevator never completed but we're tearing down,
     // spawn any pending agents at the elevator exit inside the office.
     if (this.pendingHeliAgents.length > 0) {

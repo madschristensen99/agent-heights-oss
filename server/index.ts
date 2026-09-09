@@ -1654,7 +1654,7 @@ wss.on("connection", async (ws, req) => {
           }
           break;
         case "hire":
-          await activeManager.hire(msg.name, msg.provider, msg.model, msg.systemPrompt ?? "", msg.role ?? "worker", msg.sprite, msg.appearance, msg.mcpServers, msg.personality, msg.cdpSolana, msg.crossmintWallet, msg.isPremium, msg.circleServices, msg.skills, msg.acl, msg.monidEnabled);
+          await activeManager.hire(msg.name, msg.provider, msg.model, msg.systemPrompt ?? "", msg.role ?? "worker", msg.sprite, msg.appearance, msg.mcpServers, msg.personality, msg.cdpSolana, msg.crossmintWallet, msg.isPremium, msg.circleServices, msg.skills, msg.acl, msg.monidEnabled, msg.cdpEvm, msg.crossmintChain);
           void ProfileManager.ingestHire(sess.user.id, msg.name).catch(() => {});
           void recordSignalByKey(sess.user.id, "strategic_hire");
           const xpResult = addXp(sess.user.id, 50);
@@ -1949,6 +1949,9 @@ wss.on("connection", async (ws, req) => {
           break;
         case "delete_card":
           activeManager.deleteCard(msg.cardId);
+          break;
+        case "clear_backlog":
+          activeManager.clearBacklog();
           break;
         case "set_phase":
           activeManager.setPhase(msg.cardId, msg.phase);
