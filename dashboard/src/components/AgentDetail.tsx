@@ -189,7 +189,7 @@ export function AgentDetail({ agentId, onBack, onViewFiles, onViewMemory, onView
             </DetailSection>
           )}
 
-          {(agent.cdpSolana || agent.crossmintWallet) && onViewWallet && (
+          {(agent.cdpSolana || agent.cdpEvm || agent.crossmintWallet) && onViewWallet && (
             <button
               onClick={() => onViewWallet(agentId)}
               className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-bg-input border border-border text-xs text-gray-300 hover:border-accent hover:text-accent"

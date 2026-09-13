@@ -304,7 +304,10 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
         case "cdp_policy_status":
         case "cdp_tx_history":
         case "cdp_lp_positions":
-        case "cdp_onramp_url":
+        case "cdp_evm_wallet_status":
+        case "cdp_evm_tx_history":
+        case "cdp_evm_policy_status":
+        case "cdp_evm_lp_positions":
         case "crossmint_wallet_status":
         case "crossmint_policy_status":
         case "crossmint_tx_history": {
@@ -315,6 +318,21 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
             next.set(agentId, { ...existing, [msg.type]: msg });
             return next;
           });
+          break;
+        }
+        case "cdp_onramp_url":
+        case "cdp_evm_onramp_url": {
+          const agentId = (msg as { agentId: string }).agentId;
+          setWalletData((prev) => {
+            const next = new Map(prev);
+            const existing = next.get(agentId) ?? {};
+            next.set(agentId, { ...existing, [msg.type]: msg });
+            return next;
+          });
+          const url = (msg as { url: string | null }).url;
+          if (url) {
+            window.open(url, "_blank", "noopener,noreferrer");
+          }
           break;
         }
         case "auth_required": {
