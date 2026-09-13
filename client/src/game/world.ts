@@ -4682,7 +4682,9 @@ export class WorldLayer {
         }
       }
     }
-    this.vehicles = this.vehicles.filter((v) => v.alive_);
+    for (let i = this.vehicles.length - 1; i >= 0; i--) {
+      if (!this.vehicles[i].alive_) this.vehicles.splice(i, 1);
+    }
 
     // --- hijack interaction ---
     if (this.hijackedVehicle) {
@@ -4710,7 +4712,9 @@ export class WorldLayer {
     for (const fb of this.fetchBalls) {
       fb.update(dt);
     }
-    this.fetchBalls = this.fetchBalls.filter((fb) => fb.alive);
+    for (let i = this.fetchBalls.length - 1; i >= 0; i--) {
+      if (!this.fetchBalls[i].alive) this.fetchBalls.splice(i, 1);
+    }
 
     // --- update dogs ---
     for (const dg of this.dogs) {
@@ -4718,7 +4722,9 @@ export class WorldLayer {
       const dd = Math.hypot(playerX - dg.container.x, playerY - dg.container.y);
       if (dd > 1200) dg.destroy();
     }
-    this.dogs = this.dogs.filter((dg) => dg.alive_);
+    for (let i = this.dogs.length - 1; i >= 0; i--) {
+      if (!this.dogs[i].alive_) this.dogs.splice(i, 1);
+    }
 
     // --- update leprechauns ---
     for (const lep of this.leprechauns) {
@@ -4726,7 +4732,9 @@ export class WorldLayer {
       const ld = Math.hypot(playerX - lep.container.x, playerY - lep.container.y);
       if (ld > 1500) lep.destroy();
     }
-    this.leprechauns = this.leprechauns.filter((lep) => lep.alive_);
+    for (let i = this.leprechauns.length - 1; i >= 0; i--) {
+      if (!this.leprechauns[i].alive_) this.leprechauns.splice(i, 1);
+    }
 
     // --- update wife NPC ---
     if (this.wife) {

@@ -2983,7 +2983,7 @@ export class AgentManager {
     if (/\bdata|analytics|csv|json|parse|transform|etl|chart|graph|statistics\b/.test(t)) return "data";
     if (/\bwrite|blog|article|content|copy|documentation|docs|story|essay\b/.test(t)) return "writing";
     if (/\bresearch|investigate|analyze|study|survey|report|explore\b/.test(t)) return "research";
-    if (/\bsolana|ethereum|crypto|wallet|token|nft|blockchain|web3|defi|smart contract\b/.test(t)) return "crypto";
+    if (/\bsolana|ethereum|crypto|wallet|token|nft|blockchain|web3|defi|smart contract|subgraph|the graph\b/.test(t)) return "crypto";
     return "general";
   }
 
@@ -4295,7 +4295,10 @@ export class AgentManager {
           c.type !== "goal" &&
           c.type !== "improvement" &&
           this.canStartCard(c) &&
-          this.agentCanHandleCard(rt, c),
+          this.agentCanHandleCard(rt, c) &&
+          // Don't auto-claim cards that were reverted from another agent's failure —
+          // only the original agent (or manual reassignment via the board) should pick those up.
+          (!c.originalAgentId || c.originalAgentId === rt.info.id),
         )
         .sort((a, b) => {
           const aMatch = a.category && rt.info.skills?.includes(a.category) ? 0 : 1;

@@ -439,8 +439,15 @@ export async function updateAgentEvmPolicy(
 
 // ─── Uniswap V3 LP Positions ─────────────────────────────────────────────────
 
-const UNISWAP_V3_POSITION_MANAGER = "0xC36442b465c376D4514355Ba620829C6F4eFeFED" as const;
-const UNISWAP_V3_FACTORY = "0x1F98431c8aD9850365Cde677f99a051A01328b03" as const;
+const UNISWAP_V3_ADDRESSES: Record<string, { npm: `0x${string}`; factory: `0x${string}` }> = {
+  ethereum: { npm: "0xC36442b465c376D4514355Ba620829C6F4eFeFED", factory: "0x1F98431c8aD9850365Cde677f99a051A01328b03" },
+  polygon:  { npm: "0xC36442b465c376D4514355Ba620829C6F4eFeFED", factory: "0x1F98431c8aD9850365Cde677f99a051A01328b03" },
+  base:     { npm: "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1", factory: "0x0d76e6526599A9f11f0c3A3a9d7AA6c1cA7A0c37" },
+};
+
+function getUniswapV3Addresses(network: string): { npm: `0x${string}`; factory: `0x${string}` } {
+  return UNISWAP_V3_ADDRESSES[network] ?? UNISWAP_V3_ADDRESSES.ethereum;
+}
 
 const positionManagerAbi = parseAbi([
   "function balanceOf(address owner) external view returns (uint256)",
@@ -528,8 +535,10 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
     const viemChain = getViemChain(network);
     const client = createPublicClient({ chain: viemChain, transport: http() });
 
+    const { npm: npmAddress, factory: factoryAddress } = getUniswapV3Addresses(network);
+
     const balance = await client.readContract({
-      address: UNISWAP_V3_POSITION_MANAGER,
+      address: npmAddress,
       abi: positionManagerAbi,
       functionName: "balanceOf",
       args: [account.address as `0x${string}`],
@@ -542,14 +551,14 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
     for (let i = 0n; i < balance; i++) {
       try {
         const tokenId = await client.readContract({
-          address: UNISWAP_V3_POSITION_MANAGER,
+          address: npmAddress,
           abi: positionManagerAbi,
           functionName: "tokenOfOwnerByIndex",
           args: [account.address as `0x${string}`, i],
         }) as bigint;
 
         const posData = await client.readContract({
-          address: UNISWAP_V3_POSITION_MANAGER,
+          address: npmAddress,
           abi: positionManagerAbi,
           functionName: "positions",
           args: [tokenId],
@@ -566,7 +575,7 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
 
         // Get pool address from factory
         const poolAddress = await client.readContract({
-          address: UNISWAP_V3_FACTORY,
+          address: factoryAddress,
           abi: parseAbi(["function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address)"]),
           functionName: "getPool",
           args: [token0, token1, fee],

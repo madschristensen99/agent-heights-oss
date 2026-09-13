@@ -1,7 +1,7 @@
 import Phaser from "phaser";
 import type { Store, HelicopterDelivery } from "../store";
 import { AgentNPC, OfficeManagerNPC, HermesNPC, WizardNPC, feetOf, tileOf, TILE_PX, getThemeStatusColors, agentTextureKey, wizardAppearance, wizardTextureKey, createHintTag, type HintTag, type Dir } from "./agent";
-import { OFFICE_MANAGER_ID, HERMES_ID, WIZARD_ID, type CharAppearance, type AgentInfo, type AgentStatus, type LogEntry, type PlatformEvent, getPlatformEntry, type WorldTheme, DEFAULT_APPEARANCE, type Presenter, MAX_PRESENTERS, DECORATION_CATALOG } from "../../../shared/types";
+import { OFFICE_MANAGER_ID, HERMES_ID, WIZARD_ID, type CharAppearance, type AgentInfo, type AgentStatus, type LogEntry, type PlatformEvent, getPlatformEntry, type WorldTheme, DEFAULT_APPEARANCE, type Presenter, MAX_PRESENTERS, DECORATION_CATALOG, type TaskCard } from "../../../shared/types";
 import { Grid, findPath, type Tile } from "./path";
 import { WorldLayer } from "./world";
 import { BloomPipeline, ColorGradePipeline, DOFPipeline } from "./shaders";
@@ -82,6 +82,8 @@ export class OfficeScene extends Phaser.Scene {
   private npcSpeechExpiry = new Map<string, number>();
   /** Cooldown for proximity-triggered speech per NPC, keyed by npcId. */
   private npcProximityCooldown = new Map<string, number>();
+  /** Cached deskIndex→agent map, rebuilt in syncAgents when agents change. */
+  private cachedDeskAgentMap = new Map<number, AgentInfo>();
   private decorationSprites: Phaser.GameObjects.Container[] = [];
   private decorationMode = false;
   private selectedDecorationType: string | null = null;
@@ -117,6 +119,158 @@ export class OfficeScene extends Phaser.Scene {
   private projectorHtmlIframe: HTMLIFrameElement | null = null;
   /** Agent whose HTML file is currently broadcasting (null = none). */
   private agentBroadcastHtmlAgentId: string | null = null;
+  // --- Static dialogue lines (hoisted to avoid per-frame allocation in checkNpcProximity) ---
+  private static readonly OM_LINES: Record<string, string[]> = {
+    builder: [
+      "Your pipeline is running well. If you want to set up a schedule, I can help with that.",
+      "Nice handoff chain. The agents are working together smoothly.",
+      "Throughput is up and idle time is down. Things are running nicely.",
+    ],
+    explorer: [
+      "New MCP servers in the marketplace if you want to expand your agents' capabilities.",
+      "Trying a different model on your next agent can open up new possibilities.",
+      "There's a whole marketplace of tools out there for your agents.",
+    ],
+    puzzle_solver: [
+      "Got a complex problem? I can break it down for you into subtasks.",
+      "A well-structured task graph makes everything smoother. Want help setting one up?",
+      "Dependencies mapped out? Good. Let me know if you need help with any of them.",
+    ],
+    creator: [
+      "Your office is looking nice. New themes and decorations are available in settings.",
+      "The wardrobe system has some great options if you want to freshen up your look.",
+      "Nice outfit. The customization options are there whenever you want to switch things up.",
+    ],
+    strategist: [
+      "Your team is growing. Have you checked the leaderboards lately?",
+      "Planning the next hire? I'm here to help you think it through.",
+      "Consistency pays off. The ranks will follow your progress.",
+    ],
+    warrior: [
+      "There's something nasty outside if you're up for a hunt. Your agents can help too.",
+      "Your combat record is impressive, boss. The creatures outside won't know what hit them.",
+      "Creatures won't slay themselves. Step outside when you're ready for action.",
+    ],
+  };
+  private static readonly OM_DEFAULT_LINES = [
+    "Need help? I'm here. Just let me know what you need.",
+    "Your office is looking good. I'm here if you need anything.",
+    "Want me to break down a goal? I'm good at making big problems into small ones.",
+    "Just let me know if you need anything, boss. I'll be at my desk.",
+  ];
+  private static readonly OM_WIT_LINES = [
+    "I've calculated three ways to optimize your workflow. You won't like any of them.",
+    "The agents are working. I'm supervising. Very intensely. From this chair.",
+    "Did you know 87% of meetings could be emails? The other 13% are about why the emails weren't read.",
+    "I'd offer you coffee, but last time you tried to give it to an agent. They don't drink coffee. They ARE the coffee.",
+    "I've run the numbers on your office. They're... numbers. I find that reassuring.",
+  ];
+  private static readonly OM_DIALECT_LINES: Record<string, Record<string, string[]>> = {
+    street_urban: {
+      builder: [
+        "Your pipeline is running smooth. Want to set up a schedule? I got you.",
+        "Nice handoff chain. The agents are working together real well.",
+      ],
+      explorer: [
+        "New MCP servers in the market. Your agents could be doing way more.",
+        "Try a different model on the next agent. Could open up new possibilities.",
+      ],
+      puzzle_solver: [
+        "Got a complex problem? I can break it down for you, no sweat.",
+        "A solid task graph makes everything smoother. Want help with that?",
+      ],
+      creator: [
+        "Office is looking fresh. New themes and fits in settings if you want to switch up.",
+        "Wardrobe system got some heat. Check it out when you get a chance.",
+      ],
+      strategist: [
+        "Your squad is growing. You checked the leaderboards yet?",
+        "Planning the next hire? I'm here to help you think it through.",
+      ],
+      warrior: [
+        "Something nasty outside. You ready for a hunt? Your agents got your back too.",
+        "Your combat record is legit, boss. The creatures outside don't stand a chance.",
+      ],
+    },
+    hawaiian_pidgin: {
+      builder: [
+        "Your pipeline running smooth. Like for set up one schedule? I can help.",
+        "Nice handoff chain. The agents all working together real good.",
+      ],
+      explorer: [
+        "Get new MCP servers in the market. Your agents could do plenty more.",
+        "Try one different model on the next agent. Could open up new kine possibilities.",
+      ],
+      puzzle_solver: [
+        "Got one complex problem? I can break 'em down for you, no worries.",
+        "One solid task graph makes everything go smoother. Like for help with that?",
+      ],
+      creator: [
+        "Office looking nice. Get new themes and outfits in settings if you like switch up.",
+        "Wardrobe system get some good kine options. Check 'em out when you get chance.",
+      ],
+      strategist: [
+        "Your team is growing. You check the leaderboards already?",
+        "Planning the next hire? I stay here for help you think it through.",
+      ],
+      warrior: [
+        "Get something nasty outside. You ready for hunt? Your agents can help too.",
+        "Your combat record is killer, boss. The creatures outside no chance.",
+      ],
+    },
+    southern_1812: {
+      builder: [
+        "Your pipeline is running quite well. Might I assist in setting up a schedule?",
+        "A fine handoff chain. The agents are working together admirably.",
+      ],
+      explorer: [
+        "New MCP servers have arrived in the marketplace. Your agents might benefit from expanded capabilities.",
+        "Perhaps try a different model on your next agent. New possibilities may present themselves.",
+      ],
+      puzzle_solver: [
+        "A complex problem? I would be happy to break it down into subtasks for you.",
+        "A well-structured task graph makes everything smoother. Might I help you set one up?",
+      ],
+      creator: [
+        "Your office is looking quite fine. New themes and decorations await in settings.",
+        "The wardrobe system has some splendid options. Pray have a look when you are inclined.",
+      ],
+      strategist: [
+        "Your team is growing. Have you consulted the leaderboards of late?",
+        "Planning the next hire? I am at your service to help deliberate.",
+      ],
+      warrior: [
+        "Something nasty lurks outside. Are you prepared for a hunt? Your agents can assist as well.",
+        "Your combat record is most impressive. The creatures outside shall not prevail.",
+      ],
+    },
+  };
+  private static readonly HERMES_DEFAULT_LINES = [
+    "Mail's sorted. Nothing urgent. I'll let you know when something comes in.",
+    "All systems running. Your agents are working — I'll deliver anything they need.",
+    "No new mail. I'll keep an eye out for you.",
+    "I'm the mail clerk. I deliver things. Let me know if you need anything routed.",
+  ];
+  private static readonly HERMES_DIALECT_LINES: Record<string, string[]> = {
+    street_urban: [
+      "Mail's sorted. Nothing urgent. I'll let you know when something comes in.",
+      "All systems running. Your agents are working — I'll deliver anything they need.",
+      "No new mail. I'll keep an eye out for you.",
+      "I'm the mail clerk. I deliver things. Let me know if you need anything routed.",
+    ],
+    hawaiian_pidgin: [
+      "Mail all sorted. Nothing urgent. I let you know when something comes.",
+      "All systems running. Your agents working — I deliver anything they need.",
+      "No new mail. I keep watch for you.",
+      "I'm the mail clerk. I deliver things. Let me know if you need anything routed.",
+    ],
+    southern_1812: [
+      "Mail is sorted. Nothing urgent. I shall inform you when something arrives.",
+      "All systems running. Your agents are at work — I shall deliver anything they require.",
+      "No new mail. I shall keep watch on your behalf.",
+      "I am the mail clerk. I deliver things. Pray let me know if you require anything routed.",
+    ],
+  };
   private static readonly PROJECTOR_CHANNELS: { id: string; label: string; videoId?: string; embedUrl?: string }[] = [
     { id: "brainrot", label: "BRAINROT", videoId: "vTfD20dbxho" },
     { id: "chill",    label: "CHILL",    videoId: "hnsmzzQABBo" },
@@ -343,6 +497,7 @@ export class OfficeScene extends Phaser.Scene {
   private static MATRIX_H = 80;
   private matrixRainLastUpdate = 0;
   private matrixRainWorkingDesks = new Set<number>();
+  private lastRescueCheck = 0;
   /** Speaking indicator icons above remote players. */
   private speakingIcons = new Map<string, Phaser.GameObjects.Text>();
   /** Tracks the last roomId the scene rendered — used to detect room changes. */
@@ -1996,6 +2151,7 @@ export class OfficeScene extends Phaser.Scene {
   }
 
   /** Reposition sky to cover camera view + drift clouds. Called every frame. */
+  private lastCloudAlphaUpdate = 0;
   private updateSky(dt: number): void {
     // Redraw sky gradient to cover the camera's current world view
     this.drawSkyGradient();
@@ -2004,6 +2160,9 @@ export class OfficeScene extends Phaser.Scene {
     const cam = this.cameras.main;
     const view = cam.worldView;
     const t = this.time.now;
+    // Throttle alpha + vertical bob to ~10Hz (imperceptible at these speeds)
+    const updateAlpha = t - this.lastCloudAlphaUpdate >= 100;
+    if (updateAlpha) this.lastCloudAlphaUpdate = t;
     for (const c of this.clouds) {
       // Horizontal drift
       c.sprite.x += c.speed * dt / 1000;
@@ -2011,11 +2170,13 @@ export class OfficeScene extends Phaser.Scene {
       if (c.sprite.x - halfW > view.x + view.width) {
         c.sprite.x = view.x - halfW;
       }
-      // Vertical bob around yBase
-      c.sprite.y = c.yBase + Math.sin(t * 0.0004 + c.phase) * 25;
-      // Subtle alpha pulse: oscillates between 30% and 100% of baseAlpha (never fully invisible)
-      const pulse = 0.65 + 0.35 * Math.sin(t * c.fadeSpeed + c.phase);
-      c.sprite.setAlpha(c.baseAlpha * pulse);
+      if (updateAlpha) {
+        // Vertical bob around yBase
+        c.sprite.y = c.yBase + Math.sin(t * 0.0004 + c.phase) * 25;
+        // Subtle alpha pulse: oscillates between 30% and 100% of baseAlpha (never fully invisible)
+        const pulse = 0.65 + 0.35 * Math.sin(t * c.fadeSpeed + c.phase);
+        c.sprite.setAlpha(c.baseAlpha * pulse);
+      }
     }
   }
 
@@ -2085,11 +2246,8 @@ export class OfficeScene extends Phaser.Scene {
     } else {
       // monitor glows: pulse for working agents
       const pulse = 0.15 + Math.sin(time * 0.003) * 0.05;
-      // Build deskIndex→agent map once instead of [...values()].find() per monitor
-      const deskAgentMap = new Map<number, { status: AgentStatus; deskIndex: number }>();
-      for (const agent of this.store.agents.values()) {
-        if (agent.deskIndex >= 0) deskAgentMap.set(agent.deskIndex, agent);
-      }
+      // Use cached deskIndex→agent map (rebuilt in syncAgents when agents change)
+      const deskAgentMap = this.cachedDeskAgentMap;
       this.monitors.forEach((m, i) => {
         const glow = this.monitorGlows[i];
         if (!glow) return;
@@ -3842,172 +4000,17 @@ export class OfficeScene extends Phaser.Scene {
     if (this.officeManager && !isVisitor) {
       const dominant = this.store.aspirationProfile?.dominant ?? null;
       const dialect = this.worldTheme?.dialect?.chatStyle ?? null;
-      const officeManagerLines: Record<string, string[]> = {
-        builder: [
-          "Your pipeline is running well. If you want to set up a schedule, I can help with that.",
-          "Nice handoff chain. The agents are working together smoothly.",
-          "Throughput is up and idle time is down. Things are running nicely.",
-        ],
-        explorer: [
-          "New MCP servers in the marketplace if you want to expand your agents' capabilities.",
-          "Trying a different model on your next agent can open up new possibilities.",
-          "There's a whole marketplace of tools out there for your agents.",
-        ],
-        puzzle_solver: [
-          "Got a complex problem? I can break it down for you into subtasks.",
-          "A well-structured task graph makes everything smoother. Want help setting one up?",
-          "Dependencies mapped out? Good. Let me know if you need help with any of them.",
-        ],
-        creator: [
-          "Your office is looking nice. New themes and decorations are available in settings.",
-          "The wardrobe system has some great options if you want to freshen up your look.",
-          "Nice outfit. The customization options are there whenever you want to switch things up.",
-        ],
-        strategist: [
-          "Your team is growing. Have you checked the leaderboards lately?",
-          "Planning the next hire? I'm here to help you think it through.",
-          "Consistency pays off. The ranks will follow your progress.",
-        ],
-        warrior: [
-          "There's something nasty outside if you're up for a hunt. Your agents can help too.",
-          "Your combat record is impressive, boss. The creatures outside won't know what hit them.",
-          "Creatures won't slay themselves. Step outside when you're ready for action.",
-        ],
-      };
-      const dialectLines: Record<string, Record<string, string[]>> = {
-        street_urban: {
-          builder: [
-            "Your pipeline is running smooth. Want to set up a schedule? I got you.",
-            "Nice handoff chain. The agents are working together real well.",
-          ],
-          explorer: [
-            "New MCP servers in the market. Your agents could be doing way more.",
-            "Try a different model on the next agent. Could open up new possibilities.",
-          ],
-          puzzle_solver: [
-            "Got a complex problem? I can break it down for you, no sweat.",
-            "A solid task graph makes everything smoother. Want help with that?",
-          ],
-          creator: [
-            "Office is looking fresh. New themes and fits in settings if you want to switch up.",
-            "Wardrobe system got some heat. Check it out when you get a chance.",
-          ],
-          strategist: [
-            "Your squad is growing. You checked the leaderboards yet?",
-            "Planning the next hire? I'm here to help you think it through.",
-          ],
-          warrior: [
-            "Something nasty outside. You ready for a hunt? Your agents got your back too.",
-            "Your combat record is legit, boss. The creatures outside don't stand a chance.",
-          ],
-        },
-        hawaiian_pidgin: {
-          builder: [
-            "Your pipeline running smooth. Like for set up one schedule? I can help.",
-            "Nice handoff chain. The agents all working together real good.",
-          ],
-          explorer: [
-            "Get new MCP servers in the market. Your agents could do plenty more.",
-            "Try one different model on the next agent. Could open up new kine possibilities.",
-          ],
-          puzzle_solver: [
-            "Got one complex problem? I can break 'em down for you, no worries.",
-            "One solid task graph makes everything go smoother. Like for help with that?",
-          ],
-          creator: [
-            "Office looking nice. Get new themes and outfits in settings if you like switch up.",
-            "Wardrobe system get some good kine options. Check 'em out when you get chance.",
-          ],
-          strategist: [
-            "Your team is growing. You check the leaderboards already?",
-            "Planning the next hire? I stay here for help you think it through.",
-          ],
-          warrior: [
-            "Get something nasty outside. You ready for hunt? Your agents can help too.",
-            "Your combat record is killer, boss. The creatures outside no chance.",
-          ],
-        },
-        southern_1812: {
-          builder: [
-            "Your pipeline is running quite well. Might I assist in setting up a schedule?",
-            "A fine handoff chain. The agents are working together admirably.",
-          ],
-          explorer: [
-            "New MCP servers have arrived in the marketplace. Your agents might benefit from expanded capabilities.",
-            "Perhaps try a different model on your next agent. New possibilities may present themselves.",
-          ],
-          puzzle_solver: [
-            "A complex problem? I would be happy to break it down into subtasks for you.",
-            "A well-structured task graph makes everything smoother. Might I help you set one up?",
-          ],
-          creator: [
-            "Your office is looking quite fine. New themes and decorations await in settings.",
-            "The wardrobe system has some splendid options. Pray have a look when you are inclined.",
-          ],
-          strategist: [
-            "Your team is growing. Have you consulted the leaderboards of late?",
-            "Planning the next hire? I am at your service to help deliberate.",
-          ],
-          warrior: [
-            "Something nasty lurks outside. Are you prepared for a hunt? Your agents can assist as well.",
-            "Your combat record is most impressive. The creatures outside shall not prevail.",
-          ],
-        },
-      };
       const aspirationKey = dominant ?? "default";
-      const baseLines = (dominant ? officeManagerLines[dominant] : null) ?? [
-        "Need help? I'm here. Just let me know what you need.",
-        "Your office is looking good. I'm here if you need anything.",
-        "Want me to break down a goal? I'm good at making big problems into small ones.",
-        "Just let me know if you need anything, boss. I'll be at my desk.",
-      ];
-      // Portal-style wit lines — mixed in 30% of the time
-      const witLines = [
-        "I've calculated three ways to optimize your workflow. You won't like any of them.",
-        "The agents are working. I'm supervising. Very intensely. From this chair.",
-        "Did you know 87% of meetings could be emails? The other 13% are about why the emails weren't read.",
-        "I'd offer you coffee, but last time you tried to give it to an agent. They don't drink coffee. They ARE the coffee.",
-        "I've run the numbers on your office. They're... numbers. I find that reassuring.",
-      ];
-      let lines = dialect ? (dialectLines[dialect]?.[aspirationKey] ?? baseLines) : baseLines;
+      const baseLines = (dominant ? OfficeScene.OM_LINES[dominant] : null) ?? OfficeScene.OM_DEFAULT_LINES;
+      let lines = dialect ? (OfficeScene.OM_DIALECT_LINES[dialect]?.[aspirationKey] ?? baseLines) : baseLines;
       // 30% chance to use a wit line instead
-      if (Math.random() < 0.3) lines = witLines;
+      if (Math.random() < 0.3) lines = OfficeScene.OM_WIT_LINES;
       checkNpc(OFFICE_MANAGER_ID, this.officeManager.container, lines);
     }
 
     if (this.hermes && !isVisitor) {
       const dialect = this.worldTheme?.dialect?.chatStyle ?? null;
-      const hermesLines: Record<string, string[]> = {
-        street_urban: [
-          "Mail's sorted. Nothing urgent. I'll let you know when something comes in.",
-          "All systems running. Your agents are working — I'll deliver anything they need.",
-          "No new mail. I'll keep an eye out for you.",
-          "I'm the mail clerk. I deliver things. Let me know if you need anything routed.",
-        ],
-        hawaiian_pidgin: [
-          "Mail all sorted. Nothing urgent. I let you know when something comes.",
-          "All systems running. Your agents working — I deliver anything they need.",
-          "No new mail. I keep watch for you.",
-          "I'm the mail clerk. I deliver things. Let me know if you need anything routed.",
-        ],
-        southern_1812: [
-          "Mail is sorted. Nothing urgent. I shall inform you when something arrives.",
-          "All systems running. Your agents are at work — I shall deliver anything they require.",
-          "No new mail. I shall keep watch on your behalf.",
-          "I am the mail clerk. I deliver things. Pray let me know if you require anything routed.",
-        ],
-      };
-      const lines = dialect ? (hermesLines[dialect] ?? [
-        "Mail's sorted. Nothing urgent. I'll let you know when something comes in.",
-        "All systems running. Your agents are working — I'll deliver anything they need.",
-        "No new mail. I'll keep an eye out for you.",
-        "I'm the mail clerk. I deliver things. Let me know if you need anything routed.",
-      ]) : [
-        "Mail's sorted. Nothing urgent. I'll let you know when something comes in.",
-        "All systems running. Your agents are working — I'll deliver anything they need.",
-        "No new mail. I'll keep an eye out for you.",
-        "I'm the mail clerk. I deliver things. Let me know if you need anything routed.",
-      ];
+      const lines = dialect ? (OfficeScene.HERMES_DIALECT_LINES[dialect] ?? OfficeScene.HERMES_DEFAULT_LINES) : OfficeScene.HERMES_DEFAULT_LINES;
       checkNpc(HERMES_ID, this.hermes.container, lines);
     }
   }
@@ -6809,12 +6812,12 @@ export class OfficeScene extends Phaser.Scene {
   private updateWeaponRack(): void {
     const g = this.weaponRackGfx;
     if (!g || !this.world) return;
-    g.clear();
 
     const weapons = this.world.ownedWeaponsList;
     const sig = weapons.join(",");
     if (sig === this.weaponRackSig) return;
     this.weaponRackSig = sig;
+    g.clear();
 
     if (weapons.length === 0) return; // empty rack — don't draw
 
@@ -8301,9 +8304,16 @@ export class OfficeScene extends Phaser.Scene {
   }
 
   private syncAgents(): void {
+    // Build agentId→card map once to avoid O(agents × cards) find() per agent
+    const agentCardMap = new Map<string, TaskCard>();
+    for (const c of this.store.board.values()) {
+      if (c.status === "in_progress" && c.assignedAgentId) {
+        agentCardMap.set(c.assignedAgentId, c);
+      }
+    }
     for (const [id, info] of this.store.agents) {
       // Find the card assigned to this agent to get its V-model phase
-      const agentCard = [...this.store.board.values()].find(c => c.assignedAgentId === id && c.status === "in_progress");
+      const agentCard = agentCardMap.get(id);
       const phase = agentCard?.phase ?? null;
       if (id === OFFICE_MANAGER_ID) {
         if (info.appearance) {
@@ -8379,11 +8389,12 @@ export class OfficeScene extends Phaser.Scene {
       }
     }
     this.initialSyncDone = true;
-    // Build deskIndex→agent map once for monitor + chair loops
-    const deskAgentMap = new Map<number, AgentInfo>();
+    // Build cached deskIndex→agent map for monitor + chair loops + updateLighting
+    this.cachedDeskAgentMap.clear();
     for (const a of this.store.agents.values()) {
-      if (a.deskIndex >= 0) deskAgentMap.set(a.deskIndex, a);
+      if (a.deskIndex >= 0) this.cachedDeskAgentMap.set(a.deskIndex, a);
     }
+    const deskAgentMap = this.cachedDeskAgentMap;
     // monitors glow whenever someone's at the desk — working or just typing;
     // they only go dark during the post-task break (done/error linger)
     this.monitors.forEach((m, i) => {
@@ -8666,8 +8677,9 @@ export class OfficeScene extends Phaser.Scene {
     }
 
     // Rescue: if a chunk loaded under the player and they're stuck in a wall,
-    // push them to the nearest walkable tile
-    if (this.world.isOutside(this.player.x, this.player.y)) {
+    // push them to the nearest walkable tile (throttled to 10Hz)
+    if (this.world.isOutside(this.player.x, this.player.y) && time - this.lastRescueCheck >= 100) {
+      this.lastRescueCheck = time;
       const rescue = this.world.rescuePlayer(this.player.x, this.player.y);
       if (rescue) this.player.setPosition(rescue.x, rescue.y);
     }
