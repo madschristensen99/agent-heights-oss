@@ -178,13 +178,14 @@ export async function getAgentBalances(agentId: string): Promise<{ address: stri
     } catch { /* RPC may fail */ }
 
     // ERC-20 balances from CDP (skip native ETH — already fetched via RPC above)
+    const nativeSymbol = network === "polygon" ? "MATIC" : "ETH";
     for (const b of cdpBalances as any[]) {
       const mint = (b.token?.contractAddress ?? b.token?.address ?? "").toLowerCase();
-      const isNative = !mint || mint === "0x0000000000000000000000000000000000000000" || b.token?.native === true;
+      const symbol = b.token?.symbol ?? b.token?.name ?? "unknown";
+      const isNative = !mint || mint === "0x0000000000000000000000000000000000000000" || b.token?.native === true || symbol.toUpperCase() === nativeSymbol;
       if (isNative) continue;
       const rawAmount = BigInt(b.amount?.amount ?? 0);
       const decimals = Number(b.amount?.decimals ?? 18);
-      const symbol = b.token?.symbol ?? b.token?.name ?? "unknown";
       const amount = rawToHuman(rawAmount, decimals);
       let usdValue: string | undefined;
       const cdpUsd = cdpUsdMap.get(mint);
