@@ -597,6 +597,7 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
       });
     }
     const tokenIdResults = await client.multicall({ contracts: tokenIdCalls }) as any[];
+    console.log(`[cdp-evm] multicall tokenIds:`, JSON.stringify(tokenIdResults.map((r: any) => ({ status: r.status, hasResult: r.result != null, error: r.error?.message }))));
     const tokenIds = tokenIdResults.map((r: any) => r.result) as bigint[];
 
     // Batch 2: fetch all position data via multicall
@@ -607,6 +608,7 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
       args: [tokenId],
     }));
     const positionRawResults = await client.multicall({ contracts: positionCalls }) as any[];
+    console.log(`[cdp-evm] multicall positions:`, JSON.stringify(positionRawResults.map((r: any) => ({ status: r.status, hasResult: r.result != null, error: r.error?.message }))));
     const positionResults = positionRawResults.map((r: any) => r.result).filter((r: any) => r != null) as any[][];
 
     // Collect unique (token0, token1, fee) combos for pool lookups
