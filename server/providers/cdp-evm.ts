@@ -607,7 +607,7 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
       args: [tokenId],
     }));
     const positionRawResults = await client.multicall({ contracts: positionCalls }) as any[];
-    const positionResults = positionRawResults.map((r: any) => r.result) as any[][];
+    const positionResults = positionRawResults.map((r: any) => r.result).filter((r: any) => r != null) as any[][];
 
     // Collect unique (token0, token1, fee) combos for pool lookups
     const poolKeySet = new Set<string>();
@@ -637,7 +637,7 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
     poolKeys.forEach((pk, idx) => poolMap.set(pk.key, poolResults[idx]));
 
     // Batch 4: fetch slot0 for each unique pool + token metadata via multicall
-    const uniquePools = [...new Set(poolResults.filter(p => p !== "0x0000000000000000000000000000000000000000"))];
+    const uniquePools = [...new Set(poolResults.filter(p => p && p !== "0x0000000000000000000000000000000000000000"))];
     const slot0Calls = uniquePools.map(poolAddr => ({
       address: poolAddr,
       abi: poolAbi,
