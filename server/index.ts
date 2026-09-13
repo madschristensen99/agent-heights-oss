@@ -19,7 +19,7 @@ import { rateLimitAsync, rateLimit } from "./ratelimit.js";
 import { setUserApiKey, deleteUserApiKey, setUserMcpKey, deleteUserMcpKey, getUserMcpKeys, getUserMcpKeyUrls } from "./apikeys.js";
 import { startOAuthFlow, handleOAuthCallback, exchangeOAuthCode } from "./mcp-oauth.js";
 import { getAgentWalletAddress, getAgentBalances, getAgentPolicy, updateAgentPolicy, getAgentTxHistory, createOnrampUrl, getAgentLpPositions } from "./providers/cdp-solana.js";
-import { getAgentWalletAddress as getEvmWalletAddress, getAgentBalances as getEvmBalances, getAgentTxHistory as getEvmTxHistory } from "./providers/cdp-evm.js";
+import { getAgentWalletAddress as getEvmWalletAddress, getAgentBalances as getEvmBalances, getAgentTxHistory as getEvmTxHistory, getNetwork as getEvmNetwork } from "./providers/cdp-evm.js";
 import { getAgentBalances as getCrossmintBalances, getAgentPolicy as getCrossmintPolicy, getAgentTxHistory as getCrossmintTxHistory, fundAgentWallet, createCrossmintOnrampUrl, getDefaultChain as getCrossmintDefaultChain } from "./providers/crossmint-wallets.js";
 import { startBalanceMonitor as startCircleBalanceMonitor, isCircleGatewayConfigured, ensureGatewayBalance } from "./providers/x402-pay.js";
 import { TenantManager, HQ2_ROOM_ID, type UserSession } from "./tenant.js";
@@ -2674,16 +2674,17 @@ wss.on("connection", async (ws, req) => {
           try {
             const address = await getEvmWalletAddress(msg.agentId);
             if (!address) {
-              sess.broadcast({ type: "cdp_evm_wallet_status", agentId: msg.agentId, address: null, balances: null, totalUsdValue: null, error: "CDP EVM not configured or wallet not found" });
+              sess.broadcast({ type: "cdp_evm_wallet_status", agentId: msg.agentId, address: null, balances: null, totalUsdValue: null, network: null, error: "CDP EVM not configured or wallet not found" });
               break;
             }
             const balData = await getEvmBalances(msg.agentId);
             const balances = balData?.balances ?? [];
             const totalUsdValue = balData?.totalUsdValue;
-            sess.broadcast({ type: "cdp_evm_wallet_status", agentId: msg.agentId, address, balances, totalUsdValue });
+            const evmNetwork = getEvmNetwork();
+            sess.broadcast({ type: "cdp_evm_wallet_status", agentId: msg.agentId, address, balances, totalUsdValue, network: evmNetwork });
           } catch (err) {
             const msg2 = err instanceof Error ? err.message : String(err);
-            sess.broadcast({ type: "cdp_evm_wallet_status", agentId: msg.agentId, address: null, balances: null, totalUsdValue: null, error: msg2 });
+            sess.broadcast({ type: "cdp_evm_wallet_status", agentId: msg.agentId, address: null, balances: null, totalUsdValue: null, network: null, error: msg2 });
           }
           break;
         }

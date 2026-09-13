@@ -277,7 +277,7 @@ export class Store {
   cdpOnrampListeners: ((msg: { agentId: string; url: string | null; error?: string }) => void)[] = [];
   cdpLpPositionsListeners: ((msg: { agentId: string; positions: { nftMint: string; poolId: string; liquidity: string; tickLower: number; tickUpper: number; tickCurrent: number; inRange: boolean; explorerUrl: string; symbolA: string; symbolB: string; mintA: string; mintB: string; decimalsA: number; decimalsB: number; priceLower: string; priceUpper: string; priceCurrent: string; amountA: string; amountB: string; feeTier: string; uncollectedFeeA: string; uncollectedFeeB: string; usdValueA?: string; usdValueB?: string; totalUsdValue?: string }[] | null; error?: string }) => void)[] = [];
   /** Listeners called when server responds with CDP EVM wallet status. */
-  cdpEvmWalletListeners: ((msg: { agentId: string; address: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; totalUsdValue?: string | null; error?: string }) => void)[] = [];
+  cdpEvmWalletListeners: ((msg: { agentId: string; address: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; totalUsdValue?: string | null; network?: string | null; error?: string }) => void)[] = [];
   /** Listeners called when server responds with CDP EVM tx history. */
   cdpEvmTxHistoryListeners: ((msg: { agentId: string; transactions: { hash: string; blockNumber: number | null; timestamp: number | null; from: string; to: string; value: string; status: boolean | null }[] | null; error?: string }) => void)[] = [];
   /** Listeners called when server responds with Crossmint wallet status. */

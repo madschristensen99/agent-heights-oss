@@ -247,7 +247,7 @@ export class Hud {
   private detailCdpOnrampListener: ((msg: { agentId: string; url: string | null; error?: string }) => void) | null = null;
   private detailCdpLpPositionsListener: ((msg: { agentId: string; positions: { nftMint: string; poolId: string; liquidity: string; tickLower: number; tickUpper: number; tickCurrent: number; inRange: boolean; explorerUrl: string; symbolA: string; symbolB: string; mintA: string; mintB: string; decimalsA: number; decimalsB: number; priceLower: string; priceUpper: string; priceCurrent: string; amountA: string; amountB: string; feeTier: string; uncollectedFeeA: string; uncollectedFeeB: string; usdValueA?: string; usdValueB?: string; totalUsdValue?: string }[] | null; error?: string }) => void) | null = null;
   private cdpDetailAgentId: string | null = null;
-  private detailCdpEvmListener: ((msg: { agentId: string; address: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; totalUsdValue?: string | null; error?: string }) => void) | null = null;
+  private detailCdpEvmListener: ((msg: { agentId: string; address: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; totalUsdValue?: string | null; network?: string | null; error?: string }) => void) | null = null;
   private detailCdpEvmTxHistoryListener: ((msg: { agentId: string; transactions: { hash: string; blockNumber: number | null; timestamp: number | null; from: string; to: string; value: string; status: boolean | null }[] | null; error?: string }) => void) | null = null;
   private cdpEvmDetailAgentId: string | null = null;
   private detailCrossmintListener: ((msg: { agentId: string; address: string | null; chain: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; error?: string }) => void) | null = null;
@@ -5640,7 +5640,7 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
         });
       }
       this.net.send({ type: "get_cdp_evm_wallet", agentId: agent.id });
-      this.detailCdpEvmListener = (msg: { agentId: string; address: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; totalUsdValue?: string | null; error?: string }) => {
+      this.detailCdpEvmListener = (msg: { agentId: string; address: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; totalUsdValue?: string | null; network?: string | null; error?: string }) => {
         if (msg.agentId !== agent.id) return;
         const content = cdpEvmSection.querySelector("#d-cdp-evm-content") as HTMLElement | null;
         if (!content) return;
@@ -5652,10 +5652,13 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
           content.innerHTML = `<span class="wallet-error">⚠ Wallet not available</span>`;
           return;
         }
+        const chainName = msg.network ?? "base";
+        const chainLabel = chainName === "base" ? "Base" : chainName === "ethereum" ? "Ethereum" : chainName === "polygon" ? "Polygon" : chainName === "base-sepolia" ? "Base Sepolia" : chainName;
+        const chainIcon = chainName === "polygon" ? "🟣" : "🔵";
         const balancesHtml = msg.balances && msg.balances.length > 0
           ? msg.balances.map((b: { symbol: string; amount: string; usdValue?: string }) => {
               const usd = b.usdValue ? ` <span style="color:var(--dim);">($${esc(b.usdValue)})</span>` : "";
-              return `<div style="margin-top:0.2rem;">${esc(b.symbol)}: ${esc(b.amount)}${usd}</div>`;
+              return `<div style="margin-top:0.2rem; display:flex; align-items:center; gap:0.3rem;"><span style="font-size:0.6rem;">${chainIcon}</span> ${esc(b.symbol)}: ${esc(b.amount)}${usd}</div>`;
             }).join("")
           : `<div style="color:var(--dim); margin-top:0.2rem;">No balances — wallet may need funding</div>`;
         const totalUsd = msg.totalUsdValue ? ` <span style="color:var(--green); font-weight:600; font-size:0.7rem;">Total: $${esc(msg.totalUsdValue)}</span>` : "";
@@ -5670,6 +5673,7 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
           </div>
           <div style="margin-top:0.3rem; display:flex; align-items:center; gap:0.5rem;">
             <a href="https://basescan.org/address/${esc(msg.address)}" target="_blank" style="font-size:0.6rem; color:var(--accent); text-decoration:none;">View on BaseScan →</a>
+            <span style="font-size:0.6rem; color:var(--dim);">· ${chainIcon} ${esc(chainLabel)}</span>
             ${totalUsd}
           </div>
           <div style="margin-top:0.4rem; border-top:1px solid var(--panel-edge-soft); padding-top:0.3rem;">

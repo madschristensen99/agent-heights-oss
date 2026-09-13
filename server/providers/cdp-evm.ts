@@ -36,7 +36,7 @@ function isCdpConfigured(): boolean {
   return !!(process.env.CDP_API_KEY_ID && process.env.CDP_API_KEY_SECRET && process.env.CDP_WALLET_SECRET);
 }
 
-function getNetwork(): string {
+export function getNetwork(): string {
   return process.env.CDP_EVM_NETWORK || "base";
 }
 
@@ -177,9 +177,11 @@ export async function getAgentBalances(agentId: string): Promise<{ address: stri
       balances.push({ symbol: network === "polygon" ? "MATIC" : "ETH", amount: ethAmount, usdValue: ethUsd > 0 ? ethUsd.toFixed(2) : undefined });
     } catch { /* RPC may fail */ }
 
-    // ERC-20 balances from CDP
+    // ERC-20 balances from CDP (skip native ETH — already fetched via RPC above)
     for (const b of cdpBalances as any[]) {
       const mint = (b.token?.contractAddress ?? b.token?.address ?? "").toLowerCase();
+      const isNative = !mint || mint === "0x0000000000000000000000000000000000000000" || b.token?.native === true;
+      if (isNative) continue;
       const rawAmount = BigInt(b.amount?.amount ?? 0);
       const decimals = Number(b.amount?.decimals ?? 18);
       const symbol = b.token?.symbol ?? b.token?.name ?? "unknown";
