@@ -537,12 +537,16 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
 
     const { npm: npmAddress, factory: factoryAddress } = getUniswapV3Addresses(network);
 
+    console.log(`[cdp-evm] LP positions query: network=${network}, wallet=${account.address}, npm=${npmAddress}, factory=${factoryAddress}`);
+
     const balance = await client.readContract({
       address: npmAddress,
       abi: positionManagerAbi,
       functionName: "balanceOf",
       args: [account.address as `0x${string}`],
     }) as bigint;
+
+    console.log(`[cdp-evm] NPM balanceOf(${account.address}) = ${balance}`);
 
     if (balance === 0n) return [];
 
