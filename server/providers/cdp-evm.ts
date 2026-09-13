@@ -218,6 +218,14 @@ export async function getAgentBalances(agentId: string): Promise<{ address: stri
       return { address: account.address, balances: cdpFallback, totalUsdValue: undefined };
     }
 
+    // Add LP position values to total
+    try {
+      const lpPositions = await getAgentEvmLpPositions(agentId);
+      for (const pos of lpPositions) {
+        if (pos.totalUsdValue) totalUsd += parseFloat(pos.totalUsdValue);
+      }
+    } catch { /* best-effort */ }
+
     return { address: account.address, balances, totalUsdValue: totalUsd > 0 ? totalUsd.toFixed(2) : undefined };
   } catch (err) {
     console.error(`[cdp-evm] Failed to get balances for agent ${agentId}:`, err);
