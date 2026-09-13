@@ -5669,7 +5669,7 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
             <img src="https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(msg.address)}" alt="Wallet QR" style="display:block; width:120px; height:120px;" />
           </div>
           <div style="margin-top:0.3rem; display:flex; align-items:center; gap:0.5rem;">
-            <a href="https://sepolia.basescan.org/address/${esc(msg.address)}" target="_blank" style="font-size:0.6rem; color:var(--accent); text-decoration:none;">View on BaseScan →</a>
+            <a href="https://basescan.org/address/${esc(msg.address)}" target="_blank" style="font-size:0.6rem; color:var(--accent); text-decoration:none;">View on BaseScan →</a>
             ${totalUsd}
           </div>
           <div style="margin-top:0.4rem; border-top:1px solid var(--panel-edge-soft); padding-top:0.3rem;">
@@ -5716,7 +5716,7 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
           const hashShort = tx.hash.slice(0, 10) + "..." + tx.hash.slice(-6);
           return `<div style="margin-bottom:0.3rem; padding-bottom:0.3rem; border-bottom:1px solid var(--panel-edge-soft);">
             <div style="display:flex; justify-content:space-between;">
-              <span style="font-family:monospace; font-size:0.6rem;">${status} <a href="https://sepolia.basescan.org/tx/${esc(tx.hash)}" target="_blank" style="color:var(--accent); text-decoration:none;">${esc(hashShort)}</a></span>
+              <span style="font-family:monospace; font-size:0.6rem;">${status} <a href="https://basescan.org/tx/${esc(tx.hash)}" target="_blank" style="color:var(--accent); text-decoration:none;">${esc(hashShort)}</a></span>
               <span style="font-size:0.6rem; color:var(--dim);">${time}</span>
             </div>
             <div style="font-size:0.6rem; color:var(--dim); margin-top:0.1rem;">→ ${esc(tx.to.slice(0, 10))}... · ${esc(tx.value)}</div>

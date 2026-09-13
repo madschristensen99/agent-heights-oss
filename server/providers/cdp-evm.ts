@@ -13,7 +13,7 @@ import { base, baseSepolia, mainnet as ethereum, polygon } from "viem/chains";
  *   CDP_WALLET_SECRET
  *
  * Optional env vars:
- *   CDP_EVM_NETWORK  (default: "base-sepolia")
+ *   CDP_EVM_NETWORK  (default: "base")
  */
 
 let cdpClient: CdpClient | null = null;
@@ -37,7 +37,7 @@ function isCdpConfigured(): boolean {
 }
 
 function getNetwork(): string {
-  return process.env.CDP_EVM_NETWORK || "base-sepolia";
+  return process.env.CDP_EVM_NETWORK || "base";
 }
 
 function getViemChain(network: string): ViemChain {
@@ -46,7 +46,7 @@ function getViemChain(network: string): ViemChain {
     case "base-sepolia": return baseSepolia;
     case "ethereum": return ethereum;
     case "polygon": return polygon;
-    default: return baseSepolia;
+    default: return base;
   }
 }
 
@@ -56,7 +56,7 @@ function explorerBase(network: string): string {
     case "base-sepolia": return "https://sepolia.basescan.org/address/";
     case "ethereum": return "https://etherscan.io/address/";
     case "polygon": return "https://polygonscan.com/address/";
-    default: return `https://sepolia.basescan.org/address/`;
+    default: return `https://basescan.org/address/`;
   }
 }
 
