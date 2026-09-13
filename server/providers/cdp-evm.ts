@@ -126,14 +126,13 @@ async function fetchTokenPrice(address: string, network: string): Promise<number
 }
 
 async function fetchEthPrice(network: string): Promise<number> {
-  const chainMap: Record<string, string> = { "base": "base", "base-sepolia": "base", "ethereum": "ethereum", "polygon": "matic" };
-  const chainId = chainMap[network] ?? "base";
+  const chainMap: Record<string, string> = { "base": "ethereum", "base-sepolia": "ethereum", "ethereum": "ethereum", "polygon": "matic-network" };
+  const coinId = chainMap[network] ?? "ethereum";
   try {
-    const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${chainId === "matic" ? "matic-network" : chainId}&vs_currencies=usd`);
+    const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd`);
     if (!res.ok) return 0;
     const data = await res.json() as any;
-    const id = chainId === "matic" ? "matic-network" : chainId;
-    return data[id]?.usd ?? 0;
+    return data[coinId]?.usd ?? 0;
   } catch { return 0; }
 }
 
