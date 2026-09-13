@@ -249,6 +249,9 @@ export class Hud {
   private cdpDetailAgentId: string | null = null;
   private detailCdpEvmListener: ((msg: { agentId: string; address: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; totalUsdValue?: string | null; network?: string | null; error?: string }) => void) | null = null;
   private detailCdpEvmTxHistoryListener: ((msg: { agentId: string; transactions: { hash: string; blockNumber: number | null; timestamp: number | null; from: string; to: string; value: string; status: boolean | null }[] | null; error?: string }) => void) | null = null;
+  private detailCdpEvmOnrampListener: ((msg: { agentId: string; url: string | null; error?: string }) => void) | null = null;
+  private detailCdpEvmPolicyListener: ((msg: { agentId: string; policyId: string | null; maxEthPerTransfer: number | null; allowedRecipients: string[] | null; blockedRecipients: string[] | null; allowedTokens: string[] | null; blockedTokens: string[] | null; network: string; error?: string }) => void) | null = null;
+  private detailCdpEvmLpPositionsListener: ((msg: { agentId: string; positions: { tokenId: string; token0: string; token1: string; symbol0: string; symbol1: string; fee: number; tickLower: number; tickUpper: number; tickCurrent: number; inRange: boolean; liquidity: string; tokensOwed0: string; tokensOwed1: string; amount0: string; amount1: string; priceLower: string; priceUpper: string; priceCurrent: string; explorerUrl: string; usdValue0?: string; usdValue1?: string; totalUsdValue?: string }[] | null; error?: string }) => void) | null = null;
   private cdpEvmDetailAgentId: string | null = null;
   private detailCrossmintListener: ((msg: { agentId: string; address: string | null; chain: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; error?: string }) => void) | null = null;
   private detailCrossmintPolicyListener: ((msg: { agentId: string; chain: string | null; spendingLimitUsd: number | null; allowedRecipients: string[] | null; blockedRecipients: string[] | null; description: string | null; error?: string }) => void) | null = null;
@@ -5591,6 +5594,21 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
         if (tidx >= 0) this.store.cdpEvmTxHistoryListeners.splice(tidx, 1);
         this.detailCdpEvmTxHistoryListener = null;
       }
+      if (this.detailCdpEvmOnrampListener) {
+        const oidx = this.store.cdpEvmOnrampListeners.indexOf(this.detailCdpEvmOnrampListener);
+        if (oidx >= 0) this.store.cdpEvmOnrampListeners.splice(oidx, 1);
+        this.detailCdpEvmOnrampListener = null;
+      }
+      if (this.detailCdpEvmPolicyListener) {
+        const pidx = this.store.cdpEvmPolicyListeners.indexOf(this.detailCdpEvmPolicyListener);
+        if (pidx >= 0) this.store.cdpEvmPolicyListeners.splice(pidx, 1);
+        this.detailCdpEvmPolicyListener = null;
+      }
+      if (this.detailCdpEvmLpPositionsListener) {
+        const lpidx = this.store.cdpEvmLpPositionsListeners.indexOf(this.detailCdpEvmLpPositionsListener);
+        if (lpidx >= 0) this.store.cdpEvmLpPositionsListeners.splice(lpidx, 1);
+        this.detailCdpEvmLpPositionsListener = null;
+      }
       this.cdpEvmDetailAgentId = agent.id;
     if (agent.cdpEvm && isFeatureEnabled("cdpEvm")) {
       cdpEvmSection.hidden = false;
@@ -5599,6 +5617,26 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
           <div style="font-size:0.75rem; font-weight:600; color:var(--accent); margin-bottom:0.4rem;">⟠ EVM WALLET (CDP)</div>
           <div id="d-cdp-evm-content" style="font-size:0.7rem; color:var(--dim);">Loading wallet...</div>
           <button id="d-cdp-evm-refresh" style="margin-top:0.4rem; padding:0.3rem 0.5rem; border:1px solid var(--panel-edge-soft); border-radius:0.3rem; background:var(--panel); color:var(--dim); font-size:0.65rem; cursor:pointer;">↻ Refresh</button>
+          <button id="d-cdp-evm-buy" style="margin-top:0.4rem; margin-left:0.3rem; padding:0.3rem 0.5rem; border:1px solid var(--accent); border-radius:0.3rem; background:var(--panel); color:var(--accent); font-size:0.65rem; cursor:pointer;">Buy ETH</button>
+        </div>
+        <div id="d-cdp-evm-lp" style="margin-top:0.5rem; padding-top:0.4rem; border-top:1px solid var(--panel-edge-soft);">
+          <div id="d-cdp-evm-lp-toggle" style="display:flex; justify-content:space-between; align-items:center; cursor:pointer; user-select:none;">
+            <div style="display:flex; align-items:center; gap:0.3rem; font-size:0.65rem; font-weight:600; color:var(--accent);">
+              <span class="cdp-evm-chevron" style="display:inline-block; transition:transform 0.2s; transform:rotate(-90deg);">▾</span>
+              💧 LP POSITIONS
+            </div>
+            <button id="d-cdp-evm-lp-refresh" style="padding:0.2rem 0.4rem; border:1px solid var(--panel-edge-soft); border-radius:0.3rem; background:var(--panel); color:var(--dim); font-size:0.6rem; cursor:pointer;">↻</button>
+          </div>
+          <div id="d-cdp-evm-lp-content" style="font-size:0.7rem; color:var(--dim); display:none;">Loading LP positions...</div>
+        </div>
+        <div id="d-cdp-evm-policy" style="margin-top:0.5rem; padding-top:0.4rem; border-top:1px solid var(--panel-edge-soft);">
+          <div id="d-cdp-evm-policy-toggle" style="display:flex; justify-content:space-between; align-items:center; cursor:pointer; user-select:none; margin-bottom:0.3rem;">
+            <div style="font-size:0.65rem; font-weight:600; color:var(--accent);">
+              <span class="cdp-evm-chevron" style="display:inline-block; transition:transform 0.2s; transform:rotate(-90deg);">▾</span>
+              ⚙ SPENDING POLICY
+            </div>
+          </div>
+          <div id="d-cdp-evm-policy-content" style="font-size:0.7rem; color:var(--dim); display:none;">Loading policy...</div>
         </div>
         <div id="d-cdp-evm-txhistory" style="margin-top:0.5rem; padding-top:0.4rem; border-top:1px solid var(--panel-edge-soft);">
           <div id="d-cdp-evm-tx-toggle" style="display:flex; justify-content:space-between; align-items:center; cursor:pointer; user-select:none; margin-bottom:0.3rem;">
@@ -5622,6 +5660,21 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
           if (chevron) chevron.style.transform = isHidden ? "" : "rotate(-90deg)";
         });
       }
+      const evmSetupToggle = (toggleId: string, contentId: string) => {
+        const toggle = cdpEvmSection.querySelector(`#${toggleId}`) as HTMLElement | null;
+        const content = cdpEvmSection.querySelector(`#${contentId}`) as HTMLElement | null;
+        if (toggle && content) {
+          toggle.addEventListener("click", (e) => {
+            if ((e.target as HTMLElement).tagName === "BUTTON" || (e.target as HTMLElement).closest("button")) return;
+            const isHidden = content.style.display === "none";
+            content.style.display = isHidden ? "block" : "none";
+            const chevron = toggle.querySelector(".cdp-evm-chevron") as HTMLElement | null;
+            if (chevron) chevron.style.transform = isHidden ? "" : "rotate(-90deg)";
+          });
+        }
+      };
+      evmSetupToggle("d-cdp-evm-lp-toggle", "d-cdp-evm-lp-content");
+      evmSetupToggle("d-cdp-evm-policy-toggle", "d-cdp-evm-policy-content");
 
       const evmRefreshBtn = cdpEvmSection.querySelector("#d-cdp-evm-refresh") as HTMLButtonElement | null;
       if (evmRefreshBtn) {
@@ -5629,6 +5682,22 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
           this.net.send({ type: "get_cdp_evm_wallet", agentId: agent.id });
           evmRefreshBtn.textContent = "Loading...";
           setTimeout(() => { evmRefreshBtn.textContent = "↻ Refresh"; }, 2000);
+        });
+      }
+      const evmBuyBtn = cdpEvmSection.querySelector("#d-cdp-evm-buy") as HTMLButtonElement | null;
+      if (evmBuyBtn) {
+        evmBuyBtn.addEventListener("click", () => {
+          this.net.send({ type: "create_cdp_evm_onramp", agentId: agent.id });
+          evmBuyBtn.textContent = "Loading...";
+          evmBuyBtn.disabled = true;
+        });
+      }
+      const evmLpRefreshBtn = cdpEvmSection.querySelector("#d-cdp-evm-lp-refresh") as HTMLButtonElement | null;
+      if (evmLpRefreshBtn) {
+        evmLpRefreshBtn.addEventListener("click", () => {
+          this.net.send({ type: "get_cdp_evm_lp_positions", agentId: agent.id });
+          evmLpRefreshBtn.style.opacity = "0.5";
+          setTimeout(() => { evmLpRefreshBtn.style.opacity = "1"; }, 1500);
         });
       }
       const evmTxRefreshBtn = cdpEvmSection.querySelector("#d-cdp-evm-tx-refresh") as HTMLButtonElement | null;
@@ -5728,6 +5797,135 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
         }).join("");
       };
       this.store.cdpEvmTxHistoryListeners.push(this.detailCdpEvmTxHistoryListener);
+
+      // EVM Onramp listener
+      this.detailCdpEvmOnrampListener = (msg: { agentId: string; url: string | null; error?: string }) => {
+        if (msg.agentId !== agent.id) return;
+        if (evmBuyBtn) {
+          evmBuyBtn.textContent = "Buy ETH";
+          evmBuyBtn.disabled = false;
+        }
+        if (msg.error) {
+          this.store.toast(`Onramp error: ${msg.error}`);
+          return;
+        }
+        if (msg.url) {
+          window.open(msg.url, "_blank", "noopener,noreferrer");
+        }
+      };
+      this.store.cdpEvmOnrampListeners.push(this.detailCdpEvmOnrampListener);
+
+      // EVM Policy listener
+      this.net.send({ type: "get_cdp_evm_policy", agentId: agent.id });
+      this.detailCdpEvmPolicyListener = (msg: { agentId: string; policyId: string | null; maxEthPerTransfer: number | null; allowedRecipients: string[] | null; blockedRecipients: string[] | null; allowedTokens: string[] | null; blockedTokens: string[] | null; network: string; error?: string }) => {
+        if (msg.agentId !== agent.id) return;
+        const pcontent = cdpEvmSection.querySelector("#d-cdp-evm-policy-content") as HTMLElement | null;
+        if (!pcontent) return;
+        if (msg.error) {
+          pcontent.innerHTML = `<span class="wallet-error">⚠ ${esc(msg.error)}</span>`;
+          return;
+        }
+        const maxEth = msg.maxEthPerTransfer ?? "";
+        const allowed = msg.allowedRecipients?.join(", ") ?? "";
+        const blocked = msg.blockedRecipients?.join(", ") ?? "";
+        const allowedTokens = msg.allowedTokens?.join(", ") ?? "";
+        const blockedTokens = msg.blockedTokens?.join(", ") ?? "";
+        pcontent.innerHTML = `
+          <div style="margin-bottom:0.3rem;">
+            <label style="color:var(--dim); font-size:0.65rem;">Max ETH per transfer:</label>
+            <input id="d-cdp-evm-max-eth" type="number" step="0.01" min="0" value="${esc(String(maxEth))}" placeholder="unlimited" style="font-size:0.7rem;" />
+          </div>
+          <div style="margin-bottom:0.3rem;">
+            <label style="color:var(--dim); font-size:0.65rem;">Allowed recipients (comma-sep, leave empty for any):</label>
+            <input id="d-cdp-evm-allowed" type="text" value="${esc(allowed)}" placeholder="any address" style="font-size:0.7rem; font-family:monospace;" />
+          </div>
+          <div style="margin-bottom:0.3rem;">
+            <label style="color:var(--dim); font-size:0.65rem;">Blocked recipients (comma-sep):</label>
+            <input id="d-cdp-evm-blocked" type="text" value="${esc(blocked)}" placeholder="none" style="font-size:0.7rem; font-family:monospace;" />
+          </div>
+          <div style="margin-bottom:0.3rem;">
+            <label style="color:var(--dim); font-size:0.65rem;">Allowed token addresses (comma-sep, leave empty for any):</label>
+            <input id="d-cdp-evm-allowed-tokens" type="text" value="${esc(allowedTokens)}" placeholder="any token" style="font-size:0.7rem; font-family:monospace;" />
+          </div>
+          <div style="margin-bottom:0.3rem;">
+            <label style="color:var(--dim); font-size:0.65rem;">Blocked token addresses (comma-sep):</label>
+            <input id="d-cdp-evm-blocked-tokens" type="text" value="${esc(blockedTokens)}" placeholder="none" style="font-size:0.7rem; font-family:monospace;" />
+          </div>
+          <button id="d-cdp-evm-save-policy" class="btn" style="padding:0.3rem 0.5rem; font-size:0.65rem;">Save Policy</button>
+        `;
+        const saveBtn = pcontent.querySelector("#d-cdp-evm-save-policy") as HTMLButtonElement | null;
+        if (saveBtn) {
+          saveBtn.addEventListener("click", () => {
+            const maxEthInput = pcontent.querySelector("#d-cdp-evm-max-eth") as HTMLInputElement | null;
+            const allowedInput = pcontent.querySelector("#d-cdp-evm-allowed") as HTMLInputElement | null;
+            const blockedInput = pcontent.querySelector("#d-cdp-evm-blocked") as HTMLInputElement | null;
+            const allowedTokensInput = pcontent.querySelector("#d-cdp-evm-allowed-tokens") as HTMLInputElement | null;
+            const blockedTokensInput = pcontent.querySelector("#d-cdp-evm-blocked-tokens") as HTMLInputElement | null;
+            const maxEthVal = maxEthInput?.value.trim();
+            const allowedVal = allowedInput?.value.trim();
+            const blockedVal = blockedInput?.value.trim();
+            const allowedTokensVal = allowedTokensInput?.value.trim();
+            const blockedTokensVal = blockedTokensInput?.value.trim();
+            this.net.send({
+              type: "set_cdp_evm_policy",
+              agentId: agent.id,
+              maxEthPerTransfer: maxEthVal ? parseFloat(maxEthVal) : undefined,
+              allowedRecipients: allowedVal ? allowedVal.split(",").map(s => s.trim()).filter(Boolean) : undefined,
+              blockedRecipients: blockedVal ? blockedVal.split(",").map(s => s.trim()).filter(Boolean) : undefined,
+              allowedTokens: allowedTokensVal ? allowedTokensVal.split(",").map(s => s.trim()).filter(Boolean) : undefined,
+              blockedTokens: blockedTokensVal ? blockedTokensVal.split(",").map(s => s.trim()).filter(Boolean) : undefined,
+            });
+            saveBtn.textContent = "Saving...";
+            setTimeout(() => { saveBtn.textContent = "Save Policy"; }, 2000);
+          });
+        }
+      };
+      this.store.cdpEvmPolicyListeners.push(this.detailCdpEvmPolicyListener);
+
+      // EVM LP positions listener
+      this.net.send({ type: "get_cdp_evm_lp_positions", agentId: agent.id });
+      this.detailCdpEvmLpPositionsListener = (msg: { agentId: string; positions: { tokenId: string; token0: string; token1: string; symbol0: string; symbol1: string; fee: number; tickLower: number; tickUpper: number; tickCurrent: number; inRange: boolean; liquidity: string; tokensOwed0: string; tokensOwed1: string; amount0: string; amount1: string; priceLower: string; priceUpper: string; priceCurrent: string; explorerUrl: string; usdValue0?: string; usdValue1?: string; totalUsdValue?: string }[] | null; error?: string }) => {
+        if (msg.agentId !== agent.id) return;
+        const lpContent = cdpEvmSection.querySelector("#d-cdp-evm-lp-content") as HTMLElement | null;
+        if (!lpContent) return;
+        if (msg.error) {
+          lpContent.innerHTML = `<span style="color:var(--red); font-size:0.65rem;">${esc(msg.error)}</span>`;
+          return;
+        }
+        if (!msg.positions || msg.positions.length === 0) {
+          lpContent.innerHTML = `<span style="color:var(--dim);">No LP positions — ask the agent to open a Uniswap V3 position</span>`;
+          return;
+        }
+        lpContent.innerHTML = msg.positions.map((pos) => {
+          const rangeColor = pos.inRange ? "var(--green)" : "var(--amber)";
+          const rangeIcon = pos.inRange
+            ? `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9 12l2 2 4-4"/></svg>`
+            : `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>`;
+          const pair = `${esc(pos.symbol0)} / ${esc(pos.symbol1)}`;
+          const feeTierMap: Record<number, string> = { 100: "0.01%", 500: "0.05%", 3000: "0.3%", 10000: "1%" };
+          const feeTier = feeTierMap[pos.fee] ?? `${pos.fee}`;
+          const shortId = "#" + pos.tokenId.slice(0, 6);
+          const hasFees = Number(pos.tokensOwed0) > 0 || Number(pos.tokensOwed1) > 0;
+          const usdLine = pos.totalUsdValue ? `<div style="color:var(--green); font-size:0.6rem; margin-bottom:0.1rem;">Value: $${esc(pos.totalUsdValue)}</div>` : "";
+          return `<div style="margin-top:0.3rem; padding:0.4rem; border:1px solid var(--panel-edge-soft); border-radius:0.3rem; background:var(--panel);">` +
+            `<div style="display:flex; align-items:center; gap:0.3rem; margin-bottom:0.2rem;">` +
+              `<span style="color:${rangeColor}; display:flex; align-items:center;">${rangeIcon}</span>` +
+              `<span style="color:var(--text); font-weight:600; font-size:0.65rem;">${pair}</span>` +
+              `<span style="color:var(--dim); font-size:0.55rem;">${pos.inRange ? "in range" : "out of range"}</span>` +
+              `<span style="color:var(--dim); font-size:0.5rem; margin-left:auto;">${esc(feeTier)}</span>` +
+            `</div>` +
+            usdLine +
+            `<div style="color:var(--dim); font-size:0.6rem; margin-bottom:0.15rem;">Price range: <span style="color:var(--text);">${esc(pos.priceLower)} — ${esc(pos.priceUpper)}</span> <span style="color:var(--accent); font-size:0.55rem;">(now: ${esc(pos.priceCurrent)})</span></div>` +
+            `<div style="color:var(--dim); font-size:0.6rem; margin-bottom:0.15rem;">Deposited: <span style="color:var(--text);">${esc(pos.amount0)} ${esc(pos.symbol0)}${pos.usdValue0 ? ` ($${esc(pos.usdValue0)})` : ""} + ${esc(pos.amount1)} ${esc(pos.symbol1)}${pos.usdValue1 ? ` ($${esc(pos.usdValue1)})` : ""}</span></div>` +
+            (hasFees ? `<div style="color:var(--green); font-size:0.58rem; margin-bottom:0.1rem;">Uncollected fees: ${esc(pos.tokensOwed0)} ${esc(pos.symbol0)} + ${esc(pos.tokensOwed1)} ${esc(pos.symbol1)}</div>` : ``) +
+            `<div style="display:flex; align-items:center; gap:0.4rem; margin-top:0.2rem;">` +
+              `<span style="color:var(--dim); font-size:0.5rem; font-family:monospace;">${esc(shortId)}</span>` +
+              `<a href="${esc(pos.explorerUrl)}" target="_blank" style="font-size:0.55rem; color:var(--accent); text-decoration:none; margin-left:auto;">Explorer →</a>` +
+            `</div>` +
+            `</div>`;
+        }).join("");
+      };
+      this.store.cdpEvmLpPositionsListeners.push(this.detailCdpEvmLpPositionsListener);
     } else {
       cdpEvmSection.hidden = true;
       cdpEvmSection.innerHTML = "";

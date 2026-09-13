@@ -19,7 +19,7 @@ import { rateLimitAsync, rateLimit } from "./ratelimit.js";
 import { setUserApiKey, deleteUserApiKey, setUserMcpKey, deleteUserMcpKey, getUserMcpKeys, getUserMcpKeyUrls } from "./apikeys.js";
 import { startOAuthFlow, handleOAuthCallback, exchangeOAuthCode } from "./mcp-oauth.js";
 import { getAgentWalletAddress, getAgentBalances, getAgentPolicy, updateAgentPolicy, getAgentTxHistory, createOnrampUrl, getAgentLpPositions } from "./providers/cdp-solana.js";
-import { getAgentWalletAddress as getEvmWalletAddress, getAgentBalances as getEvmBalances, getAgentTxHistory as getEvmTxHistory, getNetwork as getEvmNetwork } from "./providers/cdp-evm.js";
+import { getAgentWalletAddress as getEvmWalletAddress, getAgentBalances as getEvmBalances, getAgentTxHistory as getEvmTxHistory, getNetwork as getEvmNetwork, createEvmOnrampUrl, getAgentEvmPolicy, updateAgentEvmPolicy, getAgentEvmLpPositions } from "./providers/cdp-evm.js";
 import { getAgentBalances as getCrossmintBalances, getAgentPolicy as getCrossmintPolicy, getAgentTxHistory as getCrossmintTxHistory, fundAgentWallet, createCrossmintOnrampUrl, getDefaultChain as getCrossmintDefaultChain } from "./providers/crossmint-wallets.js";
 import { startBalanceMonitor as startCircleBalanceMonitor, isCircleGatewayConfigured, ensureGatewayBalance } from "./providers/x402-pay.js";
 import { TenantManager, HQ2_ROOM_ID, type UserSession } from "./tenant.js";
@@ -2695,6 +2695,66 @@ wss.on("connection", async (ws, req) => {
           } catch (err) {
             const msg2 = err instanceof Error ? err.message : String(err);
             sess.broadcast({ type: "cdp_evm_tx_history", agentId: msg.agentId, transactions: null, error: msg2 });
+          }
+          break;
+        }
+        case "create_cdp_evm_onramp": {
+          try {
+            const clientIp = (req.socket.remoteAddress) || undefined;
+            const url = await createEvmOnrampUrl(msg.agentId, clientIp);
+            if (!url) {
+              sess.broadcast({ type: "cdp_evm_onramp_url", agentId: msg.agentId, url: null, error: "CDP EVM not configured" });
+              break;
+            }
+            sess.broadcast({ type: "cdp_evm_onramp_url", agentId: msg.agentId, url });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "cdp_evm_onramp_url", agentId: msg.agentId, url: null, error: msg2 });
+          }
+          break;
+        }
+        case "get_cdp_evm_policy": {
+          try {
+            const policy = await getAgentEvmPolicy(msg.agentId);
+            if (!policy) {
+              sess.broadcast({ type: "cdp_evm_policy_status", agentId: msg.agentId, policyId: null, maxEthPerTransfer: null, allowedRecipients: null, blockedRecipients: null, allowedTokens: null, blockedTokens: null, network: "unknown", error: "CDP EVM not configured" });
+              break;
+            }
+            sess.broadcast({ type: "cdp_evm_policy_status", agentId: msg.agentId, policyId: policy.policyId, maxEthPerTransfer: policy.maxEthPerTransfer, allowedRecipients: policy.allowedRecipients, blockedRecipients: policy.blockedRecipients, allowedTokens: policy.allowedTokens, blockedTokens: policy.blockedTokens, network: policy.network });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "cdp_evm_policy_status", agentId: msg.agentId, policyId: null, maxEthPerTransfer: null, allowedRecipients: null, blockedRecipients: null, allowedTokens: null, blockedTokens: null, network: "unknown", error: msg2 });
+          }
+          break;
+        }
+        case "set_cdp_evm_policy": {
+          try {
+            const policy = await updateAgentEvmPolicy(msg.agentId, {
+              maxEthPerTransfer: msg.maxEthPerTransfer,
+              allowedRecipients: msg.allowedRecipients,
+              blockedRecipients: msg.blockedRecipients,
+              allowedTokens: msg.allowedTokens,
+              blockedTokens: msg.blockedTokens,
+            });
+            if (!policy) {
+              sess.broadcast({ type: "cdp_evm_policy_status", agentId: msg.agentId, policyId: null, maxEthPerTransfer: null, allowedRecipients: null, blockedRecipients: null, allowedTokens: null, blockedTokens: null, network: "unknown", error: "CDP EVM not configured" });
+              break;
+            }
+            sess.broadcast({ type: "cdp_evm_policy_status", agentId: msg.agentId, policyId: policy.policyId, maxEthPerTransfer: policy.maxEthPerTransfer, allowedRecipients: policy.allowedRecipients, blockedRecipients: policy.blockedRecipients, allowedTokens: policy.allowedTokens, blockedTokens: policy.blockedTokens, network: policy.network });
+            sess.broadcast({ type: "toast", text: "EVM spending policy updated." });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "cdp_evm_policy_status", agentId: msg.agentId, policyId: null, maxEthPerTransfer: null, allowedRecipients: null, blockedRecipients: null, allowedTokens: null, blockedTokens: null, network: "unknown", error: msg2 });
+          }
+          break;
+        }
+        case "get_cdp_evm_lp_positions": {
+          try {
+            const positions = await getAgentEvmLpPositions(msg.agentId);
+            sess.broadcast({ type: "cdp_evm_lp_positions", agentId: msg.agentId, positions });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "cdp_evm_lp_positions", agentId: msg.agentId, positions: null, error: msg2 });
           }
           break;
         }

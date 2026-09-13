@@ -1,6 +1,7 @@
 import type { AgentTool } from "@cline/sdk";
 import { CdpClient } from "@coinbase/cdp-sdk";
-import { createPublicClient, http, formatEther, parseEther, type Hex, type Chain as ViemChain } from "viem";
+import { generateJwt } from "@coinbase/cdp-sdk/auth";
+import { createPublicClient, http, formatEther, parseEther, type Hex, type Chain as ViemChain, parseAbi } from "viem";
 import { base, baseSepolia, mainnet as ethereum, polygon } from "viem/chains";
 
 /**
@@ -246,6 +247,410 @@ export async function getAgentTxHistory(agentId: string, limit: number = 10): Pr
   } catch (err) {
     console.error(`[cdp-evm] Failed to get tx history for agent ${agentId}:`, err);
     return null;
+  }
+}
+
+// ─── Onramp ──────────────────────────────────────────────────────────────────
+
+export async function createEvmOnrampUrl(agentId: string, clientIp?: string): Promise<string | null> {
+  if (!isCdpConfigured()) return null;
+  const apiKeyId = process.env.CDP_API_KEY_ID!;
+  const apiKeySecret = process.env.CDP_API_KEY_SECRET!;
+
+  const account = await getAgentAccount(agentId);
+  const address = account.address;
+
+  const requestMethod = "POST";
+  const requestHost = "api.developer.coinbase.com";
+  const requestPath = "/onramp/v1/token";
+
+  const jwt = await generateJwt({
+    apiKeyId,
+    apiKeySecret,
+    requestMethod,
+    requestHost,
+    requestPath,
+    expiresIn: 120,
+  });
+
+  const chain = getNetwork();
+  const blockchainMap: Record<string, string> = { "base": "base", "base-sepolia": "base", "ethereum": "ethereum", "polygon": "polygon" };
+  const blockchain = blockchainMap[chain] ?? "base";
+
+  const body = {
+    addresses: [{ address, blockchains: [blockchain] }],
+    assets: ["ETH", "USDC"],
+    ...(clientIp ? { clientIp } : {}),
+  };
+
+  const res = await fetch(`https://${requestHost}${requestPath}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${jwt}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Onramp token request failed (${res.status}): ${errText}`);
+  }
+
+  const data = await res.json() as any;
+  const token = data.token;
+  if (!token) throw new Error("Onramp token response missing 'token' field");
+
+  const url = new URL("https://pay.coinbase.com/buy/select-asset");
+  url.searchParams.set("sessionToken", token);
+  url.searchParams.set("partnerUserRef", `agent-${agentId}`);
+  return url.toString();
+}
+
+// ─── Spending Policy ─────────────────────────────────────────────────────────
+
+export interface EvmPolicyInfo {
+  policyId: string | null;
+  description: string | null;
+  maxEthPerTransfer: number | null;
+  allowedRecipients: string[] | null;
+  blockedRecipients: string[] | null;
+  allowedTokens: string[] | null;
+  blockedTokens: string[] | null;
+  network: string;
+}
+
+export async function getAgentEvmPolicy(agentId: string): Promise<EvmPolicyInfo | null> {
+  if (!isCdpConfigured()) return null;
+  try {
+    const cdp = getCdpClient();
+    const account = await getAgentAccount(agentId);
+    const policyIds = (account as any).policies ?? [];
+    if (policyIds.length === 0) {
+      return { policyId: null, description: null, maxEthPerTransfer: null, allowedRecipients: null, blockedRecipients: null, allowedTokens: null, blockedTokens: null, network: getNetwork() };
+    }
+    const policy = await cdp.policies.getPolicyById({ id: policyIds[0] });
+    let maxEth: number | null = null;
+    let allowed: string[] = [];
+    let blocked: string[] = [];
+    let allowedTokens: string[] = [];
+    let blockedTokens: string[] = [];
+    for (const rule of policy.rules ?? []) {
+      if (rule.action === "reject" && rule.operation === "signEvmTransaction") {
+        for (const c of (rule.criteria ?? []) as any[]) {
+          if (c.type === "ethValue" && c.operator === ">") {
+            maxEth = Number(c.ethValue) / 1e18;
+          }
+          if (c.type === "evmAddress" && c.operator === "in") {
+            blocked = c.addresses ?? [];
+          }
+          if (c.type === "evmAddress" && c.operator === "not in") {
+            allowed = c.addresses ?? [];
+          }
+          if (c.type === "erc20Address" && c.operator === "in") {
+            blockedTokens = c.addresses ?? [];
+          }
+          if (c.type === "erc20Address" && c.operator === "not in") {
+            allowedTokens = c.addresses ?? [];
+          }
+        }
+      }
+    }
+    return {
+      policyId: policy.id,
+      description: policy.description ?? null,
+      maxEthPerTransfer: maxEth,
+      allowedRecipients: allowed.length > 0 ? allowed : null,
+      blockedRecipients: blocked.length > 0 ? blocked : null,
+      allowedTokens: allowedTokens.length > 0 ? allowedTokens : null,
+      blockedTokens: blockedTokens.length > 0 ? blockedTokens : null,
+      network: getNetwork(),
+    };
+  } catch (err) {
+    console.error(`[cdp-evm] Failed to get policy for agent ${agentId}:`, err);
+    return null;
+  }
+}
+
+export async function updateAgentEvmPolicy(
+  agentId: string,
+  opts: { maxEthPerTransfer?: number; allowedRecipients?: string[]; blockedRecipients?: string[]; allowedTokens?: string[]; blockedTokens?: string[] }
+): Promise<EvmPolicyInfo | null> {
+  if (!isCdpConfigured()) return null;
+  try {
+    const cdp = getCdpClient();
+    const existing = await getAgentEvmPolicy(agentId);
+
+    const rules: any[] = [];
+
+    if (opts.maxEthPerTransfer !== undefined) {
+      rules.push({
+        action: "reject",
+        operation: "signEvmTransaction",
+        criteria: [{ type: "ethValue", ethValue: String(Math.floor(opts.maxEthPerTransfer * 1e18)), operator: ">" }],
+      });
+    }
+    if (opts.allowedRecipients && opts.allowedRecipients.length > 0) {
+      rules.push({
+        action: "reject",
+        operation: "signEvmTransaction",
+        criteria: [{ type: "evmAddress", addresses: opts.allowedRecipients, operator: "not in" }],
+      });
+    }
+    if (opts.blockedRecipients && opts.blockedRecipients.length > 0) {
+      rules.push({
+        action: "reject",
+        operation: "signEvmTransaction",
+        criteria: [{ type: "evmAddress", addresses: opts.blockedRecipients, operator: "in" }],
+      });
+    }
+    if (opts.allowedTokens && opts.allowedTokens.length > 0) {
+      rules.push({
+        action: "reject",
+        operation: "signEvmTransaction",
+        criteria: [{ type: "erc20Address", addresses: opts.allowedTokens, operator: "not in" }],
+      });
+    }
+    if (opts.blockedTokens && opts.blockedTokens.length > 0) {
+      rules.push({
+        action: "reject",
+        operation: "signEvmTransaction",
+        criteria: [{ type: "erc20Address", addresses: opts.blockedTokens, operator: "in" }],
+      });
+    }
+
+    if (existing?.policyId) {
+      await cdp.policies.updatePolicy({
+        id: existing.policyId,
+        policy: { description: existing.description ?? `EVM spending policy for agent ${agentId}`, rules },
+      });
+    } else {
+      await cdp.policies.createPolicy({
+        policy: { scope: "project", description: `EVM spending policy for agent ${agentId}`, rules },
+      });
+    }
+
+    return getAgentEvmPolicy(agentId);
+  } catch (err) {
+    console.error(`[cdp-evm] Failed to update policy for agent ${agentId}:`, err);
+    return null;
+  }
+}
+
+// ─── Uniswap V3 LP Positions ─────────────────────────────────────────────────
+
+const UNISWAP_V3_POSITION_MANAGER = "0xC36442b465c376D4514355Ba620829C6F4eFeFED" as const;
+const UNISWAP_V3_FACTORY = "0x1F98431c8aD9850365Cde677f99a051A01328b03" as const;
+
+const positionManagerAbi = parseAbi([
+  "function balanceOf(address owner) external view returns (uint256)",
+  "function tokenOfOwnerByIndex(address owner, uint256 index) external view returns (uint256)",
+  "function positions(uint256 tokenId) external view returns (uint96 nonce, address operator, address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)",
+]);
+
+const poolAbi = parseAbi([
+  "function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)",
+  "function token0() external view returns (address)",
+  "function token1() external view returns (address)",
+]);
+
+const erc20Abi = parseAbi([
+  "function symbol() external view returns (string)",
+  "function decimals() external view returns (uint8)",
+]);
+
+export interface EvmLpPositionInfo {
+  tokenId: string;
+  token0: string;
+  token1: string;
+  symbol0: string;
+  symbol1: string;
+  fee: number;
+  tickLower: number;
+  tickUpper: number;
+  tickCurrent: number;
+  inRange: boolean;
+  liquidity: string;
+  tokensOwed0: string;
+  tokensOwed1: string;
+  amount0: string;
+  amount1: string;
+  priceLower: string;
+  priceUpper: string;
+  priceCurrent: string;
+  explorerUrl: string;
+  usdValue0?: string;
+  usdValue1?: string;
+  totalUsdValue?: string;
+}
+
+function tickToPrice(tick: number, decimals0: number, decimals1: number): number {
+  const ratio = Math.pow(1.0001, tick);
+  const adjusted = ratio * Math.pow(10, decimals0 - decimals1);
+  return adjusted;
+}
+
+function sqrtPriceX96ToPrice(sqrtPriceX96: bigint, decimals0: number, decimals1: number): number {
+  const numerator = sqrtPriceX96 * sqrtPriceX96;
+  const denominator = 2n ** 192n;
+  const ratio = Number(numerator) / Number(denominator);
+  return ratio * Math.pow(10, decimals0 - decimals1);
+}
+
+function getAmountsForLiquidity(
+  sqrtPriceCurrent: bigint,
+  sqrtPriceLower: bigint,
+  sqrtPriceUpper: bigint,
+  liquidity: bigint,
+): { amount0: bigint; amount1: bigint } {
+  const Q96 = 2n ** 96n;
+  if (sqrtPriceCurrent <= sqrtPriceLower) {
+    return { amount0: liquidity * Q96 * (sqrtPriceUpper - sqrtPriceLower) / (sqrtPriceLower * sqrtPriceUpper), amount1: 0n };
+  }
+  if (sqrtPriceCurrent >= sqrtPriceUpper) {
+    return { amount0: 0n, amount1: liquidity * (sqrtPriceUpper - sqrtPriceLower) / Q96 };
+  }
+  const amount0 = liquidity * Q96 * (sqrtPriceUpper - sqrtPriceCurrent) / (sqrtPriceCurrent * sqrtPriceUpper);
+  const amount1 = liquidity * (sqrtPriceCurrent - sqrtPriceLower) / Q96;
+  return { amount0, amount1 };
+}
+
+function tickToSqrtPriceX96(tick: number): bigint {
+  const sqrtRatio = Math.sqrt(Math.pow(1.0001, tick));
+  return BigInt(Math.floor(sqrtRatio * Number(2n ** 96n)));
+}
+
+export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPositionInfo[]> {
+  if (!isCdpConfigured()) return [];
+  try {
+    const network = getNetwork();
+    const account = await getAgentAccount(agentId);
+    const viemChain = getViemChain(network);
+    const client = createPublicClient({ chain: viemChain, transport: http() });
+
+    const balance = await client.readContract({
+      address: UNISWAP_V3_POSITION_MANAGER,
+      abi: positionManagerAbi,
+      functionName: "balanceOf",
+      args: [account.address as `0x${string}`],
+    }) as bigint;
+
+    if (balance === 0n) return [];
+
+    const positions: EvmLpPositionInfo[] = [];
+
+    for (let i = 0n; i < balance; i++) {
+      try {
+        const tokenId = await client.readContract({
+          address: UNISWAP_V3_POSITION_MANAGER,
+          abi: positionManagerAbi,
+          functionName: "tokenOfOwnerByIndex",
+          args: [account.address as `0x${string}`, i],
+        }) as bigint;
+
+        const posData = await client.readContract({
+          address: UNISWAP_V3_POSITION_MANAGER,
+          abi: positionManagerAbi,
+          functionName: "positions",
+          args: [tokenId],
+        }) as unknown as any[];
+
+        const token0 = posData[2];
+        const token1 = posData[3];
+        const fee = Number(posData[4]);
+        const tickLower = Number(posData[5]);
+        const tickUpper = Number(posData[6]);
+        const liquidity = posData[7] as bigint;
+        const tokensOwed0 = posData[11] as bigint;
+        const tokensOwed1 = posData[12] as bigint;
+
+        // Get pool address from factory
+        const poolAddress = await client.readContract({
+          address: UNISWAP_V3_FACTORY,
+          abi: parseAbi(["function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address)"]),
+          functionName: "getPool",
+          args: [token0, token1, fee],
+        }) as unknown as `0x${string}`;
+
+        if (poolAddress === "0x0000000000000000000000000000000000000000") continue;
+
+        // Get slot0 for current tick
+        const slot0 = await client.readContract({
+          address: poolAddress,
+          abi: poolAbi,
+          functionName: "slot0",
+        }) as unknown as any[];
+        const sqrtPriceX96 = slot0[0] as bigint;
+        const tickCurrent = Number(slot0[1]);
+        const inRange = tickLower <= tickCurrent && tickCurrent <= tickUpper;
+
+        // Get token symbols and decimals
+        let symbol0 = "UNKNOWN", symbol1 = "UNKNOWN";
+        let decimals0 = 18, decimals1 = 18;
+        try {
+          symbol0 = await client.readContract({ address: token0, abi: erc20Abi, functionName: "symbol" }) as string;
+        } catch { /* native or error */ }
+        try {
+          symbol1 = await client.readContract({ address: token1, abi: erc20Abi, functionName: "symbol" }) as string;
+        } catch { /* native or error */ }
+        try {
+          decimals0 = Number(await client.readContract({ address: token0, abi: erc20Abi, functionName: "decimals" }) as unknown as bigint);
+        } catch { /* default 18 */ }
+        try {
+          decimals1 = Number(await client.readContract({ address: token1, abi: erc20Abi, functionName: "decimals" }) as unknown as bigint);
+        } catch { /* default 18 */ }
+
+        // Calculate amounts
+        const sqrtPriceLower = tickToSqrtPriceX96(tickLower);
+        const sqrtPriceUpper = tickToSqrtPriceX96(tickUpper);
+        const { amount0, amount1 } = getAmountsForLiquidity(sqrtPriceX96, sqrtPriceLower, sqrtPriceUpper, liquidity);
+
+        const amount0Human = (Number(amount0) / Math.pow(10, decimals0)).toFixed(6);
+        const amount1Human = (Number(amount1) / Math.pow(10, decimals1)).toFixed(6);
+
+        const priceLower = tickToPrice(tickLower, decimals0, decimals1).toFixed(6);
+        const priceUpper = tickToPrice(tickUpper, decimals0, decimals1).toFixed(6);
+        const priceCurrent = sqrtPriceX96ToPrice(sqrtPriceX96, decimals0, decimals1).toFixed(6);
+
+        const feeTierMap: Record<number, string> = { 100: "0.01%", 500: "0.05%", 3000: "0.3%", 10000: "1%" };
+        const feeTier = feeTierMap[fee] ?? `${fee}`;
+        void feeTier;
+        const explorerUrl = `${explorerBase(network)}${account.address}`;
+
+        positions.push({
+          tokenId: tokenId.toString(),
+          token0, token1, symbol0, symbol1,
+          fee, tickLower, tickUpper, tickCurrent, inRange,
+          liquidity: liquidity.toString(),
+          tokensOwed0: (Number(tokensOwed0) / Math.pow(10, decimals0)).toFixed(6),
+          tokensOwed1: (Number(tokensOwed1) / Math.pow(10, decimals1)).toFixed(6),
+          amount0: amount0Human, amount1: amount1Human,
+          priceLower, priceUpper, priceCurrent,
+          explorerUrl,
+        });
+      } catch (posErr) {
+        console.warn(`[cdp-evm] Failed to read LP position ${i} for agent ${agentId}:`, posErr instanceof Error ? posErr.message : String(posErr));
+      }
+    }
+
+    // Enrich with USD values
+    for (const pos of positions) {
+      try {
+        const price0 = await fetchTokenPrice(pos.token0, network);
+        const price1 = await fetchTokenPrice(pos.token1, network);
+        const usd0 = price0 * parseFloat(pos.amount0);
+        const usd1 = price1 * parseFloat(pos.amount1);
+        if (usd0 > 0) pos.usdValue0 = usd0.toFixed(2);
+        if (usd1 > 0) pos.usdValue1 = usd1.toFixed(2);
+        const total = usd0 + usd1;
+        if (total > 0) pos.totalUsdValue = total.toFixed(2);
+      } catch { /* best-effort */ }
+    }
+
+    return positions;
+  } catch (err) {
+    console.error(`[cdp-evm] Failed to get LP positions for agent ${agentId}:`, err);
+    return [];
   }
 }
 
@@ -731,6 +1136,111 @@ export async function loadCdpEvmTools(agentId: string): Promise<AgentTool<any, a
     },
   };
 
+  const getPolicyTool: AgentTool<any, any> = {
+    name: "evm_get_policy",
+    description:
+      "Get the current spending policy for your EVM wallet. Returns max ETH per transfer, " +
+      "allowed/blocked recipients, and allowed/blocked token addresses.",
+    inputSchema: { type: "object", properties: {} },
+    async execute() {
+      try {
+        const policy = await getAgentEvmPolicy(agentId);
+        if (!policy) return `No spending policy configured. All transactions are unrestricted.`;
+        const lines = [`Spending policy (${policy.network}):`];
+        if (policy.maxEthPerTransfer !== null) lines.push(`Max ETH/transfer: ${policy.maxEthPerTransfer}`);
+        else lines.push(`Max ETH/transfer: unlimited`);
+        if (policy.allowedRecipients) lines.push(`Allowed recipients: ${policy.allowedRecipients.join(", ")}`);
+        if (policy.blockedRecipients) lines.push(`Blocked recipients: ${policy.blockedRecipients.join(", ")}`);
+        if (policy.allowedTokens) lines.push(`Allowed tokens: ${policy.allowedTokens.join(", ")}`);
+        if (policy.blockedTokens) lines.push(`Blocked tokens: ${policy.blockedTokens.join(", ")}`);
+        return lines.join("\n");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return `Failed to get policy: ${msg}`;
+      }
+    },
+  };
+
+  const setPolicyTool: AgentTool<any, any> = {
+    name: "evm_set_policy",
+    description:
+      "Update the spending policy for your EVM wallet. Set max ETH per transfer, or restrict " +
+      "recipients and tokens. Pass only the fields you want to update. " +
+      "Always confirm policy changes with the user before calling.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        maxEthPerTransfer: { type: "number", description: "Maximum ETH per transfer (e.g. 0.5). Omit to remove limit." },
+        allowedRecipients: { type: "array", items: { type: "string" }, description: "Only allow transfers to these addresses" },
+        blockedRecipients: { type: "array", items: { type: "string" }, description: "Block transfers to these addresses" },
+        allowedTokens: { type: "array", items: { type: "string" }, description: "Only allow interactions with these token addresses" },
+        blockedTokens: { type: "array", items: { type: "string" }, description: "Block interactions with these token addresses" },
+      },
+    },
+    async execute(input: any) {
+      try {
+        const policy = await updateAgentEvmPolicy(agentId, {
+          maxEthPerTransfer: input.maxEthPerTransfer,
+          allowedRecipients: input.allowedRecipients,
+          blockedRecipients: input.blockedRecipients,
+          allowedTokens: input.allowedTokens,
+          blockedTokens: input.blockedTokens,
+        });
+        if (!policy) return `Failed to update policy — CDP not configured.`;
+        return `Policy updated successfully.\nMax ETH/transfer: ${policy.maxEthPerTransfer ?? "unlimited"}`;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return `Failed to update policy: ${msg}`;
+      }
+    },
+  };
+
+  const getLpPositionsTool: AgentTool<any, any> = {
+    name: "evm_get_lp_positions",
+    description:
+      "Get Uniswap V3 LP positions for your EVM wallet. Returns all positions with pair, fee tier, " +
+      "price range, in-range status, deposited amounts, uncollected fees, and USD values.",
+    inputSchema: { type: "object", properties: {} },
+    async execute() {
+      try {
+        const positions = await getAgentEvmLpPositions(agentId);
+        if (positions.length === 0) return `No Uniswap V3 LP positions found.`;
+        const lines = positions.map((p) => {
+          const feeTierMap: Record<number, string> = { 100: "0.01%", 500: "0.05%", 3000: "0.3%", 10000: "1%" };
+          const ft = feeTierMap[p.fee] ?? `${p.fee}`;
+          return `${p.symbol0}/${p.symbol1} (${ft}) — ${p.inRange ? "IN RANGE" : "OUT OF RANGE"}\n` +
+            `  Price: ${p.priceLower} — ${p.priceUpper} (now: ${p.priceCurrent})\n` +
+            `  Deposited: ${p.amount0} ${p.symbol0} + ${p.amount1} ${p.symbol1}` +
+            (p.totalUsdValue ? ` ($${p.totalUsdValue})` : "") +
+            (Number(p.tokensOwed0) > 0 || Number(p.tokensOwed1) > 0 ? `\n  Uncollected fees: ${p.tokensOwed0} ${p.symbol0} + ${p.tokensOwed1} ${p.symbol1}` : "");
+        });
+        return `LP Positions (${positions.length}):\n${lines.join("\n\n")}`;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return `Failed to get LP positions: ${msg}`;
+      }
+    },
+  };
+
+  const getOnrampUrlTool: AgentTool<any, any> = {
+    name: "evm_get_onramp_url",
+    description:
+      "Get a Coinbase Onramp URL for funding your EVM wallet with fiat. " +
+      "Returns a URL the user can visit to buy ETH or USDC with fiat currency. " +
+      `Network: ${network}.`,
+    inputSchema: { type: "object", properties: {} },
+    async execute() {
+      try {
+        const url = await createEvmOnrampUrl(agentId);
+        if (!url) return `Onramp not available — CDP not configured.`;
+        return `Onramp URL generated. User can visit this link to buy crypto with fiat:\n${url}`;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return `Failed to generate onramp URL: ${msg}`;
+      }
+    },
+  };
+
   return [
     getWalletTool,
     getBalanceTool,
@@ -745,5 +1255,9 @@ export async function loadCdpEvmTools(agentId: string): Promise<AgentTool<any, a
     checkTxStatusTool,
     portfolioTool,
     batchTransferTool,
+    getPolicyTool,
+    setPolicyTool,
+    getLpPositionsTool,
+    getOnrampUrlTool,
   ];
 }

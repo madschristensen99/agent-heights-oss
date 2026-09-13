@@ -1250,6 +1250,10 @@ export type ClientMsg =
   | { type: "get_cdp_lp_positions"; agentId: string }
   | { type: "get_cdp_evm_wallet"; agentId: string }
   | { type: "get_cdp_evm_tx_history"; agentId: string; limit?: number }
+  | { type: "create_cdp_evm_onramp"; agentId: string }
+  | { type: "get_cdp_evm_policy"; agentId: string }
+  | { type: "set_cdp_evm_policy"; agentId: string; maxEthPerTransfer?: number; allowedRecipients?: string[]; blockedRecipients?: string[]; allowedTokens?: string[]; blockedTokens?: string[] }
+  | { type: "get_cdp_evm_lp_positions"; agentId: string }
   | { type: "get_crossmint_wallet"; agentId: string }
   | { type: "get_crossmint_balance"; agentId: string }
   | { type: "get_crossmint_policy"; agentId: string }
@@ -1434,6 +1438,9 @@ export type ServerMsg =
   | { type: "cdp_lp_positions"; agentId: string; positions: { nftMint: string; poolId: string; liquidity: string; tickLower: number; tickUpper: number; tickCurrent: number; inRange: boolean; explorerUrl: string; symbolA: string; symbolB: string; mintA: string; mintB: string; decimalsA: number; decimalsB: number; priceLower: string; priceUpper: string; priceCurrent: string; amountA: string; amountB: string; feeTier: string; uncollectedFeeA: string; uncollectedFeeB: string; usdValueA?: string; usdValueB?: string; totalUsdValue?: string }[] | null; error?: string }
   | { type: "cdp_evm_wallet_status"; agentId: string; address: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; totalUsdValue?: string | null; network?: string | null; error?: string }
   | { type: "cdp_evm_tx_history"; agentId: string; transactions: { hash: string; blockNumber: number | null; timestamp: number | null; from: string; to: string; value: string; status: boolean | null }[] | null; error?: string }
+  | { type: "cdp_evm_onramp_url"; agentId: string; url: string | null; error?: string }
+  | { type: "cdp_evm_policy_status"; agentId: string; policyId: string | null; maxEthPerTransfer: number | null; allowedRecipients: string[] | null; blockedRecipients: string[] | null; allowedTokens: string[] | null; blockedTokens: string[] | null; network: string; error?: string }
+  | { type: "cdp_evm_lp_positions"; agentId: string; positions: { tokenId: string; token0: string; token1: string; symbol0: string; symbol1: string; fee: number; tickLower: number; tickUpper: number; tickCurrent: number; inRange: boolean; liquidity: string; tokensOwed0: string; tokensOwed1: string; amount0: string; amount1: string; priceLower: string; priceUpper: string; priceCurrent: string; explorerUrl: string; usdValue0?: string; usdValue1?: string; totalUsdValue?: string }[] | null; error?: string }
   | { type: "crossmint_wallet_status"; agentId: string; address: string | null; chain: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; error?: string }
   | { type: "crossmint_policy_status"; agentId: string; chain: string | null; spendingLimitUsd: number | null; allowedRecipients: string[] | null; blockedRecipients: string[] | null; description: string | null; error?: string }
   | { type: "crossmint_tx_history"; agentId: string; transactions: any[] | null; error?: string }

@@ -280,6 +280,9 @@ export class Store {
   cdpEvmWalletListeners: ((msg: { agentId: string; address: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; totalUsdValue?: string | null; network?: string | null; error?: string }) => void)[] = [];
   /** Listeners called when server responds with CDP EVM tx history. */
   cdpEvmTxHistoryListeners: ((msg: { agentId: string; transactions: { hash: string; blockNumber: number | null; timestamp: number | null; from: string; to: string; value: string; status: boolean | null }[] | null; error?: string }) => void)[] = [];
+  cdpEvmOnrampListeners: ((msg: { agentId: string; url: string | null; error?: string }) => void)[] = [];
+  cdpEvmPolicyListeners: ((msg: { agentId: string; policyId: string | null; maxEthPerTransfer: number | null; allowedRecipients: string[] | null; blockedRecipients: string[] | null; allowedTokens: string[] | null; blockedTokens: string[] | null; network: string; error?: string }) => void)[] = [];
+  cdpEvmLpPositionsListeners: ((msg: { agentId: string; positions: { tokenId: string; token0: string; token1: string; symbol0: string; symbol1: string; fee: number; tickLower: number; tickUpper: number; tickCurrent: number; inRange: boolean; liquidity: string; tokensOwed0: string; tokensOwed1: string; amount0: string; amount1: string; priceLower: string; priceUpper: string; priceCurrent: string; explorerUrl: string; usdValue0?: string; usdValue1?: string; totalUsdValue?: string }[] | null; error?: string }) => void)[] = [];
   /** Listeners called when server responds with Crossmint wallet status. */
   crossmintWalletListeners: ((msg: { agentId: string; address: string | null; chain: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; error?: string }) => void)[] = [];
   /** Listeners called when server responds with Crossmint policy status. */
@@ -1470,6 +1473,15 @@ export class Store {
         break;
       case "cdp_evm_tx_history":
         for (const fn of this.cdpEvmTxHistoryListeners) fn(msg);
+        break;
+      case "cdp_evm_onramp_url":
+        for (const fn of this.cdpEvmOnrampListeners) fn(msg);
+        break;
+      case "cdp_evm_policy_status":
+        for (const fn of this.cdpEvmPolicyListeners) fn(msg);
+        break;
+      case "cdp_evm_lp_positions":
+        for (const fn of this.cdpEvmLpPositionsListeners) fn(msg);
         break;
       case "crossmint_wallet_status":
         for (const fn of this.crossmintWalletListeners) fn(msg);
