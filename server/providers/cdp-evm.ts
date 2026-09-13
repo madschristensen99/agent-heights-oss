@@ -656,32 +656,37 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
     }
     const tokenMetaCache = new Map<string, { symbol: string; decimals: number }>();
     const uniqueTokenAddrs = [...tokenAddrSet];
-    const symbolCalls = uniqueTokenAddrs.map(addr => ({
-      address: addr as `0x${string}`,
-      abi: erc20Abi,
-      functionName: "symbol",
-    }));
-    const decimalsCalls = uniqueTokenAddrs.map(addr => ({
-      address: addr as `0x${string}`,
-      abi: erc20Abi,
-      functionName: "decimals",
-    }));
-    let symbols: string[] = [];
-    let decimalsList: bigint[] = [];
-    try {
-      const symbolResults = await client.multicall({ contracts: symbolCalls }) as any[];
-      symbols = symbolResults.map((r: any) => r.result) as string[];
-    } catch { /* best-effort */ }
-    try {
-      const decimalsResults = await client.multicall({ contracts: decimalsCalls }) as any[];
-      decimalsList = decimalsResults.map((r: any) => r.result) as bigint[];
-    } catch { /* best-effort */ }
-    uniqueTokenAddrs.forEach((addr, idx) => {
-      tokenMetaCache.set(addr.toLowerCase(), {
-        symbol: symbols[idx] ?? "UNKNOWN",
-        decimals: Number(decimalsList[idx] ?? 18n),
-      });
-    });
+
+    // Known token metadata for common Base tokens (avoids RPC calls)
+    const knownTokens: Record<string, { symbol: string; decimals: number }> = {
+      "0x4200000000000000000000000000000000000006": { symbol: "WETH", decimals: 18 },
+      "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": { symbol: "USDC", decimals: 6 },
+      "0x0000000000000000000000000000000000000000": { symbol: "ETH", decimals: 18 },
+      "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22": { symbol: "cbETH", decimals: 18 },
+      "0x4ed77070b5900662f6237cfa51a7c3e0279e9d35": { symbol: "aBasWETH", decimals: 18 },
+    };
+
+    async function getTokenMeta(tokenAddress: string): Promise<{ symbol: string; decimals: number }> {
+      const key = tokenAddress.toLowerCase();
+      if (tokenMetaCache.has(key)) return tokenMetaCache.get(key)!;
+      const known = knownTokens[key];
+      if (known) { tokenMetaCache.set(key, known); return known; }
+      let symbol = "UNKNOWN", decimals = 18;
+      try {
+        symbol = await readContractWithRetry(client, { address: tokenAddress as `0x${string}`, abi: erc20Abi, functionName: "symbol" }) as string;
+      } catch { /* native or error */ }
+      try {
+        decimals = Number(await readContractWithRetry(client, { address: tokenAddress as `0x${string}`, abi: erc20Abi, functionName: "decimals" }) as unknown as bigint);
+      } catch { /* default 18 */ }
+      const meta = { symbol, decimals };
+      tokenMetaCache.set(key, meta);
+      return meta;
+    }
+
+    // Fetch token metadata individually (only for unknown tokens)
+    for (const addr of uniqueTokenAddrs) {
+      await getTokenMeta(addr);
+    }
 
     const positions: EvmLpPositionInfo[] = [];
 
