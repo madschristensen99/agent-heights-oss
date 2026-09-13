@@ -15,11 +15,11 @@ import { getHttpBaseUrl, isNative } from "./platform";
 
 // TODO: Replace with your AdMob App ID (format: ca-app-pub-XXXXXXXXXXXXXXXX~XXXXXXXXXX)
 // Get this from https://apps.admob.com → Apps → Add App
-const ADMOB_APP_ID = "ca-app-pub-3940256099942544~1458002511"; // Google test app ID
+const ADMOB_APP_ID = "ca-app-pub-7715871137896324~5190110827";
 
 // TODO: Replace with your rewarded ad unit ID (format: ca-app-pub-XXXXXXXXXXXXXXXX/XXXXXXXXXX)
 // Create this in AdMob → Ad units → Add ad unit → Rewarded
-const ADMOB_REWARDED_AD_UNIT_ID = "ca-app-pub-3940256099942544/1719395716"; // Google test rewarded ad unit
+const ADMOB_REWARDED_AD_UNIT_ID = "ca-app-pub-7715871137896324/4998539132";
 
 let initialized = false;
 
@@ -66,9 +66,7 @@ export const REWARD_CONFIGS: Record<RewardType, RewardConfig> = {
 export async function initAdMob(): Promise<void> {
   if (initialized || !isNative()) return;
   try {
-    await AdMob.initialize({
-      initializeForTesting: true, // TODO: Set to false for production
-    });
+    await AdMob.initialize();
     initialized = true;
     console.log("[ads] AdMob initialized with app ID:", ADMOB_APP_ID);
   } catch (err) {

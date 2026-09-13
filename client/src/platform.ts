@@ -45,6 +45,7 @@ const ANDROID_DISABLED_FEATURES = new Set([
 
 export type FeatureFlag =
   | "cdpSolana"
+  | "cdpEvm"
   | "crossmintWallet"
   | "premiumMarketplace"
   | "screenShare"

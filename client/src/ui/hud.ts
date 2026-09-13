@@ -247,6 +247,9 @@ export class Hud {
   private detailCdpOnrampListener: ((msg: { agentId: string; url: string | null; error?: string }) => void) | null = null;
   private detailCdpLpPositionsListener: ((msg: { agentId: string; positions: { nftMint: string; poolId: string; liquidity: string; tickLower: number; tickUpper: number; tickCurrent: number; inRange: boolean; explorerUrl: string; symbolA: string; symbolB: string; mintA: string; mintB: string; decimalsA: number; decimalsB: number; priceLower: string; priceUpper: string; priceCurrent: string; amountA: string; amountB: string; feeTier: string; uncollectedFeeA: string; uncollectedFeeB: string; usdValueA?: string; usdValueB?: string; totalUsdValue?: string }[] | null; error?: string }) => void) | null = null;
   private cdpDetailAgentId: string | null = null;
+  private detailCdpEvmListener: ((msg: { agentId: string; address: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; totalUsdValue?: string | null; error?: string }) => void) | null = null;
+  private detailCdpEvmTxHistoryListener: ((msg: { agentId: string; transactions: { hash: string; blockNumber: number | null; timestamp: number | null; from: string; to: string; value: string; status: boolean | null }[] | null; error?: string }) => void) | null = null;
+  private cdpEvmDetailAgentId: string | null = null;
   private detailCrossmintListener: ((msg: { agentId: string; address: string | null; chain: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; error?: string }) => void) | null = null;
   private detailCrossmintPolicyListener: ((msg: { agentId: string; chain: string | null; spendingLimitUsd: number | null; allowedRecipients: string[] | null; blockedRecipients: string[] | null; description: string | null; error?: string }) => void) | null = null;
   private detailCrossmintTxHistoryListener: ((msg: { agentId: string; transactions: any[] | null; error?: string }) => void) | null = null;
@@ -335,6 +338,7 @@ export class Hud {
         <div id="d-acl-section" hidden></div>
         <div id="d-premium-section" hidden></div>
         <div id="d-cdp-section" hidden></div>
+        <div id="d-cdp-evm-section" hidden></div>
         <div id="d-crossmint-section" hidden></div>
         <div class="d-schedules" id="d-schedules" hidden></div>
         <div id="d-growth-section" hidden></div>
@@ -3912,7 +3916,7 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
             </div>
             <div class="sec" style="font-size:0.8rem;color:var(--dim);margin-top:0.3rem;">WALLETS</div>
             <div id="f-wallets" style="padding:0.3rem 0;font-size:0.78rem;color:var(--text);">
-              ${((agentA.cdpSolana || firstOther.cdpSolana) ? `${svgIcon('circleBlue')} Solana (CDP) ` : "")}${((agentA.crossmintWallet || firstOther.crossmintWallet) ? `${svgIcon('circleGreen')} Crossmint ` : "")}${(!agentA.cdpSolana && !firstOther.cdpSolana && !agentA.crossmintWallet && !firstOther.crossmintWallet) ? "<span style='color:var(--dim);'>None</span>" : ""}
+              ${((agentA.cdpSolana || firstOther.cdpSolana) ? `${svgIcon('circleBlue')} Solana (CDP) ` : "")}${((agentA.cdpEvm || firstOther.cdpEvm) ? `${svgIcon('circleBlue')} EVM (CDP) ` : "")}${((agentA.crossmintWallet || firstOther.crossmintWallet) ? `${svgIcon('circleGreen')} Crossmint ` : "")}${(!agentA.cdpSolana && !firstOther.cdpSolana && !agentA.cdpEvm && !firstOther.cdpEvm && !agentA.crossmintWallet && !firstOther.crossmintWallet) ? "<span style='color:var(--dim);'>None</span>" : ""}
             </div>
           </div>
         </div>
@@ -3940,6 +3944,7 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
       }
       document.getElementById("f-wallets")!.innerHTML =
         ((a.cdpSolana || b.cdpSolana) ? `${svgIcon('circleBlue')} Solana (CDP) ` : "") +
+        ((a.cdpEvm || b.cdpEvm) ? `${svgIcon('circleBlue')} EVM (CDP) ` : "") +
         ((a.crossmintWallet || b.crossmintWallet) ? `${svgIcon('circleGreen')} Crossmint ` : "") ||
         "<span style='color:var(--dim);'>None</span>";
     };
@@ -4635,6 +4640,7 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
       this.lastSelected = null;
       this.lastSchedulesSig = "";
       this.cdpDetailAgentId = null;
+      this.cdpEvmDetailAgentId = null;
       this.crossmintDetailAgentId = null;
       this.lastDetailSig = "";
       return;
@@ -5568,6 +5574,161 @@ document.getElementById("h-cancel")!.addEventListener("click", () => (modal.hidd
       cdpSection.innerHTML = "";
     }
     } // end cdpNeedsInit
+
+    // CDP EVM wallet section — only rebuild when selected agent changes
+    const cdpEvmSection = document.getElementById("d-cdp-evm-section")!;
+    const cdpEvmNeedsInit = this.cdpEvmDetailAgentId !== agent.id ||
+      (agent.cdpEvm && cdpEvmSection.hidden) ||
+      (!agent.cdpEvm && !cdpEvmSection.hidden);
+    if (cdpEvmNeedsInit) {
+      if (this.detailCdpEvmListener) {
+        const idx = this.store.cdpEvmWalletListeners.indexOf(this.detailCdpEvmListener);
+        if (idx >= 0) this.store.cdpEvmWalletListeners.splice(idx, 1);
+        this.detailCdpEvmListener = null;
+      }
+      if (this.detailCdpEvmTxHistoryListener) {
+        const tidx = this.store.cdpEvmTxHistoryListeners.indexOf(this.detailCdpEvmTxHistoryListener);
+        if (tidx >= 0) this.store.cdpEvmTxHistoryListeners.splice(tidx, 1);
+        this.detailCdpEvmTxHistoryListener = null;
+      }
+      this.cdpEvmDetailAgentId = agent.id;
+    if (agent.cdpEvm && isFeatureEnabled("cdpEvm")) {
+      cdpEvmSection.hidden = false;
+      cdpEvmSection.innerHTML = `
+        <div style="margin:0.5rem 0; padding:0.6rem; border:1px solid var(--panel-edge-soft); border-radius:0.5rem; background:var(--panel-soft);">
+          <div style="font-size:0.75rem; font-weight:600; color:var(--accent); margin-bottom:0.4rem;">⟠ EVM WALLET (CDP)</div>
+          <div id="d-cdp-evm-content" style="font-size:0.7rem; color:var(--dim);">Loading wallet...</div>
+          <button id="d-cdp-evm-refresh" style="margin-top:0.4rem; padding:0.3rem 0.5rem; border:1px solid var(--panel-edge-soft); border-radius:0.3rem; background:var(--panel); color:var(--dim); font-size:0.65rem; cursor:pointer;">↻ Refresh</button>
+        </div>
+        <div id="d-cdp-evm-txhistory" style="margin-top:0.5rem; padding-top:0.4rem; border-top:1px solid var(--panel-edge-soft);">
+          <div id="d-cdp-evm-tx-toggle" style="display:flex; justify-content:space-between; align-items:center; cursor:pointer; user-select:none; margin-bottom:0.3rem;">
+            <div style="font-size:0.65rem; font-weight:600; color:var(--accent);">
+              <span class="cdp-evm-chevron" style="display:inline-block; transition:transform 0.2s; transform:rotate(-90deg);">▾</span>
+              📜 TRANSACTION HISTORY
+            </div>
+            <button id="d-cdp-evm-tx-refresh" style="padding:0.2rem 0.4rem; border:1px solid var(--panel-edge-soft); border-radius:0.3rem; background:var(--panel); color:var(--dim); font-size:0.6rem; cursor:pointer;">↻</button>
+          </div>
+          <div id="d-cdp-evm-tx-content" style="font-size:0.7rem; color:var(--dim); display:none; max-height:120px; overflow-y:auto; -webkit-overflow-scrolling:touch;">Loading transactions...</div>
+        </div>
+      `;
+      const evmTxToggle = cdpEvmSection.querySelector("#d-cdp-evm-tx-toggle") as HTMLElement | null;
+      const evmTxContent = cdpEvmSection.querySelector("#d-cdp-evm-tx-content") as HTMLElement | null;
+      if (evmTxToggle && evmTxContent) {
+        evmTxToggle.addEventListener("click", (e) => {
+          if ((e.target as HTMLElement).tagName === "BUTTON" || (e.target as HTMLElement).closest("button")) return;
+          const isHidden = evmTxContent.style.display === "none";
+          evmTxContent.style.display = isHidden ? "block" : "none";
+          const chevron = evmTxToggle.querySelector(".cdp-evm-chevron") as HTMLElement | null;
+          if (chevron) chevron.style.transform = isHidden ? "" : "rotate(-90deg)";
+        });
+      }
+
+      const evmRefreshBtn = cdpEvmSection.querySelector("#d-cdp-evm-refresh") as HTMLButtonElement | null;
+      if (evmRefreshBtn) {
+        evmRefreshBtn.addEventListener("click", () => {
+          this.net.send({ type: "get_cdp_evm_wallet", agentId: agent.id });
+          evmRefreshBtn.textContent = "Loading...";
+          setTimeout(() => { evmRefreshBtn.textContent = "↻ Refresh"; }, 2000);
+        });
+      }
+      const evmTxRefreshBtn = cdpEvmSection.querySelector("#d-cdp-evm-tx-refresh") as HTMLButtonElement | null;
+      if (evmTxRefreshBtn) {
+        evmTxRefreshBtn.addEventListener("click", () => {
+          this.net.send({ type: "get_cdp_evm_tx_history", agentId: agent.id });
+          evmTxRefreshBtn.textContent = "Loading...";
+          setTimeout(() => { evmTxRefreshBtn.textContent = "↻"; }, 2000);
+        });
+      }
+      this.net.send({ type: "get_cdp_evm_wallet", agentId: agent.id });
+      this.detailCdpEvmListener = (msg: { agentId: string; address: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; totalUsdValue?: string | null; error?: string }) => {
+        if (msg.agentId !== agent.id) return;
+        const content = cdpEvmSection.querySelector("#d-cdp-evm-content") as HTMLElement | null;
+        if (!content) return;
+        if (msg.error) {
+          content.innerHTML = `<span class="wallet-error">⚠ ${esc(msg.error)}</span>`;
+          return;
+        }
+        if (!msg.address) {
+          content.innerHTML = `<span class="wallet-error">⚠ Wallet not available</span>`;
+          return;
+        }
+        const balancesHtml = msg.balances && msg.balances.length > 0
+          ? msg.balances.map((b: { symbol: string; amount: string; usdValue?: string }) => {
+              const usd = b.usdValue ? ` <span style="color:var(--dim);">($${esc(b.usdValue)})</span>` : "";
+              return `<div style="margin-top:0.2rem;">${esc(b.symbol)}: ${esc(b.amount)}${usd}</div>`;
+            }).join("")
+          : `<div style="color:var(--dim); margin-top:0.2rem;">No balances — wallet may need funding</div>`;
+        const totalUsd = msg.totalUsdValue ? ` <span style="color:var(--green); font-weight:600; font-size:0.7rem;">Total: $${esc(msg.totalUsdValue)}</span>` : "";
+        content.innerHTML = `
+          <div style="color:var(--text); font-family:monospace; font-size:0.65rem; word-break:break-all; display:flex; align-items:flex-start; gap:0.3rem;">
+            <span>${esc(msg.address)}</span>
+            <button id="d-cdp-evm-copy" title="Copy address" style="border:none; background:none; color:var(--accent); cursor:pointer; font-size:0.7rem; padding:0; flex-shrink:0;">⧉</button>
+            <button id="d-cdp-evm-qr" title="Show QR code" style="border:none; background:none; color:var(--accent); cursor:pointer; font-size:0.7rem; padding:0; flex-shrink:0;">⊞</button>
+          </div>
+          <div id="d-cdp-evm-qr-box" style="display:none; margin-top:0.4rem; padding:0.5rem; background:#fff; border-radius:0.3rem; width:fit-content;">
+            <img src="https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(msg.address)}" alt="Wallet QR" style="display:block; width:120px; height:120px;" />
+          </div>
+          <div style="margin-top:0.3rem; display:flex; align-items:center; gap:0.5rem;">
+            <a href="https://sepolia.basescan.org/address/${esc(msg.address)}" target="_blank" style="font-size:0.6rem; color:var(--accent); text-decoration:none;">View on BaseScan →</a>
+            ${totalUsd}
+          </div>
+          <div style="margin-top:0.4rem; border-top:1px solid var(--panel-edge-soft); padding-top:0.3rem;">
+            <div style="font-size:0.65rem; color:var(--dim); margin-bottom:0.2rem;">Balances:</div>
+            ${balancesHtml}
+          </div>
+        `;
+        const copyBtn = content.querySelector("#d-cdp-evm-copy") as HTMLButtonElement | null;
+        if (copyBtn) {
+          copyBtn.addEventListener("click", () => {
+            navigator.clipboard.writeText(msg.address!);
+            copyBtn.textContent = "✓";
+            setTimeout(() => { copyBtn.textContent = "⧉"; }, 1500);
+          });
+        }
+        const qrBtn = content.querySelector("#d-cdp-evm-qr") as HTMLButtonElement | null;
+        const qrBox = content.querySelector("#d-cdp-evm-qr-box") as HTMLElement | null;
+        if (qrBtn && qrBox) {
+          qrBtn.addEventListener("click", () => {
+            const visible = qrBox.style.display !== "none";
+            qrBox.style.display = visible ? "none" : "block";
+            qrBtn.textContent = visible ? "⊞" : "⊟";
+          });
+        }
+      };
+      this.store.cdpEvmWalletListeners.push(this.detailCdpEvmListener);
+
+      this.net.send({ type: "get_cdp_evm_tx_history", agentId: agent.id });
+      this.detailCdpEvmTxHistoryListener = (msg: { agentId: string; transactions: { hash: string; blockNumber: number | null; timestamp: number | null; from: string; to: string; value: string; status: boolean | null }[] | null; error?: string }) => {
+        if (msg.agentId !== agent.id) return;
+        const txContent = cdpEvmSection.querySelector("#d-cdp-evm-tx-content") as HTMLElement | null;
+        if (!txContent) return;
+        if (msg.error) {
+          txContent.innerHTML = `<span class="wallet-error">⚠ ${esc(msg.error)}</span>`;
+          return;
+        }
+        if (!msg.transactions || msg.transactions.length === 0) {
+          txContent.innerHTML = `<span style="color:var(--dim);">No transactions yet — this wallet may be new</span>`;
+          return;
+        }
+        txContent.innerHTML = msg.transactions.map((tx) => {
+          const time = tx.timestamp ? new Date(tx.timestamp * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "unknown";
+          const status = tx.status === true ? "✓" : tx.status === false ? "✗" : "?";
+          const hashShort = tx.hash.slice(0, 10) + "..." + tx.hash.slice(-6);
+          return `<div style="margin-bottom:0.3rem; padding-bottom:0.3rem; border-bottom:1px solid var(--panel-edge-soft);">
+            <div style="display:flex; justify-content:space-between;">
+              <span style="font-family:monospace; font-size:0.6rem;">${status} <a href="https://sepolia.basescan.org/tx/${esc(tx.hash)}" target="_blank" style="color:var(--accent); text-decoration:none;">${esc(hashShort)}</a></span>
+              <span style="font-size:0.6rem; color:var(--dim);">${time}</span>
+            </div>
+            <div style="font-size:0.6rem; color:var(--dim); margin-top:0.1rem;">→ ${esc(tx.to.slice(0, 10))}... · ${esc(tx.value)}</div>
+          </div>`;
+        }).join("");
+      };
+      this.store.cdpEvmTxHistoryListeners.push(this.detailCdpEvmTxHistoryListener);
+    } else {
+      cdpEvmSection.hidden = true;
+      cdpEvmSection.innerHTML = "";
+    }
+    } // end cdpEvmNeedsInit
 
     // Crossmint multi-chain wallet section — only rebuild when selected agent changes
     const crossmintSection = document.getElementById("d-crossmint-section")!;

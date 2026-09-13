@@ -19,7 +19,8 @@ import { rateLimitAsync, rateLimit } from "./ratelimit.js";
 import { setUserApiKey, deleteUserApiKey, setUserMcpKey, deleteUserMcpKey, getUserMcpKeys, getUserMcpKeyUrls } from "./apikeys.js";
 import { startOAuthFlow, handleOAuthCallback, exchangeOAuthCode } from "./mcp-oauth.js";
 import { getAgentWalletAddress, getAgentBalances, getAgentPolicy, updateAgentPolicy, getAgentTxHistory, createOnrampUrl, getAgentLpPositions } from "./providers/cdp-solana.js";
-import { getAgentBalances as getCrossmintBalances, getAgentPolicy as getCrossmintPolicy, getAgentTxHistory as getCrossmintTxHistory, fundAgentWallet, createCrossmintOnrampUrl } from "./providers/crossmint-wallets.js";
+import { getAgentWalletAddress as getEvmWalletAddress, getAgentBalances as getEvmBalances, getAgentTxHistory as getEvmTxHistory } from "./providers/cdp-evm.js";
+import { getAgentBalances as getCrossmintBalances, getAgentPolicy as getCrossmintPolicy, getAgentTxHistory as getCrossmintTxHistory, fundAgentWallet, createCrossmintOnrampUrl, getDefaultChain as getCrossmintDefaultChain } from "./providers/crossmint-wallets.js";
 import { startBalanceMonitor as startCircleBalanceMonitor, isCircleGatewayConfigured, ensureGatewayBalance } from "./providers/x402-pay.js";
 import { TenantManager, HQ2_ROOM_ID, type UserSession } from "./tenant.js";
 import { ScreenshotManager } from "./providers/screenshot.js";
@@ -2669,6 +2670,33 @@ wss.on("connection", async (ws, req) => {
           }
           break;
         }
+        case "get_cdp_evm_wallet": {
+          try {
+            const address = await getEvmWalletAddress(msg.agentId);
+            if (!address) {
+              sess.broadcast({ type: "cdp_evm_wallet_status", agentId: msg.agentId, address: null, balances: null, totalUsdValue: null, error: "CDP EVM not configured or wallet not found" });
+              break;
+            }
+            const balData = await getEvmBalances(msg.agentId);
+            const balances = balData?.balances ?? [];
+            const totalUsdValue = balData?.totalUsdValue;
+            sess.broadcast({ type: "cdp_evm_wallet_status", agentId: msg.agentId, address, balances, totalUsdValue });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "cdp_evm_wallet_status", agentId: msg.agentId, address: null, balances: null, totalUsdValue: null, error: msg2 });
+          }
+          break;
+        }
+        case "get_cdp_evm_tx_history": {
+          try {
+            const history = await getEvmTxHistory(msg.agentId, msg.limit ?? 10);
+            sess.broadcast({ type: "cdp_evm_tx_history", agentId: msg.agentId, transactions: history ?? [] });
+          } catch (err) {
+            const msg2 = err instanceof Error ? err.message : String(err);
+            sess.broadcast({ type: "cdp_evm_tx_history", agentId: msg.agentId, transactions: null, error: msg2 });
+          }
+          break;
+        }
         case "get_cdp_policy": {
           try {
             const policy = await getAgentPolicy(msg.agentId);
@@ -2752,7 +2780,7 @@ wss.on("connection", async (ws, req) => {
               sess.broadcast({ type: "crossmint_wallet_status", agentId: msg.agentId, address: null, chain: null, balances: null, error: "Crossmint not configured" });
               break;
             }
-            sess.broadcast({ type: "crossmint_wallet_status", agentId: msg.agentId, address: balData.address, chain: process.env.CROSSMINT_CHAIN ?? "solana", balances: balData.balances });
+            sess.broadcast({ type: "crossmint_wallet_status", agentId: msg.agentId, address: balData.address, chain: getCrossmintDefaultChain(msg.agentId), balances: balData.balances });
           } catch (err) {
             const msg2 = err instanceof Error ? err.message : String(err);
             sess.broadcast({ type: "crossmint_wallet_status", agentId: msg.agentId, address: null, chain: null, balances: null, error: msg2 });
@@ -2799,7 +2827,7 @@ wss.on("connection", async (ws, req) => {
             if (result.success) {
               const balData = await getCrossmintBalances(msg.agentId);
               if (balData) {
-                sess.broadcast({ type: "crossmint_wallet_status", agentId: msg.agentId, address: balData.address, chain: process.env.CROSSMINT_CHAIN ?? "solana", balances: balData.balances });
+                sess.broadcast({ type: "crossmint_wallet_status", agentId: msg.agentId, address: balData.address, chain: getCrossmintDefaultChain(msg.agentId), balances: balData.balances });
               }
             }
           } catch (err) {

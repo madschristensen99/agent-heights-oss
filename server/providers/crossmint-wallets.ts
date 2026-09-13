@@ -41,7 +41,7 @@ function getSignerSecret(): string | null {
 
 const agentChainOverrides = new Map<string, string>();
 
-function getDefaultChain(agentId?: string): string {
+export function getDefaultChain(agentId?: string): string {
   if (agentId && agentChainOverrides.has(agentId)) return agentChainOverrides.get(agentId)!;
   return process.env.CROSSMINT_CHAIN ?? "solana";
 }
@@ -98,6 +98,7 @@ export async function getOrCreateAgentWallet(
   if (!isCrossmintConfigured()) return null;
 
   const useChain = chain ?? getDefaultChain(agentId);
+  if (chain) agentChainOverrides.set(agentId, chain);
   const cacheKey = `agent-${agentId}-${useChain}`;
   if (walletCache.has(cacheKey)) return walletCache.get(cacheKey)!;
 
@@ -180,7 +181,7 @@ export async function getAgentBalances(
     if (!wallet) return null;
 
     const chain = getDefaultChain(agentId);
-    const tokenList = tokens ?? ["sol", "usdc", "usdxm"];
+    const tokenList = tokens ?? (chainToType(chain) === "solana" ? ["sol", "usdc", "usdxm"] : ["eth", "usdc"]);
 
     const url = new URL(
       `${baseUrl}/${API_VERSION}/wallets/${wallet.address}/balances`,

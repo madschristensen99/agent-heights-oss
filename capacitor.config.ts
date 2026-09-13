@@ -33,3 +33,5 @@ const config: CapacitorConfig = {
 // Expose server URL to the client via a global so net.ts can pick it up.
 // Capacitor injects this before the web view loads.
 export { SERVER_URL };
+
+export default config;

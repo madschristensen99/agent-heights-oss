@@ -1,0 +1,57 @@
+workflows:
+  ios-build:
+    name: Agent Heights iOS
+    instance_type: mac_mini_m1
+    max_build_duration: 30
+    environment:
+      vars:
+        XCODE_WORKSPACE: ios/App/App.xcworkspace
+        XCODE_SCHEME: App
+        BUNDLE_ID: com.agentheights.app
+      node: 20
+      xcode: latest
+      groups:
+        - apple_developer  # contains APP_STORE_CONNECT_PRIVATE_KEY, APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_ISSUER_ID
+        - revenuecat       # contains REVENUECAT_SECRET_KEY
+        - admob            # contains ADMOB_APP_ID
+    scripts:
+      - name: Install dependencies
+        script: |
+          pnpm install --frozen-lockfile
+      - name: Build web assets
+        script: |
+          pnpm build:ios
+      - name: Copy web assets to iOS
+        script: |
+          npx cap copy ios
+      - name: Update iOS plugins
+        script: |
+          npx cap update ios
+      - name: Build iOS app
+        script: |
+          xcodebuild \
+            -workspace "$XCODE_WORKSPACE" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            -archivePath build/AgentHeights.xcarchive \
+            archive \
+            CODE_SIGN_STYLE=Automatic \
+            DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM_ID
+      - name: Export IPA
+        script: |
+          xcodebuild \
+            -exportArchive \
+            -archivePath build/AgentHeights.xcarchive \
+            -exportOptionsPlist exportOptions.plist \
+            -exportPath build/ipa
+    artifacts:
+      - build/ipa/*.ipa
+      - build/AgentHeights.xcarchive
+    publishing:
+      app_store_connect:
+        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
+        key_id: $APP_STORE_CONNECT_KEY_ID
+        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+        submit_to_testflight: true
