@@ -538,6 +538,22 @@ function tickToSqrtPriceX96(tick: number): bigint {
   return BigInt(Math.floor(sqrtRatio * Number(2n ** 96n)));
 }
 
+async function readContractWithRetry(client: any, params: any, maxRetries = 3): Promise<any> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await client.readContract(params);
+    } catch (err: any) {
+      const isRateLimit = err?.shortMessage?.includes("rate limit") || err?.details?.includes("rate limit") || err?.message?.includes("rate limit");
+      const isEmpty = err?.shortMessage?.includes("no data") || err?.details?.includes("no data");
+      if ((isRateLimit || isEmpty) && attempt < maxRetries) {
+        await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPositionInfo[]> {
   if (!isCdpConfigured()) return [];
   try {
@@ -549,7 +565,7 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
 
     console.log(`[cdp-evm] LP positions query: network=${network}, wallet=${account.address}, npm=${npmAddress}, factory=${factoryAddress}`);
 
-    const balance = await client.readContract({
+    const balance = await readContractWithRetry(client, {
       address: npmAddress,
       abi: positionManagerAbi,
       functionName: "balanceOf",
@@ -561,17 +577,33 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
     if (balance === 0n) return [];
 
     const positions: EvmLpPositionInfo[] = [];
+    const tokenMetaCache = new Map<string, { symbol: string; decimals: number }>();
+
+    async function getTokenMeta(tokenAddress: string): Promise<{ symbol: string; decimals: number }> {
+      const key = tokenAddress.toLowerCase();
+      if (tokenMetaCache.has(key)) return tokenMetaCache.get(key)!;
+      let symbol = "UNKNOWN", decimals = 18;
+      try {
+        symbol = await readContractWithRetry(client, { address: tokenAddress as `0x${string}`, abi: erc20Abi, functionName: "symbol" }) as string;
+      } catch { /* native or error */ }
+      try {
+        decimals = Number(await readContractWithRetry(client, { address: tokenAddress as `0x${string}`, abi: erc20Abi, functionName: "decimals" }) as unknown as bigint);
+      } catch { /* default 18 */ }
+      const meta = { symbol, decimals };
+      tokenMetaCache.set(key, meta);
+      return meta;
+    }
 
     for (let i = 0n; i < balance; i++) {
       try {
-        const tokenId = await client.readContract({
+        const tokenId = await readContractWithRetry(client, {
           address: npmAddress,
           abi: positionManagerAbi,
           functionName: "tokenOfOwnerByIndex",
           args: [account.address as `0x${string}`, i],
         }) as bigint;
 
-        const posData = await client.readContract({
+        const posData = await readContractWithRetry(client, {
           address: npmAddress,
           abi: positionManagerAbi,
           functionName: "positions",
@@ -588,7 +620,7 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
         const tokensOwed1 = posData[12] as bigint;
 
         // Get pool address from factory
-        const poolAddress = await client.readContract({
+        const poolAddress = await readContractWithRetry(client, {
           address: factoryAddress,
           abi: parseAbi(["function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address)"]),
           functionName: "getPool",
@@ -598,7 +630,7 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
         if (poolAddress === "0x0000000000000000000000000000000000000000") continue;
 
         // Get slot0 for current tick
-        const slot0 = await client.readContract({
+        const slot0 = await readContractWithRetry(client, {
           address: poolAddress,
           abi: poolAbi,
           functionName: "slot0",
@@ -607,21 +639,11 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
         const tickCurrent = Number(slot0[1]);
         const inRange = tickLower <= tickCurrent && tickCurrent <= tickUpper;
 
-        // Get token symbols and decimals
-        let symbol0 = "UNKNOWN", symbol1 = "UNKNOWN";
-        let decimals0 = 18, decimals1 = 18;
-        try {
-          symbol0 = await client.readContract({ address: token0, abi: erc20Abi, functionName: "symbol" }) as string;
-        } catch { /* native or error */ }
-        try {
-          symbol1 = await client.readContract({ address: token1, abi: erc20Abi, functionName: "symbol" }) as string;
-        } catch { /* native or error */ }
-        try {
-          decimals0 = Number(await client.readContract({ address: token0, abi: erc20Abi, functionName: "decimals" }) as unknown as bigint);
-        } catch { /* default 18 */ }
-        try {
-          decimals1 = Number(await client.readContract({ address: token1, abi: erc20Abi, functionName: "decimals" }) as unknown as bigint);
-        } catch { /* default 18 */ }
+        // Get token symbols and decimals (cached)
+        const meta0 = await getTokenMeta(token0);
+        const meta1 = await getTokenMeta(token1);
+        const symbol0 = meta0.symbol, symbol1 = meta1.symbol;
+        const decimals0 = meta0.decimals, decimals1 = meta1.decimals;
 
         // Calculate amounts
         const sqrtPriceLower = tickToSqrtPriceX96(tickLower);
