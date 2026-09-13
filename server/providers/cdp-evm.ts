@@ -1,7 +1,7 @@
 import type { AgentTool } from "@cline/sdk";
 import { CdpClient } from "@coinbase/cdp-sdk";
 import { generateJwt } from "@coinbase/cdp-sdk/auth";
-import { createPublicClient, http, formatEther, parseEther, type Hex, type Chain as ViemChain, parseAbi } from "viem";
+import { createPublicClient, http, formatEther, parseEther, getAddress, type Hex, type Chain as ViemChain, parseAbi } from "viem";
 import { base, baseSepolia, mainnet as ethereum, polygon } from "viem/chains";
 
 /**
@@ -49,6 +49,19 @@ function getViemChain(network: string): ViemChain {
     case "polygon": return polygon;
     default: return base;
   }
+}
+
+function getRpcUrl(network: string): string | undefined {
+  if (network === "base" || network === "base-sepolia") return process.env.BASE_RPC_URL || undefined;
+  if (network === "ethereum") return process.env.ETH_RPC_URL || undefined;
+  if (network === "polygon") return process.env.POLYGON_RPC_URL || undefined;
+  return undefined;
+}
+
+function createEvmClient(network: string) {
+  const viemChain = getViemChain(network);
+  const rpcUrl = getRpcUrl(network);
+  return createPublicClient({ chain: viemChain, transport: http(rpcUrl) });
 }
 
 function explorerBase(network: string): string {
@@ -142,8 +155,7 @@ export async function getAgentBalances(agentId: string): Promise<{ address: stri
   try {
     const network = getNetwork();
     const account = await getAgentAccount(agentId);
-    const viemChain = getViemChain(network);
-    const client = createPublicClient({ chain: viemChain, transport: http() });
+    const client = createEvmClient(network);
 
     let cdpBalances: any[] = [];
     try {
@@ -218,8 +230,7 @@ export async function getAgentTxHistory(agentId: string, limit: number = 10): Pr
   try {
     const network = getNetwork();
     const account = await getAgentAccount(agentId);
-    const viemChain = getViemChain(network);
-    const client = createPublicClient({ chain: viemChain, transport: http() });
+    const client = createEvmClient(network);
     const block = await client.getBlockNumber();
     const logs = await client.getLogs({
       address: account.address as `0x${string}`,
@@ -440,9 +451,9 @@ export async function updateAgentEvmPolicy(
 // ─── Uniswap V3 LP Positions ─────────────────────────────────────────────────
 
 const UNISWAP_V3_ADDRESSES: Record<string, { npm: `0x${string}`; factory: `0x${string}` }> = {
-  ethereum: { npm: "0xC36442b465c376D4514355Ba620829C6F4eFeFED", factory: "0x1F98431c8aD9850365Cde677f99a051A01328b03" },
-  polygon:  { npm: "0xC36442b465c376D4514355Ba620829C6F4eFeFED", factory: "0x1F98431c8aD9850365Cde677f99a051A01328b03" },
-  base:     { npm: "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1", factory: "0x0d76e6526599A9f11f0c3A3a9d7AA6c1cA7A0c37" },
+  ethereum: { npm: getAddress("0xC36442b465c376D4514355Ba620829C6F4eFeFED"), factory: getAddress("0x1F98431c8aD9850365Cde677f99a051A01328b03") },
+  polygon:  { npm: getAddress("0xC36442b465c376D4514355Ba620829C6F4eFeFED"), factory: getAddress("0x1F98431c8aD9850365Cde677f99a051A01328b03") },
+  base:     { npm: getAddress("0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1"), factory: getAddress("0x0d76e6526599a9f11f0c3a3a9d7aa6c1ca7a0c37") },
 };
 
 function getUniswapV3Addresses(network: string): { npm: `0x${string}`; factory: `0x${string}` } {
@@ -532,8 +543,7 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
   try {
     const network = getNetwork();
     const account = await getAgentAccount(agentId);
-    const viemChain = getViemChain(network);
-    const client = createPublicClient({ chain: viemChain, transport: http() });
+    const client = createEvmClient(network);
 
     const { npm: npmAddress, factory: factoryAddress } = getUniswapV3Addresses(network);
 
@@ -1038,8 +1048,7 @@ export async function loadCdpEvmTools(agentId: string): Promise<AgentTool<any, a
     },
     async execute(input: any) {
       try {
-        const viemChain = getViemChain(network);
-        const client = createPublicClient({ chain: viemChain, transport: http() });
+        const client = createEvmClient(network);
         const receipt = await client.getTransactionReceipt({ hash: input.hash as `0x${string}` });
         return `Transaction ${input.hash}\nStatus: ${receipt.status === "success" ? "SUCCESS" : "FAILED"}\nBlock: ${receipt.blockNumber}\nGas used: ${receipt.gasUsed.toString()}\nExplorer: ${explorerBase(network)}${input.hash}`;
       } catch {
