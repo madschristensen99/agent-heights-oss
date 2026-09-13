@@ -1754,8 +1754,11 @@ export const runCline: ProviderRunner = async function* (task, ctx) {
           if (/authentication\s*(failed|error)|unauthorized|api\s*key.*(invalid|revoked|expired|missing)/i.test(ev.error?.message ?? "")) {
             markParetoFailed();
             authErrorProvider = pc.name;
+            // Don't enqueue auth errors — the fallback logic below handles them.
+            // Enqueueing here leaks the error to the manager even when the fallback succeeds.
+          } else {
+            enqueue({ kind: "error", text: truncate(ev.error?.message ?? "Run failed", 300) });
           }
-          enqueue({ kind: "error", text: truncate(ev.error?.message ?? "Run failed", 300) });
           break;
         case "run-finished": {
           console.log(`[cline:${agentId}] run-finished: status=${ev.result?.status} output=${ev.result?.outputText?.slice(0, 200)}`);
