@@ -232,12 +232,22 @@ export async function getAgentTxHistory(agentId: string, limit: number = 10): Pr
     const account = await getAgentAccount(agentId);
     const client = createEvmClient(network);
     const block = await client.getBlockNumber();
-    const logs = await client.getLogs({
-      address: account.address as `0x${string}`,
-      fromBlock: block > 10000n ? block - 10000n : 0n,
-      toBlock: block,
-    });
-    const txHashes = [...new Set(logs.map(l => l.transactionHash))].slice(0, limit);
+    const CHUNK = 2000n;
+    const totalRange = 10000n;
+    const startBlock = block > totalRange ? block - totalRange : 0n;
+    const allLogs: any[] = [];
+    for (let from = startBlock; from < block; from += CHUNK) {
+      const to = from + CHUNK > block ? block : from + CHUNK;
+      try {
+        const chunkLogs = await client.getLogs({
+          address: account.address as `0x${string}`,
+          fromBlock: from,
+          toBlock: to,
+        });
+        allLogs.push(...chunkLogs);
+      } catch { /* rate-limited chunk, skip */ }
+    }
+    const txHashes = [...new Set(allLogs.map(l => l.transactionHash))].slice(0, limit);
     const result: { hash: string; blockNumber: number | null; timestamp: number | null; from: string; to: string; value: string; status: boolean | null }[] = [];
     for (const hash of txHashes) {
       try {
@@ -576,40 +586,109 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
 
     if (balance === 0n) return [];
 
-    const positions: EvmLpPositionInfo[] = [];
-    const tokenMetaCache = new Map<string, { symbol: string; decimals: number }>();
+    // Batch 1: fetch all tokenIds via multicall
+    const tokenIdCalls = [];
+    for (let i = 0n; i < balance; i++) {
+      tokenIdCalls.push({
+        address: npmAddress,
+        abi: positionManagerAbi,
+        functionName: "tokenOfOwnerByIndex",
+        args: [account.address as `0x${string}`, i],
+      });
+    }
+    const tokenIdResults = await client.multicall({ contracts: tokenIdCalls }) as any[];
+    const tokenIds = tokenIdResults.map((r: any) => r.result) as bigint[];
 
-    async function getTokenMeta(tokenAddress: string): Promise<{ symbol: string; decimals: number }> {
-      const key = tokenAddress.toLowerCase();
-      if (tokenMetaCache.has(key)) return tokenMetaCache.get(key)!;
-      let symbol = "UNKNOWN", decimals = 18;
-      try {
-        symbol = await readContractWithRetry(client, { address: tokenAddress as `0x${string}`, abi: erc20Abi, functionName: "symbol" }) as string;
-      } catch { /* native or error */ }
-      try {
-        decimals = Number(await readContractWithRetry(client, { address: tokenAddress as `0x${string}`, abi: erc20Abi, functionName: "decimals" }) as unknown as bigint);
-      } catch { /* default 18 */ }
-      const meta = { symbol, decimals };
-      tokenMetaCache.set(key, meta);
-      return meta;
+    // Batch 2: fetch all position data via multicall
+    const positionCalls = tokenIds.map((tokenId: bigint) => ({
+      address: npmAddress,
+      abi: positionManagerAbi,
+      functionName: "positions",
+      args: [tokenId],
+    }));
+    const positionRawResults = await client.multicall({ contracts: positionCalls }) as any[];
+    const positionResults = positionRawResults.map((r: any) => r.result) as any[][];
+
+    // Collect unique (token0, token1, fee) combos for pool lookups
+    const poolKeySet = new Set<string>();
+    const poolKeys: { token0: string; token1: string; fee: number; key: string }[] = [];
+    for (const posData of positionResults) {
+      const token0 = posData[2];
+      const token1 = posData[3];
+      const fee = Number(posData[4]);
+      const key = `${token0}_${token1}_${fee}`;
+      if (!poolKeySet.has(key)) {
+        poolKeySet.add(key);
+        poolKeys.push({ token0, token1, fee, key });
+      }
     }
 
-    for (let i = 0n; i < balance; i++) {
+    // Batch 3: fetch all pool addresses via multicall
+    const getPoolAbi = parseAbi(["function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address)"]);
+    const poolCalls = poolKeys.map(pk => ({
+      address: factoryAddress,
+      abi: getPoolAbi,
+      functionName: "getPool",
+      args: [pk.token0, pk.token1, pk.fee],
+    }));
+    const poolRawResults = await client.multicall({ contracts: poolCalls }) as any[];
+    const poolResults = poolRawResults.map((r: any) => r.result) as `0x${string}`[];
+    const poolMap = new Map<string, `0x${string}`>();
+    poolKeys.forEach((pk, idx) => poolMap.set(pk.key, poolResults[idx]));
+
+    // Batch 4: fetch slot0 for each unique pool + token metadata via multicall
+    const uniquePools = [...new Set(poolResults.filter(p => p !== "0x0000000000000000000000000000000000000000"))];
+    const slot0Calls = uniquePools.map(poolAddr => ({
+      address: poolAddr,
+      abi: poolAbi,
+      functionName: "slot0",
+    }));
+    const slot0RawResults = await client.multicall({ contracts: slot0Calls }) as any[];
+    const slot0Results = slot0RawResults.map((r: any) => r.result) as any[][];
+    const slot0Map = new Map<string, any[]>();
+    uniquePools.forEach((poolAddr, idx) => slot0Map.set(poolAddr.toLowerCase(), slot0Results[idx]));
+
+    // Collect unique token addresses for metadata
+    const tokenAddrSet = new Set<string>();
+    for (const posData of positionResults) {
+      tokenAddrSet.add(posData[2]);
+      tokenAddrSet.add(posData[3]);
+    }
+    const tokenMetaCache = new Map<string, { symbol: string; decimals: number }>();
+    const uniqueTokenAddrs = [...tokenAddrSet];
+    const symbolCalls = uniqueTokenAddrs.map(addr => ({
+      address: addr as `0x${string}`,
+      abi: erc20Abi,
+      functionName: "symbol",
+    }));
+    const decimalsCalls = uniqueTokenAddrs.map(addr => ({
+      address: addr as `0x${string}`,
+      abi: erc20Abi,
+      functionName: "decimals",
+    }));
+    let symbols: string[] = [];
+    let decimalsList: bigint[] = [];
+    try {
+      const symbolResults = await client.multicall({ contracts: symbolCalls }) as any[];
+      symbols = symbolResults.map((r: any) => r.result) as string[];
+    } catch { /* best-effort */ }
+    try {
+      const decimalsResults = await client.multicall({ contracts: decimalsCalls }) as any[];
+      decimalsList = decimalsResults.map((r: any) => r.result) as bigint[];
+    } catch { /* best-effort */ }
+    uniqueTokenAddrs.forEach((addr, idx) => {
+      tokenMetaCache.set(addr.toLowerCase(), {
+        symbol: symbols[idx] ?? "UNKNOWN",
+        decimals: Number(decimalsList[idx] ?? 18n),
+      });
+    });
+
+    const positions: EvmLpPositionInfo[] = [];
+
+    for (let i = 0; i < tokenIds.length; i++) {
       try {
-        const tokenId = await readContractWithRetry(client, {
-          address: npmAddress,
-          abi: positionManagerAbi,
-          functionName: "tokenOfOwnerByIndex",
-          args: [account.address as `0x${string}`, i],
-        }) as bigint;
-
-        const posData = await readContractWithRetry(client, {
-          address: npmAddress,
-          abi: positionManagerAbi,
-          functionName: "positions",
-          args: [tokenId],
-        }) as unknown as any[];
-
+        const tokenId = tokenIds[i];
+        const posData = positionResults[i];
         const token0 = posData[2];
         const token1 = posData[3];
         const fee = Number(posData[4]);
@@ -619,29 +698,18 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
         const tokensOwed0 = posData[11] as bigint;
         const tokensOwed1 = posData[12] as bigint;
 
-        // Get pool address from factory
-        const poolAddress = await readContractWithRetry(client, {
-          address: factoryAddress,
-          abi: parseAbi(["function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address)"]),
-          functionName: "getPool",
-          args: [token0, token1, fee],
-        }) as unknown as `0x${string}`;
+        const poolKey = `${token0}_${token1}_${fee}`;
+        const poolAddress = poolMap.get(poolKey);
+        if (!poolAddress || poolAddress === "0x0000000000000000000000000000000000000000") continue;
 
-        if (poolAddress === "0x0000000000000000000000000000000000000000") continue;
-
-        // Get slot0 for current tick
-        const slot0 = await readContractWithRetry(client, {
-          address: poolAddress,
-          abi: poolAbi,
-          functionName: "slot0",
-        }) as unknown as any[];
+        const slot0 = slot0Map.get(poolAddress.toLowerCase());
+        if (!slot0) continue;
         const sqrtPriceX96 = slot0[0] as bigint;
         const tickCurrent = Number(slot0[1]);
         const inRange = tickLower <= tickCurrent && tickCurrent <= tickUpper;
 
-        // Get token symbols and decimals (cached)
-        const meta0 = await getTokenMeta(token0);
-        const meta1 = await getTokenMeta(token1);
+        const meta0 = tokenMetaCache.get(token0.toLowerCase()) ?? { symbol: "UNKNOWN", decimals: 18 };
+        const meta1 = tokenMetaCache.get(token1.toLowerCase()) ?? { symbol: "UNKNOWN", decimals: 18 };
         const symbol0 = meta0.symbol, symbol1 = meta1.symbol;
         const decimals0 = meta0.decimals, decimals1 = meta1.decimals;
 
