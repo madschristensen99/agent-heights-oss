@@ -2684,6 +2684,11 @@ export class OfficeScene extends Phaser.Scene {
 
     // ── Pointer down: track for pinch, pan, or tap-to-walk ──
     this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
+      // Blur any focused DOM input so WASD movement resumes
+      const active = document.activeElement;
+      if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA")) {
+        (active as HTMLElement).blur();
+      }
       // Decoration placement mode — intercept all clicks
       if (this.decorationMode) {
         const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
