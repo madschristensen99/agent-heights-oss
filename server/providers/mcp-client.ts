@@ -252,6 +252,7 @@ class HttpMCPClient {
   private postEndpoint: string | null = null;
   private sseReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   private sseBuffer = "";
+  private sseConnected = false;
   private pending = new Map<number, PendingCall>();
 
   constructor(private config: MCPServerConfig) {
@@ -311,6 +312,7 @@ class HttpMCPClient {
     this.postEndpoint = await this.waitForSseEndpoint();
     this.useSseTransport = true;
     console.log(`[mcp:${this.label}] SSE POST endpoint: ${this.postEndpoint}`);
+    this.sseConnected = true;
 
     // Start background reader that routes SSE responses to pending calls
     this.readSseResponses().catch((err) => {
@@ -379,13 +381,29 @@ class HttpMCPClient {
         }
       }
     }
-    // Stream closed — reject all pending calls
+    // Stream closed — reject all pending calls and mark as disconnected
+    this.sseConnected = false;
+    console.log(`[mcp:${this.label}] SSE stream closed — will reconnect on next call`);
     for (const [, call] of this.pending) call.reject(new Error("SSE stream closed"));
     this.pending.clear();
   }
 
+  /** Reconnect SSE transport if the stream has closed. */
+  private async ensureSseConnected(): Promise<void> {
+    if (!this.useSseTransport) return;
+    if (this.sseConnected) return;
+    console.log(`[mcp:${this.label}] reconnecting SSE transport...`);
+    this.postEndpoint = null;
+    this.sseReader = null;
+    this.sseBuffer = "";
+    this.initialized = false;
+    this.toolsCache = null;
+    await this.start();
+  }
+
   async listTools(): Promise<MCPToolDef[]> {
     if (this.toolsCache) return this.toolsCache;
+    await this.ensureSseConnected();
     await this.start();
     const result = await this.rpc("tools/list", {}) as { tools?: MCPToolDef[] };
     this.toolsCache = result.tools ?? [];
@@ -393,6 +411,7 @@ class HttpMCPClient {
   }
 
   async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+    await this.ensureSseConnected();
     await this.start();
     const result = await this.rpc("tools/call", { name, arguments: args }, signal) as {
       content?: Array<{ type: string; text?: string }>;
@@ -509,10 +528,22 @@ class HttpMCPClient {
         method: "POST",
         headers,
         body: JSON.stringify(body),
-      }).then((res) => {
+      }).then(async (res) => {
         if (!res.ok) {
           this.pending.delete(id);
-          reject(new Error(`MCP SSE POST ${res.status}: ${res.statusText}`));
+          if (res.status === 404 && this.useSseTransport) {
+            console.log(`[mcp:${this.label}] SSE POST 404 — session expired, reconnecting...`);
+            this.sseConnected = false;
+            try {
+              await this.ensureSseConnected();
+              const retryResult = await this.rpcSse(method, params, signal);
+              resolve(retryResult);
+            } catch (retryErr) {
+              reject(retryErr instanceof Error ? retryErr : new Error(String(retryErr)));
+            }
+          } else {
+            reject(new Error(`MCP SSE POST ${res.status}: ${res.statusText}`));
+          }
         }
         // Response will arrive through the SSE background reader
       }).catch((err) => {
@@ -610,6 +641,7 @@ class HttpMCPClient {
     this.useSseTransport = false;
     this.postEndpoint = null;
     this.sseBuffer = "";
+    this.sseConnected = false;
     for (const [, call] of this.pending) call.reject(new Error("MCP client stopped"));
     this.pending.clear();
   }
