@@ -17,6 +17,12 @@ import { getMonthlyPremiumSpend, getPremiumCap } from "../usage.js";
 import type { SubscriptionTier } from "../../shared/types.js";
 import type { OnApiErrorFn } from "./mcp-client.js";
 
+/** Sanitize a tool name to match the LLM API pattern ^[a-zA-Z0-9_-]+$
+ *  Replaces spaces, dots, colons, and any other invalid chars with underscores. */
+function sanitizeToolName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
 /** Maximum characters of a premium API result to pass into conversation history.
  *  ~15K chars ≈ 3.75K tokens — aggressive but prevents context overflow when
  *  agents make many premium calls in a single task run. */
@@ -196,7 +202,10 @@ export async function loadPremiumTools(
   for (const service of services) {
     for (const def of service.tools) {
       // Prefix tool name with service name to avoid collisions
-      const toolName = `${service.name}__${def.name}`;
+      // Sanitize both parts to match the LLM API pattern ^[a-zA-Z0-9_-]+$
+      const safeServiceName = sanitizeToolName(service.name);
+      const safeDefName = sanitizeToolName(def.name);
+      const toolName = `${safeServiceName}__${safeDefName}`;
 
       allTools.push({
         name: toolName,

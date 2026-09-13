@@ -1554,6 +1554,10 @@ export class OfficeScene extends Phaser.Scene {
               this.exitDecorationMode();
               return;
             }
+            if (this.agentViewAgentId) {
+              this.closeAgentViewModal();
+              return;
+            }
             this.store.select(null);
             this.store.toggleBoard(false);
           });
@@ -9294,13 +9298,14 @@ export class OfficeScene extends Phaser.Scene {
       position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
       background: rgba(20,50,100,0.4); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); z-index: 1000;
       display: flex; align-items: center; justify-content: center;
+      pointer-events: none;
     `;
     const modalMaxW = isNarrow ? '100vw' : '90vw';
     const modalMaxH = isNarrow ? '100vh' : '90vh';
     const modalRadius = isNarrow ? '0' : '14px';
     const contentW = '100%';
     modal.innerHTML = `
-      <div style="background: linear-gradient(to bottom, rgba(235,245,255,0.95), rgba(200,225,250,0.9)); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.6); border-radius: ${modalRadius}; padding: 0; max-width: ${modalMaxW}; max-height: ${modalMaxH}; width: ${isNarrow ? '100vw' : '900px'}; height: ${isNarrow ? '100vh' : '70vh'}; position: relative; display:flex; flex-direction:column; box-shadow: 0 12px 48px rgba(0,80,180,0.2), inset 0 1px 0 rgba(255,255,255,0.8); overflow: hidden;">
+      <div style="background: linear-gradient(to bottom, rgba(235,245,255,0.95), rgba(200,225,250,0.9)); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.6); border-radius: ${modalRadius}; padding: 0; max-width: ${modalMaxW}; max-height: ${modalMaxH}; width: ${isNarrow ? '100vw' : '900px'}; height: ${isNarrow ? '100vh' : '70vh'}; position: relative; display:flex; flex-direction:column; box-shadow: 0 12px 48px rgba(0,80,180,0.2), inset 0 1px 0 rgba(255,255,255,0.8); overflow: hidden; pointer-events: auto;">
         <div style="display: flex; align-items: center; justify-content: space-between; padding: ${isNarrow ? '6px 10px' : '8px 16px'}; background: linear-gradient(to bottom, rgba(120,180,240,0.7), rgba(80,140,220,0.5)); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); border-radius: ${isNarrow ? '0' : '13px 13px 0 0'}; border-bottom: 1px solid rgba(255,255,255,0.4);${isNarrow ? 'flex-wrap:wrap;gap:4px;' : ''}">
           <div style="${isNarrow ? 'flex:1;min-width:0;' : ''}">
             <span style="color: #ffffff; font-weight: bold; font-size: ${isNarrow ? '0.9rem' : '1.1rem'}; text-shadow: 0 1px 3px rgba(0,60,140,0.4);">${agent.name}</span>
@@ -9358,11 +9363,6 @@ export class OfficeScene extends Phaser.Scene {
         const tab = (btn as HTMLElement).dataset.tab as "screen" | "files" | "terminal" | "tasks" | "chat" | "memory" | "stats" | "wallet";
         this.switchAgentViewTab(tab, agent.id);
       });
-    });
-
-    // Click outside to close
-    modal.addEventListener("click", (e) => {
-      if (e.target === modal) this.closeAgentViewModal();
     });
 
     // Render initial tab (screen)

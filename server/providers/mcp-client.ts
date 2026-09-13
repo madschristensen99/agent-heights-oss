@@ -21,6 +21,12 @@ import type { AgentTool } from "@cline/sdk";
 
 const execFileAsync = promisify(execFile);
 
+/** Sanitize a tool name to match the LLM API pattern ^[a-zA-Z0-9_-]+$
+ *  Replaces spaces, dots, colons, and any other invalid chars with underscores. */
+function sanitizeToolName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
 /** Maximum characters of an MCP tool result to pass into conversation history.
  *  ~50K chars ≈ 12.5K tokens — large enough for useful data, small enough to
  *  avoid blowing the context window (262K token limit on most models). */
@@ -942,7 +948,10 @@ export async function loadMCPTools(servers: MCPServerConfig[], abortRef?: { sign
 
       for (const def of toolDefs) {
         // Prefix tool name with server label to avoid collisions between servers
-        const toolName = servers.length > 1 ? `${label}__${def.name}` : def.name;
+        // Sanitize both parts to match the LLM API pattern ^[a-zA-Z0-9_-]+$
+        const safeLabel = sanitizeToolName(label);
+        const safeDefName = sanitizeToolName(def.name);
+        const toolName = servers.length > 1 ? `${safeLabel}__${safeDefName}` : safeDefName;
         allTools.push({
           name: toolName,
           description: def.description,
