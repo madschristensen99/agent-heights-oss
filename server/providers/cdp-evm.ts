@@ -634,6 +634,7 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
       args: [pk.token0, pk.token1, pk.fee],
     }));
     const poolRawResults = await client.multicall({ contracts: poolCalls }) as any[];
+    console.log(`[cdp-evm] multicall pools:`, JSON.stringify(poolRawResults.map((r: any) => ({ status: r.status, result: r.result, error: r.error?.message }))));
     const poolResults = poolRawResults.map((r: any) => r.result) as `0x${string}`[];
     const poolMap = new Map<string, `0x${string}`>();
     poolKeys.forEach((pk, idx) => poolMap.set(pk.key, poolResults[idx]));
@@ -646,6 +647,7 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
       functionName: "slot0",
     }));
     const slot0RawResults = await client.multicall({ contracts: slot0Calls }) as any[];
+    console.log(`[cdp-evm] multicall slot0:`, JSON.stringify(slot0RawResults.map((r: any) => ({ status: r.status, hasResult: r.result != null, error: r.error?.message }))));
     const slot0Results = slot0RawResults.map((r: any) => r.result) as any[][];
     const slot0Map = new Map<string, any[]>();
     uniquePools.forEach((poolAddr, idx) => slot0Map.set(poolAddr.toLowerCase(), slot0Results[idx]));
@@ -685,6 +687,7 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
       });
     });
 
+    console.log(`[cdp-evm] positionResults count=${positionResults.length}, poolKeys=${poolKeys.length}, uniquePools=${uniquePools.length}`);
     const positions: EvmLpPositionInfo[] = [];
 
     for (let i = 0; i < tokenIds.length; i++) {
