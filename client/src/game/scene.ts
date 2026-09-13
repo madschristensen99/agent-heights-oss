@@ -10409,7 +10409,7 @@ export class OfficeScene extends Phaser.Scene {
       }
       const addr = data.address ?? "—";
       const network = data.network ?? "unknown";
-      const totalUsdLine = data.totalUsdValue ? `<div style="margin-bottom:8px;padding:6px 10px;background:linear-gradient(135deg,rgba(45,170,80,0.15),rgba(45,170,80,0.05));border-radius:8px;border:1px solid rgba(45,170,80,0.3);"><span style="font-size:0.7rem;color:#888;">Total Portfolio Value</span><br><span style="font-size:1.1rem;font-weight:bold;color:#2a8c2a;">$${data.totalUsdValue}</span></div>` : "";
+      const totalUsdLine = `<div style="margin-bottom:8px;padding:6px 10px;background:linear-gradient(135deg,rgba(45,170,80,0.15),rgba(45,170,80,0.05));border-radius:8px;border:1px solid rgba(45,170,80,0.3);"><span style="font-size:0.7rem;color:#888;">Total Portfolio Value</span><br><span class="total-portfolio-value" style="font-size:1.1rem;font-weight:bold;color:#2a8c2a;">$${data.totalUsdValue ?? "0.00"}</span></div>`;
       const balances = (data.balances ?? []).map(b => `<div style="display:flex;justify-content:space-between;padding:3px 0;"><span style="color:#4a7a9a;">${b.symbol}</span><span style="font-weight:bold;color:#1a6bb0;">${b.amount}${b.usdValue ? ` <span style="color:#888;font-size:0.72rem;">($${b.usdValue})</span>` : ""}</span></div>`).join("");
       const explorerBase = network.includes("base") ? "https://basescan.org" : "https://etherscan.io";
       const infoHtml = `
@@ -10571,6 +10571,22 @@ export class OfficeScene extends Phaser.Scene {
           const ch = lpToggle.querySelector(".av-chevron") as HTMLElement | null;
           if (ch) ch.style.transform = isHidden ? "" : "rotate(-90deg)";
         });
+      }
+
+      // Update total portfolio value to include LP positions
+      let lpTotal = 0;
+      for (const pos of data.positions) {
+        if (pos.totalUsdValue) lpTotal += parseFloat(pos.totalUsdValue);
+      }
+      if (lpTotal > 0) {
+        const totalEl = document.querySelector("#av-wallet-info .total-portfolio-value") as HTMLElement | null;
+        if (totalEl) {
+          const currentText = totalEl.textContent ?? "";
+          const match = currentText.match(/\$([\d.]+)/);
+          const currentVal = match ? parseFloat(match[1]) : 0;
+          const newTotal = (currentVal + lpTotal).toFixed(2);
+          totalEl.textContent = `$${newTotal}`;
+        }
       }
     };
 
