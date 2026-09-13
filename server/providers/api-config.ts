@@ -170,6 +170,13 @@ const MODEL_TO_KIMI: Record<string, string> = {
 };
 
 export function resolveModel(model: string, provider: ProviderName): string {
+  // Catch-all: map any stale claude/gpt/gemini model names to the provider default
+  // so legacy agent configs self-heal instead of sending unknown models to the API
+  if (/^claude-|^gpt-|^o[1-4]-|^gemini/i.test(model)) {
+    if (provider === "deepseek") return DEEPSEEK_DEFAULT_MODEL;
+    if (provider === "kimi") return KIMI_DEFAULT_MODEL;
+    return PARETO_DEFAULT_MODEL;
+  }
   if (provider === "deepseek") return MODEL_TO_DEEPSEEK[model] ?? MODEL_TO_PARETO[model] ?? model;
   if (provider === "kimi") return MODEL_TO_KIMI[model] ?? MODEL_TO_PARETO[model] ?? model;
   return MODEL_TO_PARETO[model] ?? model;
