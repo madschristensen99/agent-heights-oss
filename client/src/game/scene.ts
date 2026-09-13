@@ -9319,7 +9319,7 @@ export class OfficeScene extends Phaser.Scene {
           <button class="av-tab" data-tab="chat" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 4px;border:1px solid rgba(180,200,225,0.4);border-bottom:none;border-radius:10px 10px 0 0;background:linear-gradient(to bottom,rgba(200,220,245,0.5),rgba(180,205,235,0.3));color:#4a7a9a;font-size:0.78rem;cursor:pointer;"><svg width="14" height="14" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tg-ch" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#b8e0f8"/><stop offset="1" stop-color="#5fb8e8"/></linearGradient></defs><path d="M2 2 L14 2 Q15 2 15 3 L15 10 Q15 11 14 11 L6 11 L3 14 L3 11 L2 11 Q1 11 1 10 L1 3 Q1 2 2 2 Z" fill="url(#tg-ch)" stroke="#2a8cd4" stroke-width="0.5"/><circle cx="5" cy="6.5" r="1" fill="#fff"/><circle cx="8" cy="6.5" r="1" fill="#fff"/><circle cx="11" cy="6.5" r="1" fill="#fff"/></svg> Chat</button>
           <button class="av-tab" data-tab="memory" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 4px;border:1px solid rgba(180,200,225,0.4);border-bottom:none;border-radius:10px 10px 0 0;background:linear-gradient(to bottom,rgba(200,220,245,0.5),rgba(180,205,235,0.3));color:#4a7a9a;font-size:0.78rem;cursor:pointer;"><svg width="14" height="14" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tg-mc" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#a8c8e8"/><stop offset="0.5" stop-color="#78a8d0"/><stop offset="1" stop-color="#5088b8"/></linearGradient></defs><rect x="2" y="3" width="12" height="8" rx="1" fill="url(#tg-mc)" stroke="#406890" stroke-width="0.5"/><rect x="3.5" y="4.5" width="9" height="5" rx="0.5" fill="#2a5878" opacity="0.6"/><rect x="3" y="11" width="1" height="2.5" fill="#888"/><rect x="5.5" y="11" width="1" height="2.5" fill="#888"/><rect x="8" y="11" width="1" height="2.5" fill="#888"/><rect x="10.5" y="11" width="1" height="2.5" fill="#888"/><rect x="4.5" y="5.5" width="2" height="1" fill="#5dd55d" rx="0.2"/><rect x="7.5" y="5.5" width="2" height="1" fill="#ffcc44" rx="0.2"/><rect x="4.5" y="7.5" width="2" height="1" fill="#5dd5ff" rx="0.2"/><rect x="7.5" y="7.5" width="2" height="1" fill="#ff8844" rx="0.2"/></svg> Memory</button>
           <button class="av-tab" data-tab="stats" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 4px;border:1px solid rgba(180,200,225,0.4);border-bottom:none;border-radius:10px 10px 0 0;background:linear-gradient(to bottom,rgba(200,220,245,0.5),rgba(180,205,235,0.3));color:#4a7a9a;font-size:0.78rem;cursor:pointer;"><svg width="14" height="14" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tg-s1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7ec8ee"/><stop offset="1" stop-color="#2a8cd4"/></linearGradient><linearGradient id="tg-s2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5dd55d"/><stop offset="1" stop-color="#2a8c2a"/></linearGradient><linearGradient id="tg-s3" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffcc88"/><stop offset="1" stop-color="#e8a830"/></linearGradient></defs><rect x="2" y="9" width="3" height="5" rx="0.5" fill="url(#tg-s1)" stroke="#2a8cd4" stroke-width="0.3"/><rect x="6.5" y="6" width="3" height="8" rx="0.5" fill="url(#tg-s2)" stroke="#2a8c2a" stroke-width="0.3"/><rect x="11" y="3" width="3" height="11" rx="0.5" fill="url(#tg-s3)" stroke="#e8a830" stroke-width="0.3"/><rect x="2" y="9" width="3" height="1.5" fill="rgba(255,255,255,0.35)" rx="0.3"/><rect x="6.5" y="6" width="3" height="1.5" fill="rgba(255,255,255,0.35)" rx="0.3"/><rect x="11" y="3" width="3" height="1.5" fill="rgba(255,255,255,0.35)" rx="0.3"/></svg> Stats</button>
-          ${(agent.cdpSolana || agent.crossmintWallet) ? `<button class="av-tab" data-tab="wallet" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 4px;border:1px solid rgba(180,200,225,0.4);border-bottom:none;border-radius:10px 10px 0 0;background:linear-gradient(to bottom,rgba(200,220,245,0.5),rgba(180,205,235,0.3));color:#4a7a9a;font-size:0.78rem;cursor:pointer;"><svg width="14" height="14" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tg-wl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#e8d0ff"/><stop offset="1" stop-color="#a060d0"/></linearGradient></defs><rect x="2" y="3" width="12" height="10" rx="1.5" fill="url(#tg-wl)" stroke="#7040a0" stroke-width="0.5"/><rect x="2" y="3" width="12" height="3" rx="1.5" fill="rgba(255,255,255,0.3)"/><circle cx="11" cy="8" r="1.5" fill="#fff" opacity="0.9"/><rect x="4" y="7" width="4" height="1" fill="#fff" opacity="0.7" rx="0.3"/><rect x="4" y="9" width="3" height="1" fill="#fff" opacity="0.5" rx="0.3"/></svg> Wallet</button>` : ""}
+          ${(agent.cdpSolana || agent.cdpEvm || agent.crossmintWallet) ? `<button class="av-tab" data-tab="wallet" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 4px;border:1px solid rgba(180,200,225,0.4);border-bottom:none;border-radius:10px 10px 0 0;background:linear-gradient(to bottom,rgba(200,220,245,0.5),rgba(180,205,235,0.3));color:#4a7a9a;font-size:0.78rem;cursor:pointer;"><svg width="14" height="14" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tg-wl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#e8d0ff"/><stop offset="1" stop-color="#a060d0"/></linearGradient></defs><rect x="2" y="3" width="12" height="10" rx="1.5" fill="url(#tg-wl)" stroke="#7040a0" stroke-width="0.5"/><rect x="2" y="3" width="12" height="3" rx="1.5" fill="rgba(255,255,255,0.3)"/><circle cx="11" cy="8" r="1.5" fill="#fff" opacity="0.9"/><rect x="4" y="7" width="4" height="1" fill="#fff" opacity="0.7" rx="0.3"/><rect x="4" y="9" width="3" height="1" fill="#fff" opacity="0.5" rx="0.3"/></svg> Wallet</button>` : ""}
         </div>
         ${agent.task ? `<div style="color: #4a7a9a; font-size: 0.75rem; padding: 6px 14px; text-shadow: 0 1px 0 rgba(255,255,255,0.5); white-space: pre-line; word-break: break-word; max-height: 60px; overflow-y: auto; overflow-x: hidden; flex-shrink: 0; min-width: 0; width: 100%; box-sizing: border-box; border-top: 1px solid rgba(180,200,225,0.3); background: rgba(240,248,255,0.6);">Task: ${agent.task}</div>` : ""}
         <div id="agent-view-content" style="width: ${contentW}; flex: 1; min-height: 0; max-width: 100%; background: linear-gradient(to bottom, rgba(255,255,255,0.95), rgba(240,248,255,0.9)); border-radius: 0 0 ${isNarrow ? '0' : '12px'} 12px; overflow: hidden;">
@@ -10107,13 +10107,17 @@ export class OfficeScene extends Phaser.Scene {
     const agent = this.store.agents.get(agentId);
     if (!agent) return;
     const isCdp = !!agent.cdpSolana;
+    const isCdpEvm = !!agent.cdpEvm;
     const isCrossmint = !!agent.crossmintWallet;
 
     content.innerHTML = `
       <div style="width:100%;height:100%;display:flex;flex-direction:column;font-family:'Segoe UI',Tahoma,sans-serif;color:#1a3a5a;font-size:0.8rem;overflow-y:auto;-webkit-overflow-scrolling:touch;">
         <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 14px;background:linear-gradient(to bottom,rgba(255,255,255,0.6),rgba(220,240,255,0.4));border-bottom:1px solid rgba(255,255,255,0.4);">
-          <span style="font-weight:bold;color:#1a6bb0;font-size:0.85rem;">${isCdp ? "◎ CDP Solana Wallet" : "🔗 Crossmint Wallet"}</span>
-          <button id="av-wallet-refresh" style="padding:3px 12px;border:1px solid rgba(255,255,255,0.5);border-radius:14px;background:linear-gradient(to bottom,rgba(255,255,255,0.8),rgba(220,240,255,0.5));color:#1a6bb0;font-size:0.7rem;cursor:pointer;">↻ Refresh</button>
+          <span style="font-weight:bold;color:#1a6bb0;font-size:0.85rem;">${isCdp ? "◎ CDP Solana Wallet" : isCdpEvm ? "⟠ CDP EVM Wallet" : "🔗 Crossmint Wallet"}</span>
+          <div style="display:flex;gap:6px;align-items:center;">
+            ${(isCdp || isCdpEvm) ? `<button id="av-wallet-onramp" style="padding:3px 12px;border:1px solid rgba(255,255,255,0.5);border-radius:14px;background:linear-gradient(to bottom,rgba(120,200,120,0.6),rgba(80,160,80,0.4));color:#fff;font-size:0.7rem;cursor:pointer;">Buy ETH</button>` : ""}
+            <button id="av-wallet-refresh" style="padding:3px 12px;border:1px solid rgba(255,255,255,0.5);border-radius:14px;background:linear-gradient(to bottom,rgba(255,255,255,0.8),rgba(220,240,255,0.5));color:#1a6bb0;font-size:0.7rem;cursor:pointer;">↻ Refresh</button>
+          </div>
         </div>
         <div id="av-wallet-content" style="flex:1;padding:10px 14px;overflow-y:auto;">
           <div style="color:#4a7a9a;text-align:center;padding:20px;">Loading wallet data…</div>
@@ -10132,6 +10136,11 @@ export class OfficeScene extends Phaser.Scene {
         this.net?.send({ type: "get_cdp_policy", agentId });
         this.net?.send({ type: "get_cdp_tx_history", agentId });
         this.net?.send({ type: "get_cdp_lp_positions", agentId });
+      } else if (isCdpEvm) {
+        this.net?.send({ type: "get_cdp_evm_wallet", agentId });
+        this.net?.send({ type: "get_cdp_evm_policy", agentId });
+        this.net?.send({ type: "get_cdp_evm_tx_history", agentId });
+        this.net?.send({ type: "get_cdp_evm_lp_positions", agentId });
       } else if (isCrossmint) {
         this.net?.send({ type: "get_crossmint_wallet", agentId });
         this.net?.send({ type: "get_crossmint_policy", agentId });
@@ -10375,21 +10384,227 @@ export class OfficeScene extends Phaser.Scene {
       if (pendingData.txHistory) renderCdpTxHistory(pendingData.txHistory);
     };
 
+    // EVM wallet render functions
+    const renderEvmWallet = (data: { address: string | null; balances: { symbol: string; amount: string; usdValue?: string }[] | null; totalUsdValue?: string | null; network?: string | null; error?: string }) => {
+      if (data.error) {
+        walletContent.innerHTML = `<div style="color:#c44;padding:10px;background:rgba(255,200,200,0.3);border-radius:8px;">⚠ ${data.error}</div>`;
+        return;
+      }
+      const addr = data.address ?? "—";
+      const network = data.network ?? "unknown";
+      const totalUsdLine = data.totalUsdValue ? `<div style="margin-bottom:8px;padding:6px 10px;background:linear-gradient(135deg,rgba(45,170,80,0.15),rgba(45,170,80,0.05));border-radius:8px;border:1px solid rgba(45,170,80,0.3);"><span style="font-size:0.7rem;color:#888;">Total Portfolio Value</span><br><span style="font-size:1.1rem;font-weight:bold;color:#2a8c2a;">$${data.totalUsdValue}</span></div>` : "";
+      const balances = (data.balances ?? []).map(b => `<div style="display:flex;justify-content:space-between;padding:3px 0;"><span style="color:#4a7a9a;">${b.symbol}</span><span style="font-weight:bold;color:#1a6bb0;">${b.amount}${b.usdValue ? ` <span style="color:#888;font-size:0.72rem;">($${b.usdValue})</span>` : ""}</span></div>`).join("");
+      const explorerBase = network.includes("base") ? "https://basescan.org" : "https://etherscan.io";
+      const infoHtml = `
+        <div style="margin-bottom:12px;">
+          <div style="color:#888;font-size:0.7rem;margin-bottom:3px;">Address (${network})</div>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span style="font-family:monospace;font-size:0.75rem;color:#1a6bb0;word-break:break-all;">${addr}</span>
+            <button id="av-wallet-copy" style="padding:2px 8px;border:1px solid rgba(255,255,255,0.5);border-radius:10px;background:rgba(255,255,255,0.6);color:#4a7a9a;font-size:0.65rem;cursor:pointer;">⧉</button>
+          </div>
+          <a href="${explorerBase}/address/${addr}" target="_blank" style="color:#2a8cd4;font-size:0.7rem;text-decoration:none;">View on Explorer →</a>
+        </div>
+        ${totalUsdLine}
+        <div style="margin-bottom:12px;">
+          <div style="color:#888;font-size:0.7rem;margin-bottom:3px;">Balances</div>
+          ${balances || '<div style="color:#888;">No balances</div>'}
+        </div>
+      `;
+      walletContent.innerHTML = `
+        <div id="av-wallet-info">${infoHtml}</div>
+        <div id="av-wallet-lp-section"></div>
+        <div id="av-wallet-policy-section"></div>
+        <div id="av-wallet-tx-section"></div>
+      `;
+      if (pendingData.lpPositions) renderEvmLpPositions(pendingData.lpPositions);
+      if (pendingData.policy) renderEvmPolicy(pendingData.policy);
+      if (pendingData.txHistory) renderEvmTxHistory(pendingData.txHistory);
+      const copyBtn = document.getElementById("av-wallet-copy");
+      copyBtn?.addEventListener("click", () => {
+        navigator.clipboard?.writeText(addr);
+        (copyBtn as HTMLElement).textContent = "✓";
+        setTimeout(() => { (copyBtn as HTMLElement).textContent = "⧉"; }, 1500);
+      });
+    };
+
+    const renderEvmPolicy = (data: { policyId: string | null; maxEthPerTransfer: number | null; allowedRecipients: string[] | null; blockedRecipients: string[] | null; allowedTokens: string[] | null; blockedTokens: string[] | null; network: string; error?: string }) => {
+      const section = document.getElementById("av-wallet-policy-section");
+      if (!section) { pendingData.policy = data; return; }
+      if (data.error) { section.innerHTML = ""; return; }
+      section.innerHTML = `
+        <div style="margin-bottom:12px;">
+          <div class="av-wallet-toggle" data-target="av-wallet-policy-body" style="color:#888;font-size:0.7rem;margin-bottom:4px;cursor:pointer;user-select:none;"><span class="av-chevron" style="display:inline-block;transition:transform 0.2s;transform:rotate(-90deg);">▾</span> ⚙ Spending Policy</div>
+          <div id="av-wallet-policy-body" style="display:none;padding:8px;background:rgba(255,255,255,0.4);border-radius:8px;border:1px solid rgba(255,255,255,0.5);">
+            <div style="font-size:0.75rem;color:#4a7a9a;">
+              <div>Max ETH/transfer: <b style="color:#1a6bb0;">${data.maxEthPerTransfer ?? "unlimited"}</b></div>
+              <div>Network: <b style="color:#1a6bb0;">${data.network}</b></div>
+              ${data.allowedRecipients && data.allowedRecipients.length > 0 ? `<div>Allowed recipients: <b style="color:#1a6bb0;font-family:monospace;font-size:0.68rem;">${data.allowedRecipients.join(", ")}</b></div>` : ""}
+              ${data.blockedRecipients && data.blockedRecipients.length > 0 ? `<div>Blocked recipients: <b style="color:#c44;font-family:monospace;font-size:0.68rem;">${data.blockedRecipients.join(", ")}</b></div>` : ""}
+            </div>
+          </div>
+        </div>
+      `;
+      const polToggle = section.querySelector(".av-wallet-toggle");
+      const polBody = section.querySelector("#av-wallet-policy-body") as HTMLElement | null;
+      if (polToggle && polBody) {
+        polToggle.addEventListener("click", () => {
+          const isHidden = polBody.style.display === "none";
+          polBody.style.display = isHidden ? "block" : "none";
+          const ch = polToggle.querySelector(".av-chevron") as HTMLElement | null;
+          if (ch) ch.style.transform = isHidden ? "" : "rotate(-90deg)";
+        });
+      }
+    };
+
+    const renderEvmTxHistory = (data: { transactions: { hash: string; blockNumber: number | null; timestamp: number | null; from: string; to: string; value: string; status: boolean | null }[] | null; error?: string }) => {
+      const section = document.getElementById("av-wallet-tx-section");
+      if (!section) { pendingData.txHistory = data; return; }
+      if (data.error || !data.transactions) { section.innerHTML = ""; return; }
+      const txs = data.transactions.slice(0, 10).map(tx => {
+        const time = tx.timestamp ? new Date(tx.timestamp * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
+        const hash = tx.hash.slice(0, 8) + "…" + tx.hash.slice(-4);
+        const status = tx.status === false ? "✗" : "✓";
+        const statusColor = tx.status === false ? "#c44" : "#2a8c2a";
+        return `<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:0.72rem;"><span style="color:${statusColor};">${status}</span><span style="color:#888;">${time}</span><span style="font-family:monospace;color:#4a7a9a;">${hash}</span></div>`;
+      }).join("");
+      section.innerHTML = `
+        <div style="margin-bottom:12px;">
+          <div class="av-wallet-toggle" data-target="av-wallet-tx-body" style="color:#888;font-size:0.7rem;margin-bottom:4px;cursor:pointer;user-select:none;"><span class="av-chevron" style="display:inline-block;transition:transform 0.2s;transform:rotate(-90deg);">▾</span> 📜 Recent Transactions</div>
+          <div id="av-wallet-tx-body" style="display:none;max-height:120px;overflow-y:auto;-webkit-overflow-scrolling:touch;">
+            ${txs || '<div style="color:#888;font-size:0.72rem;">No transactions</div>'}
+          </div>
+        </div>
+      `;
+      const txToggle = section.querySelector(".av-wallet-toggle");
+      const txBody = section.querySelector("#av-wallet-tx-body") as HTMLElement | null;
+      if (txToggle && txBody) {
+        txToggle.addEventListener("click", () => {
+          const isHidden = txBody.style.display === "none";
+          txBody.style.display = isHidden ? "block" : "none";
+          const ch = txToggle.querySelector(".av-chevron") as HTMLElement | null;
+          if (ch) ch.style.transform = isHidden ? "" : "rotate(-90deg)";
+        });
+      }
+    };
+
+    const renderEvmLpPositions = (data: { positions: { tokenId: string; token0: string; token1: string; symbol0: string; symbol1: string; fee: number; tickLower: number; tickUpper: number; tickCurrent: number; inRange: boolean; liquidity: string; tokensOwed0: string; tokensOwed1: string; amount0: string; amount1: string; priceLower: string; priceUpper: string; priceCurrent: string; explorerUrl: string; usdValue0?: string; usdValue1?: string; totalUsdValue?: string }[] | null; error?: string }) => {
+      const section = document.getElementById("av-wallet-lp-section");
+      if (!section) { pendingData.lpPositions = data; return; }
+      if (data.error || !data.positions || data.positions.length === 0) {
+        section.innerHTML = `
+          <div style="margin-bottom:8px;">
+            <div style="color:#888;font-size:0.7rem;margin-bottom:4px;">💧 LP Positions</div>
+            <div style="color:#888;font-size:0.72rem;padding:6px;background:rgba(255,255,255,0.3);border-radius:6px;">
+              ${data.error ? data.error : "No LP positions yet. Ask the agent to open a Uniswap V3 position."}
+            </div>
+          </div>
+        `;
+        return;
+      }
+      const feeTierMap: Record<number, string> = { 100: "0.01%", 500: "0.05%", 3000: "0.3%", 10000: "1%" };
+      const positions = data.positions.map(pos => {
+        const range = pos.tickUpper - pos.tickLower;
+        const currentPct = range > 0 ? Math.max(0, Math.min(100, ((pos.tickCurrent - pos.tickLower) / range) * 100)) : 50;
+        const statusColor = pos.inRange ? "#2a8c2a" : "#c44";
+        const statusText = pos.inRange ? "In Range" : "Out of Range";
+        const shortId = "#" + pos.tokenId.slice(0, 6);
+        const pair = `${pos.symbol0} / ${pos.symbol1}`;
+        const ft = feeTierMap[pos.fee] ?? `${pos.fee}`;
+        const hasFees = Number(pos.tokensOwed0) > 0 || Number(pos.tokensOwed1) > 0;
+        const usdLine = pos.totalUsdValue ? `<div style="font-size:0.72rem;color:#2a8c2a;font-weight:bold;margin-bottom:4px;">Position Value: $${pos.totalUsdValue}</div>` : "";
+        return `
+          <div style="padding:8px;background:rgba(255,255,255,0.4);border-radius:8px;border:1px solid rgba(255,255,255,0.5);margin-bottom:6px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+              <span style="font-size:0.78rem;font-weight:bold;color:#1a6bb0;">${pair}</span>
+              <span style="font-size:0.68rem;color:${statusColor};font-weight:bold;">● ${statusText}</span>
+            </div>
+            ${usdLine}
+            <div style="font-size:0.68rem;color:#4a7a9a;margin-bottom:4px;">
+              Fee tier: <b>${ft}</b> · Price: <b>${pos.priceLower} — ${pos.priceUpper}</b> <span style="color:#2a8cd4;">(now: ${pos.priceCurrent})</span>
+            </div>
+            <div style="margin-bottom:6px;">
+              <div style="position:relative;height:8px;background:rgba(200,200,200,0.4);border-radius:4px;overflow:hidden;">
+                <div style="position:absolute;left:0;top:0;height:100%;width:${currentPct}%;background:linear-gradient(to right,#5dd55d,#2a8cd4);border-radius:4px;"></div>
+                <div style="position:absolute;left:${currentPct}%;top:-2px;width:2px;height:12px;background:#1a6bb0;"></div>
+              </div>
+            </div>
+            <div style="font-size:0.7rem;color:#4a7a9a;margin-bottom:4px;">
+              Deposited: <b>${pos.amount0} ${pos.symbol0}</b>${pos.usdValue0 ? ` <span style="color:#2a8c2a;">($${pos.usdValue0})</span>` : ""} + <b>${pos.amount1} ${pos.symbol1}</b>${pos.usdValue1 ? ` <span style="color:#2a8c2a;">($${pos.usdValue1})</span>` : ""}
+            </div>
+            ${hasFees ? `<div style="font-size:0.65rem;color:#2a8c2a;margin-bottom:4px;">Uncollected fees: ${pos.tokensOwed0} ${pos.symbol0} + ${pos.tokensOwed1} ${pos.symbol1}</div>` : ""}
+            <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;">
+              <a href="${pos.explorerUrl}" target="_blank" style="padding:3px 8px;border:1px solid rgba(255,255,255,0.5);border-radius:10px;background:rgba(255,255,255,0.5);color:#4a7a9a;font-size:0.65rem;text-decoration:none;">Explorer →</a>
+              <span style="font-size:0.58rem;color:#888;font-family:monospace;margin-left:auto;">${shortId}</span>
+            </div>
+          </div>
+        `;
+      }).join("");
+      section.innerHTML = `
+        <div style="margin-bottom:8px;">
+          <div class="av-wallet-toggle" data-target="av-wallet-lp-body" style="color:#888;font-size:0.7rem;margin-bottom:4px;cursor:pointer;user-select:none;"><span class="av-chevron" style="display:inline-block;transition:transform 0.2s;">▾</span> 💧 LP Positions (${data.positions.length})</div>
+          <div id="av-wallet-lp-body">${positions}</div>
+        </div>
+      `;
+      const lpToggle = section.querySelector(".av-wallet-toggle");
+      const lpBody = section.querySelector("#av-wallet-lp-body") as HTMLElement | null;
+      if (lpToggle && lpBody) {
+        lpToggle.addEventListener("click", () => {
+          const isHidden = lpBody.style.display === "none";
+          lpBody.style.display = isHidden ? "block" : "none";
+          const ch = lpToggle.querySelector(".av-chevron") as HTMLElement | null;
+          if (ch) ch.style.transform = isHidden ? "" : "rotate(-90deg)";
+        });
+      }
+    };
+
     // Register listeners
     if (isCdp) {
       const onWallet = (msg: any) => { if (msg.agentId === agentId) renderCdpWallet(msg); };
       const onPolicy = (msg: any) => { if (msg.agentId === agentId) renderCdpPolicy(msg); };
       const onTxHistory = (msg: any) => { if (msg.agentId === agentId) renderCdpTxHistory(msg); };
       const onLpPositions = (msg: any) => { if (msg.agentId === agentId) renderCdpLpPositions(msg); };
+      const onOnramp = (msg: any) => {
+        if (msg.agentId !== agentId) return;
+        const onrampBtn = document.getElementById("av-wallet-onramp") as HTMLButtonElement | null;
+        if (onrampBtn) { onrampBtn.textContent = "Buy ETH"; onrampBtn.disabled = false; }
+        if (msg.error) { this.store.toast(`Onramp error: ${msg.error}`); return; }
+        if (msg.url) window.open(msg.url, "_blank", "noopener,noreferrer");
+      };
       this.store.cdpWalletListeners.push(onWallet);
       this.store.cdpPolicyListeners.push(onPolicy);
       this.store.cdpTxHistoryListeners.push(onTxHistory);
       this.store.cdpLpPositionsListeners.push(onLpPositions);
+      this.store.cdpOnrampListeners.push(onOnramp);
       this.agentViewCleanup.push(() => {
         this.store.cdpWalletListeners = this.store.cdpWalletListeners.filter(f => f !== onWallet);
         this.store.cdpPolicyListeners = this.store.cdpPolicyListeners.filter(f => f !== onPolicy);
         this.store.cdpTxHistoryListeners = this.store.cdpTxHistoryListeners.filter(f => f !== onTxHistory);
         this.store.cdpLpPositionsListeners = this.store.cdpLpPositionsListeners.filter(f => f !== onLpPositions);
+        this.store.cdpOnrampListeners = this.store.cdpOnrampListeners.filter(f => f !== onOnramp);
+      });
+    } else if (isCdpEvm) {
+      const onWallet = (msg: any) => { if (msg.agentId === agentId) renderEvmWallet(msg); };
+      const onPolicy = (msg: any) => { if (msg.agentId === agentId) renderEvmPolicy(msg); };
+      const onTxHistory = (msg: any) => { if (msg.agentId === agentId) renderEvmTxHistory(msg); };
+      const onLpPositions = (msg: any) => { if (msg.agentId === agentId) renderEvmLpPositions(msg); };
+      const onOnramp = (msg: any) => {
+        if (msg.agentId !== agentId) return;
+        const onrampBtn = document.getElementById("av-wallet-onramp") as HTMLButtonElement | null;
+        if (onrampBtn) { onrampBtn.textContent = "Buy ETH"; onrampBtn.disabled = false; }
+        if (msg.error) { this.store.toast(`Onramp error: ${msg.error}`); return; }
+        if (msg.url) window.open(msg.url, "_blank", "noopener,noreferrer");
+      };
+      this.store.cdpEvmWalletListeners.push(onWallet);
+      this.store.cdpEvmPolicyListeners.push(onPolicy);
+      this.store.cdpEvmTxHistoryListeners.push(onTxHistory);
+      this.store.cdpEvmLpPositionsListeners.push(onLpPositions);
+      this.store.cdpEvmOnrampListeners.push(onOnramp);
+      this.agentViewCleanup.push(() => {
+        this.store.cdpEvmWalletListeners = this.store.cdpEvmWalletListeners.filter(f => f !== onWallet);
+        this.store.cdpEvmPolicyListeners = this.store.cdpEvmPolicyListeners.filter(f => f !== onPolicy);
+        this.store.cdpEvmTxHistoryListeners = this.store.cdpEvmTxHistoryListeners.filter(f => f !== onTxHistory);
+        this.store.cdpEvmLpPositionsListeners = this.store.cdpEvmLpPositionsListeners.filter(f => f !== onLpPositions);
+        this.store.cdpEvmOnrampListeners = this.store.cdpEvmOnrampListeners.filter(f => f !== onOnramp);
       });
     } else if (isCrossmint) {
       const onWallet = (msg: any) => { if (msg.agentId === agentId) renderCrossmintWallet(msg); };
@@ -10403,6 +10618,23 @@ export class OfficeScene extends Phaser.Scene {
     this.agentViewCleanup.push(() => {
       refreshBtn.removeEventListener("click", fetchWalletData);
     });
+
+    const onrampBtn = document.getElementById("av-wallet-onramp") as HTMLButtonElement | null;
+    if (onrampBtn) {
+      const onrampClick = () => {
+        if (isCdp) {
+          this.net?.send({ type: "create_cdp_onramp", agentId });
+        } else if (isCdpEvm) {
+          this.net?.send({ type: "create_cdp_evm_onramp", agentId });
+        }
+        onrampBtn.textContent = "Loading...";
+        onrampBtn.disabled = true;
+      };
+      onrampBtn.addEventListener("click", onrampClick);
+      this.agentViewCleanup.push(() => {
+        onrampBtn.removeEventListener("click", onrampClick);
+      });
+    }
 
     // Initial fetch
     fetchWalletData();
