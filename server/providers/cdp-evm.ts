@@ -463,7 +463,7 @@ export async function updateAgentEvmPolicy(
 const UNISWAP_V3_ADDRESSES: Record<string, { npm: `0x${string}`; factory: `0x${string}` }> = {
   ethereum: { npm: getAddress("0xC36442b465c376D4514355Ba620829C6F4eFeFED"), factory: getAddress("0x1F98431c8aD9850365Cde677f99a051A01328b03") },
   polygon:  { npm: getAddress("0xC36442b465c376D4514355Ba620829C6F4eFeFED"), factory: getAddress("0x1F98431c8aD9850365Cde677f99a051A01328b03") },
-  base:     { npm: getAddress("0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1"), factory: getAddress("0x0d76e6526599a9f11f0c3a3a9d7aa6c1ca7a0c37") },
+  base:     { npm: getAddress("0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1"), factory: getAddress("0x33128a8fC17869897dcE68Ed026d694621f6FDfD") },
 };
 
 function getUniswapV3Addresses(network: string): { npm: `0x${string}`; factory: `0x${string}` } {
@@ -597,7 +597,6 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
       });
     }
     const tokenIdResults = await client.multicall({ contracts: tokenIdCalls }) as any[];
-    console.log(`[cdp-evm] multicall tokenIds:`, JSON.stringify(tokenIdResults.map((r: any) => ({ status: r.status, hasResult: r.result != null, error: r.error?.message }))));
     const tokenIds = tokenIdResults.map((r: any) => r.result) as bigint[];
 
     // Batch 2: fetch all position data via multicall
@@ -608,7 +607,6 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
       args: [tokenId],
     }));
     const positionRawResults = await client.multicall({ contracts: positionCalls }) as any[];
-    console.log(`[cdp-evm] multicall positions:`, JSON.stringify(positionRawResults.map((r: any) => ({ status: r.status, hasResult: r.result != null, error: r.error?.message }))));
     const positionResults = positionRawResults.map((r: any) => r.result).filter((r: any) => r != null) as any[][];
 
     // Collect unique (token0, token1, fee) combos for pool lookups
@@ -634,7 +632,6 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
       args: [pk.token0, pk.token1, pk.fee],
     }));
     const poolRawResults = await client.multicall({ contracts: poolCalls }) as any[];
-    console.log(`[cdp-evm] multicall pools:`, JSON.stringify(poolRawResults.map((r: any) => ({ status: r.status, result: r.result, error: r.error?.message }))));
     const poolResults = poolRawResults.map((r: any) => r.result) as `0x${string}`[];
     const poolMap = new Map<string, `0x${string}`>();
     poolKeys.forEach((pk, idx) => poolMap.set(pk.key, poolResults[idx]));
@@ -647,7 +644,6 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
       functionName: "slot0",
     }));
     const slot0RawResults = await client.multicall({ contracts: slot0Calls }) as any[];
-    console.log(`[cdp-evm] multicall slot0:`, JSON.stringify(slot0RawResults.map((r: any) => ({ status: r.status, hasResult: r.result != null, error: r.error?.message }))));
     const slot0Results = slot0RawResults.map((r: any) => r.result) as any[][];
     const slot0Map = new Map<string, any[]>();
     uniquePools.forEach((poolAddr, idx) => slot0Map.set(poolAddr.toLowerCase(), slot0Results[idx]));
@@ -687,7 +683,6 @@ export async function getAgentEvmLpPositions(agentId: string): Promise<EvmLpPosi
       });
     });
 
-    console.log(`[cdp-evm] positionResults count=${positionResults.length}, poolKeys=${poolKeys.length}, uniquePools=${uniquePools.length}`);
     const positions: EvmLpPositionInfo[] = [];
 
     for (let i = 0; i < tokenIds.length; i++) {
